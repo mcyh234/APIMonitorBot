@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from backend.app.availability import ApiProbe
 from backend.app.crypto import SecretBox, get_secret_box
 from backend.app.db import get_session
-from backend.app.models import APIConfig, BotAdmin, CheckRecord, ReceivedMessage, SendRecord
+from backend.app.models import APIConfig, BotAdmin, CheckRecord, ReceivedMessage, SendRecord, Sub2Config
 from backend.app.monitor import MonitorService
 from backend.app.repository import (
     config_to_out,
@@ -34,9 +34,13 @@ from backend.app.schemas import (
     SendRecordOut,
     StatusBucketOut,
     StatusWindowOut,
+    Sub2PriceBoardOut,
+    Sub2RateHistoryPointOut,
+    Sub2RateOut,
 )
 from backend.app.settings import Settings, get_settings
 from backend.app.status_bars import ConfigStatusBarsData, build_status_bars
+from backend.app.sub2_rates import Sub2StoredRate, stored_sub2_rate_views
 from backend.app.time_utils import api_datetime
 
 
@@ -230,6 +234,45 @@ def status_bars_to_out(item: ConfigStatusBarsData) -> ConfigStatusBarsOut:
                 ],
             )
             for window in item.windows
+        ],
+    )
+
+
+@api_router.get("/sub2/prices", response_model=list[Sub2PriceBoardOut])
+def list_sub2_prices(session: Session = Depends(get_session)) -> list[Sub2PriceBoardOut]:
+    configs = session.scalars(select(Sub2Config).order_by(Sub2Config.name)).all()
+    return [
+        Sub2PriceBoardOut(
+            config_id=config.id,
+            name=config.name,
+            target_type=config.target_type,
+            target_id=config.target_id,
+            target=format_target(config.target_type, config.target_id),
+            base_url=config.base_url,
+            enabled=config.enabled,
+            last_checked_at=api_datetime(config.last_checked_at),
+            last_error=config.last_error,
+            rates=[sub2_rate_to_out(rate) for rate in stored_sub2_rate_views(session, config)],
+        )
+        for config in configs
+    ]
+
+
+def sub2_rate_to_out(rate: Sub2StoredRate) -> Sub2RateOut:
+    return Sub2RateOut(
+        platform=rate.platform,
+        group_key=rate.group_key,
+        group_name=rate.group_name,
+        rate_multiplier=rate.rate_multiplier,
+        previous_rate=rate.previous_rate,
+        change_percent=rate.change_percent,
+        last_seen_at=api_datetime(rate.last_seen_at),
+        history=[
+            Sub2RateHistoryPointOut(
+                recorded_at=api_datetime(point.recorded_at),
+                rate_multiplier=point.rate_multiplier,
+            )
+            for point in rate.history
         ],
     )
 

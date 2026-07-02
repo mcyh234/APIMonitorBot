@@ -4,7 +4,10 @@ import {
   Activity,
   BarChart3,
   Bot,
+  BadgePercent,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Clock3,
   KeyRound,
   Send,
@@ -15,6 +18,8 @@ import {
   Trash2,
   MessageSquareText,
   Pencil,
+  TrendingDown,
+  TrendingUp,
   Wifi,
   WifiOff,
   XCircle
@@ -118,6 +123,35 @@ type ConfigStatusBars = {
   windows: StatusWindow[];
 };
 
+type Sub2RateHistoryPoint = {
+  recorded_at: string;
+  rate_multiplier: number;
+};
+
+type Sub2Rate = {
+  platform: string;
+  group_key: string;
+  group_name: string;
+  rate_multiplier: number;
+  previous_rate: number | null;
+  change_percent: number | null;
+  last_seen_at: string;
+  history: Sub2RateHistoryPoint[];
+};
+
+type Sub2PriceBoard = {
+  config_id: number;
+  name: string;
+  target_type: "group" | "private";
+  target_id: string;
+  target: string;
+  base_url: string;
+  enabled: boolean;
+  last_checked_at: string | null;
+  last_error: string | null;
+  rates: Sub2Rate[];
+};
+
 type ConfigForm = {
   name: string;
   target: string;
@@ -196,6 +230,46 @@ function statusBucketLabel(state: string): string {
   return "未检查";
 }
 
+function platformLabel(platform: string): string {
+  const clean = platform.trim().toLowerCase();
+  if (clean === "openai") return "OpenAI";
+  if (clean === "anthropic") return "Anthropic";
+  return platform.trim() || "Unknown";
+}
+
+function platformClass(platform: string): string {
+  const clean = platform.trim().toLowerCase();
+  if (clean === "openai") return "openai";
+  if (clean === "anthropic") return "anthropic";
+  return "other";
+}
+
+function formatRate(value: number): string {
+  return `${Number(value.toPrecision(6)).toString()}x`;
+}
+
+function formatPercent(value: number | null): string {
+  if (value == null || !Number.isFinite(value)) return "基准";
+  const sign = value > 0 ? "+" : "";
+  return `${sign}${value.toFixed(1)}%`;
+}
+
+function trendClass(value: number | null): "up" | "down" | "flat" {
+  if (value == null || Math.abs(value) < 0.0000001) return "flat";
+  return value > 0 ? "up" : "down";
+}
+
+function groupByPlatform(rates: Sub2Rate[]): [string, Sub2Rate[]][] {
+  const grouped = new Map<string, Sub2Rate[]>();
+  for (const rate of rates) {
+    const key = rate.platform || "unknown";
+    grouped.set(key, [...(grouped.get(key) ?? []), rate]);
+  }
+  return Array.from(grouped.entries()).sort(([left], [right]) =>
+    platformLabel(left).localeCompare(platformLabel(right))
+  );
+}
+
 function App() {
   const [configs, setConfigs] = useState<ApiConfig[]>([]);
   const [history, setHistory] = useState<CheckRecord[]>([]);
@@ -203,6 +277,8 @@ function App() {
   const [messages, setMessages] = useState<ReceivedMessage[]>([]);
   const [sendFailures, setSendFailures] = useState<SendFailure[]>([]);
   const [statusBars, setStatusBars] = useState<ConfigStatusBars[]>([]);
+  const [sub2Prices, setSub2Prices] = useState<Sub2PriceBoard[]>([]);
+  const [expandedSub2, setExpandedSub2] = useState<Record<number, boolean>>({});
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [selectedName, setSelectedName] = useState("");
   const [form, setForm] = useState<ConfigForm>(emptyForm);
@@ -217,13 +293,14 @@ function App() {
   );
 
   async function loadAll() {
-    const [nextStatus, nextConfigs, nextAdmins, nextMessages, nextSendFailures, nextStatusBars] = await Promise.all([
+    const [nextStatus, nextConfigs, nextAdmins, nextMessages, nextSendFailures, nextStatusBars, nextSub2Prices] = await Promise.all([
       requestJson<AppStatus>("/api/status"),
       requestJson<ApiConfig[]>("/api/configs"),
       requestJson<Admin[]>("/api/admins"),
       requestJson<ReceivedMessage[]>("/api/messages/recent"),
       requestJson<SendFailure[]>("/api/sends/recent-failures"),
-      requestJson<ConfigStatusBars[]>("/api/status-bars")
+      requestJson<ConfigStatusBars[]>("/api/status-bars"),
+      requestJson<Sub2PriceBoard[]>("/api/sub2/prices")
     ]);
     setStatus(nextStatus);
     setConfigs(nextConfigs);
@@ -231,6 +308,7 @@ function App() {
     setMessages(nextMessages);
     setSendFailures(nextSendFailures);
     setStatusBars(nextStatusBars);
+    setSub2Prices(nextSub2Prices);
     if (!selectedName && nextConfigs.length > 0) {
       setSelectedName(nextConfigs[0].name);
     }
@@ -615,6 +693,15 @@ function App() {
         </div>
       </section>
 
+      <Sub2PriceSection
+        boards={sub2Prices}
+        expanded={expandedSub2}
+        onToggle={(configId) =>
+          setExpandedSub2((current) => ({ ...current, [configId]: !current[configId] }))
+        }
+        timeZone={displayTimeZone}
+      />
+
       <section className="panel send-failures-panel">
         <div className="panel-heading">
           <div>
@@ -704,6 +791,160 @@ function App() {
       </footer>
     </main>
   );
+}
+
+function Sub2PriceSection({
+  boards,
+  expanded,
+  onToggle,
+  timeZone
+}: {
+  boards: Sub2PriceBoard[];
+  expanded: Record<number, boolean>;
+  onToggle: (configId: number) => void;
+  timeZone: string;
+}) {
+  return (
+    <section className="panel sub2-panel">
+      <div className="panel-heading">
+        <div>
+          <h2>Sub2API 渠道倍率</h2>
+          <p>默认收起，展开后查看各渠道当前倍率、涨跌百分比和历史变化。</p>
+        </div>
+        <BadgePercent size={18} />
+      </div>
+      <div className="sub2-board-list">
+        {boards.length === 0 ? (
+          <div className="empty">暂无 Sub2API 渠道倍率数据。</div>
+        ) : (
+          boards.map((board) => {
+            const isOpen = Boolean(expanded[board.config_id]);
+            const changedCount = board.rates.filter((rate) => trendClass(rate.change_percent) !== "flat").length;
+            return (
+              <div className="sub2-board" key={board.config_id}>
+                <button
+                  className="sub2-board-toggle"
+                  type="button"
+                  aria-expanded={isOpen}
+                  onClick={() => onToggle(board.config_id)}
+                >
+                  {isOpen ? <ChevronDown size={18} /> : <ChevronRight size={18} />}
+                  <span className="sub2-board-main">
+                    <strong>{board.name}</strong>
+                    <span>{board.target} · {board.base_url}</span>
+                  </span>
+                  <span className="sub2-board-summary">
+                    <span>{board.rates.length} 个分组</span>
+                    <span>{changedCount} 个变化</span>
+                    <span>{formatTime(board.last_checked_at, timeZone)}</span>
+                  </span>
+                </button>
+                {isOpen && (
+                  <div className="sub2-board-body">
+                    {board.last_error && <div className="sub2-error">最近错误：{board.last_error}</div>}
+                    {groupByPlatform(board.rates).map(([platform, rates]) => (
+                      <div className="sub2-platform" key={`${board.config_id}-${platform}`}>
+                        <div className={`sub2-platform-badge ${platformClass(platform)}`}>
+                          {platformLabel(platform)}
+                        </div>
+                        <div className="sub2-rate-grid">
+                          {rates
+                            .slice()
+                            .sort((left, right) => left.group_name.localeCompare(right.group_name))
+                            .map((rate) => (
+                              <Sub2RateCard key={`${rate.platform}-${rate.group_key}`} rate={rate} timeZone={timeZone} />
+                            ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })
+        )}
+      </div>
+    </section>
+  );
+}
+
+function Sub2RateCard({ rate, timeZone }: { rate: Sub2Rate; timeZone: string }) {
+  const trend = trendClass(rate.change_percent);
+  const TrendIcon = trend === "up" ? TrendingUp : trend === "down" ? TrendingDown : BadgePercent;
+  return (
+    <div className={`sub2-rate-card ${trend}`}>
+      <div className="sub2-rate-head">
+        <strong>{rate.group_name}</strong>
+        <span>{formatTime(rate.last_seen_at, timeZone)}</span>
+      </div>
+      <div className="sub2-rate-body">
+        <div>
+          <div className={`sub2-current-rate ${trend}`}>{formatRate(rate.rate_multiplier)}</div>
+          <div className={`sub2-rate-change ${trend}`}>
+            <TrendIcon size={16} />
+            <span>{formatPercent(rate.change_percent)}</span>
+            {rate.previous_rate != null && <small>上次 {formatRate(rate.previous_rate)}</small>}
+          </div>
+        </div>
+        <Sub2Sparkline points={rate.history} trend={trend} timeZone={timeZone} />
+      </div>
+    </div>
+  );
+}
+
+function Sub2Sparkline({
+  points,
+  trend,
+  timeZone
+}: {
+  points: Sub2RateHistoryPoint[];
+  trend: "up" | "down" | "flat";
+  timeZone: string;
+}) {
+  const chartPoints = downsamplePoints(points, 48);
+  const width = 210;
+  const height = 60;
+  const values = chartPoints.map((point) => point.rate_multiplier);
+  const minimum = values.length ? Math.min(...values) : 0;
+  const maximum = values.length ? Math.max(...values) : 0;
+  const color = trend === "up" ? "#ef4444" : trend === "down" ? "#22c55e" : "#94a3b8";
+  const polyline = chartPoints
+    .map((point, index) => {
+      const x = chartPoints.length <= 1 ? 0 : (index / (chartPoints.length - 1)) * width;
+      const ratio = maximum === minimum ? 0.5 : (point.rate_multiplier - minimum) / (maximum - minimum);
+      const y = height - ratio * height;
+      return `${x.toFixed(2)},${y.toFixed(2)}`;
+    })
+    .join(" ");
+  const first = chartPoints[0];
+  const last = chartPoints[chartPoints.length - 1];
+
+  return (
+    <div className="sub2-sparkline" aria-label="倍率历史折线图">
+      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-hidden="true">
+        <line x1="0" y1={height} x2={width} y2={height} />
+        {polyline && <polyline points={polyline} style={{ stroke: color }} />}
+      </svg>
+      <div className="sub2-sparkline-axis">
+        <span>{first ? formatShortDate(first.recorded_at, timeZone) : "-"}</span>
+        <span>{last ? formatShortDate(last.recorded_at, timeZone) : "-"}</span>
+      </div>
+    </div>
+  );
+}
+
+function downsamplePoints<T>(points: T[], limit: number): T[] {
+  if (points.length <= limit) return points;
+  const step = (points.length - 1) / (limit - 1);
+  return Array.from({ length: limit }, (_, index) => points[Math.round(index * step)]);
+}
+
+function formatShortDate(value: string, timeZone = defaultTimeZone): string {
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone,
+    month: "2-digit",
+    day: "2-digit"
+  }).format(parseApiDate(value));
 }
 
 function Metric({ icon, label, value, tone }: { icon: React.ReactNode; label: string; value: string; tone: "neutral" | "ok" | "down" | "warn" }) {

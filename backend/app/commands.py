@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
@@ -8,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.availability import ApiProbe
 from backend.app.crypto import SecretBox
-from backend.app.models import APIConfig, ReceivedMessage
+from backend.app.models import APIConfig, ReceivedMessage, Sub2Config
 from backend.app.onebot import OneBotClient
 from backend.app.notifier import record_send_result
 from backend.app.repository import (
@@ -26,6 +27,10 @@ from backend.app.schemas import APIConfigCreate
 from backend.app.settings import Settings
 from backend.app.status_bars import build_status_bars
 from backend.app.status_image import render_status_image
+from backend.app.sub2_price_image import Sub2PriceBoard, render_sub2_price_image
+from backend.app.sub2_rates import stored_sub2_rate_views, sync_sub2_rates
+from backend.app.sub2api import Sub2ApiClient, Sub2ApiError
+from backend.app.time_utils import utc_now
 from backend.app.web_snapshot import StatusPageSnapshotter, StatusSnapshotError
 
 
@@ -45,12 +50,14 @@ class CommandRouter:
         secret_box: SecretBox,
         probe: ApiProbe | None = None,
         snapshotter: StatusPageSnapshotter | None = None,
+        sub2_client: Sub2ApiClient | None = None,
     ) -> None:
         self.settings = settings
         self.onebot = onebot
         self.secret_box = secret_box
         self.probe = probe or ApiProbe(timeout_seconds=settings.request_timeout_seconds)
         self.snapshotter = snapshotter or StatusPageSnapshotter(settings)
+        self.sub2_client = sub2_client or Sub2ApiClient(timeout_seconds=settings.request_timeout_seconds)
 
     async def handle_event(self, session: Session, event: dict) -> None:
         message = parse_onebot_message(event)
@@ -72,7 +79,10 @@ class CommandRouter:
         text = incoming.message.strip()
         state = get_conversation(session, incoming.user_id)
         if state is not None and not text.startswith("/cancel"):
-            return await self._continue_addapi(session, incoming, state.step, dict(state.payload or {}), text)
+            payload = dict(state.payload or {})
+            if state.step.startswith("sub2_"):
+                return await self._continue_addsub2(session, incoming, state.step, payload, text)
+            return await self._continue_addapi(session, incoming, state.step, payload, text)
 
         if not text.startswith("/"):
             return None
@@ -108,6 +118,11 @@ class CommandRouter:
                 return "权限不足。"
             upsert_conversation(session, incoming.user_id, "name", {})
             return "请输入api配置名称"
+        if command == "/addsub2":
+            if not is_admin(session, incoming.user_id):
+                return "权限不足。"
+            upsert_conversation(session, incoming.user_id, "sub2_name", {})
+            return "请输入API名称"
         if command == "/check":
             if not arg:
                 return "用法：/check <apiname>"
@@ -116,6 +131,8 @@ class CommandRouter:
             return await self._status(session, incoming, arg)
         if command == "/stat":
             return await self._stat(session, incoming)
+        if command == "/price":
+            return await self._price(session, incoming)
         return None
 
     async def _manual_check(self, session: Session, incoming: IncomingMessage, name: str) -> str:
@@ -215,6 +232,46 @@ class CommandRouter:
             return ""
         return f"网页快照发送失败：{result.error or result.status_code or '未知错误'}"
 
+    async def _price(self, session: Session, incoming: IncomingMessage) -> str:
+        configs = self._sub2_configs_for_notification_context(session, incoming)
+        if configs is None:
+            return "权限不足，当前会话不是 Sub2API 通知对象。"
+        if not configs:
+            return "没有可显示的 Sub2API 价格表。"
+        ok, remaining = self._consume_command_cooldown(session, incoming, "price")
+        if not ok:
+            return f"操作太频繁，请 {remaining} 秒后再试。"
+
+        boards: list[Sub2PriceBoard] = []
+        for config in configs:
+            rate_views = stored_sub2_rate_views(session, config)
+            if not rate_views and config.enabled:
+                try:
+                    rates = await self.sub2_client.fetch_rates_with_cached_token(
+                        session,
+                        config,
+                        self.secret_box,
+                    )
+                    sync_sub2_rates(session, config, rates)
+                    rate_views = stored_sub2_rate_views(session, config)
+                except Sub2ApiError as exc:
+                    config.last_error = str(exc)
+                    session.commit()
+            boards.append(Sub2PriceBoard(config.name, rate_views))
+
+        image = render_sub2_price_image(boards, title="Sub2API 渠道倍率", timezone_name=self.settings.app_timezone)
+        if incoming.message_type == "group" and incoming.group_id:
+            target_type = "group"
+            target_id = incoming.group_id
+        else:
+            target_type = "private"
+            target_id = incoming.user_id
+        result = await self.onebot.send_image_message(target_type, target_id, image, "sub2-price.png")
+        record_send_result(session, result)
+        if result.ok:
+            return ""
+        return f"价格表发送失败：{result.error or result.status_code or '未知错误'}"
+
     def _notification_target_for_context(
         self,
         session: Session,
@@ -234,6 +291,34 @@ class CommandRouter:
             return ("private", incoming.user_id)
         return None
 
+    def _sub2_configs_for_notification_context(
+        self,
+        session: Session,
+        incoming: IncomingMessage,
+    ) -> list[Sub2Config] | None:
+        if incoming.message_type == "group" and incoming.group_id:
+            configs = list(
+                session.scalars(
+                    select(Sub2Config)
+                    .where(Sub2Config.target_type == "group")
+                    .where(Sub2Config.target_id == incoming.group_id)
+                    .order_by(Sub2Config.name)
+                ).all()
+            )
+            if configs or is_admin(session, incoming.user_id):
+                return configs
+            return None
+        if not is_admin(session, incoming.user_id):
+            return None
+        return list(
+            session.scalars(
+                select(Sub2Config)
+                .where(Sub2Config.target_type == "private")
+                .where(Sub2Config.target_id == incoming.user_id)
+                .order_by(Sub2Config.name)
+            ).all()
+        )
+
     def _consume_command_cooldown(
         self,
         session: Session,
@@ -248,6 +333,110 @@ class CommandRouter:
             command,
             self.settings.command_check_cooldown_seconds,
         )
+
+    async def _continue_addsub2(
+        self,
+        session: Session,
+        incoming: IncomingMessage,
+        step: str,
+        payload: dict,
+        text: str,
+    ) -> str:
+        if step == "sub2_name":
+            name = text.strip()
+            if not name:
+                return "API名称不能为空，请重新输入。"
+            exists = session.scalar(select(Sub2Config).where(Sub2Config.name == name))
+            if exists is not None:
+                return "这个 Sub2API 名称已经存在，请换一个名称。"
+            payload["name"] = name
+            upsert_conversation(session, incoming.user_id, "sub2_base_url", payload)
+            return "请输入Sub2API的BaseURL"
+
+        if step == "sub2_base_url":
+            base_url = text.strip()
+            if not base_url.startswith(("http://", "https://")):
+                return "Sub2API BaseURL 必须以 http:// 或 https:// 开头，请重新输入。"
+            payload["base_url"] = base_url
+            upsert_conversation(session, incoming.user_id, "sub2_email", payload)
+            return "请输入email"
+
+        if step == "sub2_email":
+            email = text.strip()
+            if not email:
+                return "email 不能为空，请重新输入。"
+            payload["email"] = email
+            upsert_conversation(session, incoming.user_id, "sub2_password", payload)
+            return "请输入密码"
+
+        if step == "sub2_password":
+            password = text.strip()
+            if not password:
+                return "密码不能为空，请重新输入。"
+            try:
+                tokens = await self.sub2_client.login(payload["base_url"], payload["email"], password)
+                rates = await self.sub2_client.fetch_rates(payload["base_url"], tokens.access_token)
+            except Sub2ApiError as exc:
+                return f"登录或读取渠道失败：{exc}\n请重新输入密码，或发送 /cancel 取消。"
+            payload["password"] = password
+            payload["access_token"] = tokens.access_token
+            payload["refresh_token"] = tokens.refresh_token
+            payload["token_expires_at"] = tokens.expires_at.isoformat() if tokens.expires_at else None
+            payload["rate_count"] = len(rates)
+            upsert_conversation(session, incoming.user_id, "sub2_target", payload)
+            return f"我测试，登录成功，已读取 {len(rates)} 个渠道分组。现在输入报告群号/私聊QQ号 (G+群号 或者 P+QQ号)"
+
+        if step == "sub2_target":
+            try:
+                target_type, target_id = parse_target(text)
+            except ValueError as exc:
+                return str(exc)
+            token_expires_at = _parse_datetime(payload.get("token_expires_at"))
+            config = Sub2Config(
+                name=payload["name"],
+                target_type=target_type,
+                target_id=target_id,
+                base_url=payload["base_url"],
+                email=payload["email"],
+                password_encrypted=self.secret_box.encrypt(payload["password"]),
+                access_token_encrypted=self.secret_box.encrypt(payload["access_token"]),
+                refresh_token_encrypted=(
+                    self.secret_box.encrypt(payload["refresh_token"]) if payload.get("refresh_token") else None
+                ),
+                token_expires_at=token_expires_at,
+                enabled=True,
+            )
+            session.add(config)
+            try:
+                session.commit()
+            except IntegrityError:
+                session.rollback()
+                return "这个 Sub2API 名称刚刚被占用了，请发送 /addsub2 重新开始。"
+            session.refresh(config)
+
+            try:
+                rates = await self.sub2_client.fetch_rates_with_cached_token(
+                    session,
+                    config,
+                    self.secret_box,
+                )
+                sync_sub2_rates(session, config, rates)
+                config.last_checked_at = utc_now()
+                config.last_error = None
+                session.commit()
+            except Sub2ApiError as exc:
+                config.last_error = str(exc)
+                session.commit()
+
+            clear_conversation(session, incoming.user_id)
+            if target_type == "group":
+                in_group = await self.onebot.is_in_group(target_id)
+                state_text = "在" if in_group else "不在" if in_group is False else "无法确认是否在"
+                return f"你添加了一个群聊，我{state_text}这个群里面。添加成功。"
+            return "你添加了一个私聊通知目标。添加成功。"
+
+        clear_conversation(session, incoming.user_id)
+        return "Sub2API 对话状态异常，已重置。请重新发送 /addsub2。"
 
     async def _continue_addapi(
         self,
@@ -384,3 +573,12 @@ def log_incoming_message(session: Session, message: IncomingMessage, reply: str 
     )
     session.add(row)
     session.commit()
+
+
+def _parse_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None

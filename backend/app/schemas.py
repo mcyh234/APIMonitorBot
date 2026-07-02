@@ -79,6 +79,35 @@ class ConfigStatusBarsOut(BaseModel):
     windows: list[StatusWindowOut]
 
 
+class Sub2RateHistoryPointOut(BaseModel):
+    recorded_at: datetime
+    rate_multiplier: float
+
+
+class Sub2RateOut(BaseModel):
+    platform: str
+    group_key: str
+    group_name: str
+    rate_multiplier: float
+    previous_rate: float | None
+    change_percent: float | None
+    last_seen_at: datetime
+    history: list[Sub2RateHistoryPointOut]
+
+
+class Sub2PriceBoardOut(BaseModel):
+    config_id: int
+    name: str
+    target_type: str
+    target_id: str
+    target: str
+    base_url: str
+    enabled: bool
+    last_checked_at: datetime | None
+    last_error: str | None
+    rates: list[Sub2RateOut]
+
+
 class ReceivedMessageOut(BaseModel):
     id: int
     received_at: datetime

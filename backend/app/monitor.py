@@ -12,10 +12,13 @@ from sqlalchemy.orm import Session
 
 from backend.app.availability import ApiProbe, CheckResult, InternetConnectivityProbe
 from backend.app.crypto import SecretBox
-from backend.app.models import APIConfig, CheckRecord
+from backend.app.models import APIConfig, CheckRecord, Sub2Config
 from backend.app.notifier import Notifier, NotifyTarget
 from backend.app.repository import today_availability
 from backend.app.settings import Settings
+from backend.app.sub2_price_image import Sub2PriceBoard, render_sub2_price_image
+from backend.app.sub2_rates import stored_sub2_rate_views, sync_sub2_rates
+from backend.app.sub2api import Sub2ApiClient
 from backend.app.time_utils import coerce_aware_utc, utc_now
 
 logger = logging.getLogger(__name__)
@@ -60,6 +63,7 @@ class MonitorService:
         notifier: Notifier,
         probe: ApiProbe | None = None,
         internet_probe: InternetConnectivityProbe | None = None,
+        sub2_client: Sub2ApiClient | None = None,
     ) -> None:
         self.settings = settings
         self.secret_box = secret_box
@@ -69,6 +73,7 @@ class MonitorService:
             url=settings.internet_check_url,
             timeout_seconds=settings.internet_check_timeout_seconds,
         )
+        self.sub2_client = sub2_client or Sub2ApiClient(timeout_seconds=settings.request_timeout_seconds)
         self._lock = asyncio.Lock()
         self._last_scheduled_run_at: datetime | None = None
         self._last_internet_disconnect_notified_at: datetime | None = None
@@ -119,11 +124,15 @@ class MonitorService:
 
     async def run_all_scheduled(self, session_factory) -> None:
         now = utc_now()
-        if not self.should_run_scheduled(now):
-            return
         if self._lock.locked():
             return
         async with self._lock:
+            with session_factory() as session:
+                await self._run_sub2_scheduled(session)
+
+            now = utc_now()
+            if not self.should_run_scheduled(now):
+                return
             self._last_scheduled_run_at = now
             with session_factory() as session:
                 configs = list(session.scalars(select(APIConfig).where(APIConfig.enabled.is_(True))).all())
@@ -144,6 +153,37 @@ class MonitorService:
                     except Exception:
                         logger.exception("Scheduled check failed for %s", config.name)
                 await self._send_grouped_notifications(events)
+
+    async def _run_sub2_scheduled(self, session: Session) -> None:
+        configs = list(session.scalars(select(Sub2Config).where(Sub2Config.enabled.is_(True))).all())
+        for config in configs:
+            try:
+                rates = await self.sub2_client.fetch_rates_with_cached_token(
+                    session,
+                    config,
+                    self.secret_box,
+                )
+                changes = sync_sub2_rates(session, config, rates)
+                config.last_checked_at = utc_now()
+                config.last_error = None
+                session.commit()
+                if changes:
+                    rate_views = stored_sub2_rate_views(session, config)
+                    image = render_sub2_price_image(
+                        [Sub2PriceBoard(config.name, rate_views, changes)],
+                        title="Sub2API 价格变动",
+                        timezone_name=self.settings.app_timezone,
+                    )
+                    await self.notifier.send_image(
+                        NotifyTarget(config.target_type, config.target_id),
+                        image,
+                        "sub2-price-change.png",
+                    )
+            except Exception as exc:
+                logger.exception("Scheduled Sub2API check failed for %s", config.name)
+                config.last_checked_at = utc_now()
+                config.last_error = str(exc)
+                session.commit()
 
     def _record_result(self, session: Session, config: APIConfig, result: CheckResult, scheduled: bool) -> None:
         now = utc_now()

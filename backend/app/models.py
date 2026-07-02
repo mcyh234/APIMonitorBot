@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from backend.app.time_utils import utc_now
@@ -69,6 +69,72 @@ class CheckRecord(Base):
     scheduled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
 
     api_config: Mapped[APIConfig] = relationship(back_populates="records")
+
+
+class Sub2Config(TimestampMixin, Base):
+    __tablename__ = "sub2_configs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    target_type: Mapped[str] = mapped_column(String(16), index=True)
+    target_id: Mapped[str] = mapped_column(String(64), index=True)
+    base_url: Mapped[str] = mapped_column(String(512))
+    email: Mapped[str] = mapped_column(String(255))
+    password_encrypted: Mapped[str] = mapped_column(Text)
+    access_token_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    refresh_token_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    rates: Mapped[list["Sub2ChannelRate"]] = relationship(
+        back_populates="sub2_config",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    rate_history: Mapped[list["Sub2RateHistory"]] = relationship(
+        back_populates="sub2_config",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class Sub2ChannelRate(Base):
+    __tablename__ = "sub2_channel_rates"
+    __table_args__ = (
+        UniqueConstraint("sub2_config_id", "platform", "group_key", name="uq_sub2_rate_group"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sub2_config_id: Mapped[int] = mapped_column(
+        ForeignKey("sub2_configs.id", ondelete="CASCADE"),
+        index=True,
+    )
+    platform: Mapped[str] = mapped_column(String(64), index=True)
+    group_key: Mapped[str] = mapped_column(String(128), index=True)
+    group_name: Mapped[str] = mapped_column(String(255))
+    rate_multiplier: Mapped[float] = mapped_column(Float)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+    sub2_config: Mapped[Sub2Config] = relationship(back_populates="rates")
+
+
+class Sub2RateHistory(Base):
+    __tablename__ = "sub2_rate_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sub2_config_id: Mapped[int] = mapped_column(
+        ForeignKey("sub2_configs.id", ondelete="CASCADE"),
+        index=True,
+    )
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    platform: Mapped[str] = mapped_column(String(64), index=True)
+    group_key: Mapped[str] = mapped_column(String(128), index=True)
+    group_name: Mapped[str] = mapped_column(String(255))
+    rate_multiplier: Mapped[float] = mapped_column(Float)
+
+    sub2_config: Mapped[Sub2Config] = relationship(back_populates="rate_history")
 
 
 class BotAdmin(TimestampMixin, Base):

@@ -6,10 +6,11 @@ from sqlalchemy.orm import sessionmaker
 
 from backend.app.availability import CheckResult, ConnectivityResult
 from backend.app.crypto import SecretBox
-from backend.app.models import APIConfig, Base, CheckRecord
+from backend.app.models import APIConfig, Base, CheckRecord, Sub2ChannelRate, Sub2Config, Sub2RateHistory
 from backend.app.monitor import MonitorService, night_saver_active, scheduled_interval_seconds
 from backend.app.notifier import NotifyTarget
 from backend.app.settings import Settings
+from backend.app.sub2api import Sub2ChannelRateSnapshot
 
 
 class SequenceProbe:
@@ -25,9 +26,13 @@ class SequenceProbe:
 class FakeNotifier:
     def __init__(self):
         self.messages: list[tuple[NotifyTarget, str]] = []
+        self.images: list[tuple[NotifyTarget, str]] = []
 
     async def send(self, target: NotifyTarget, message: str) -> None:
         self.messages.append((target, message))
+
+    async def send_image(self, target: NotifyTarget, image_bytes: bytes, filename: str) -> None:
+        self.images.append((target, filename))
 
 
 class FakeInternetProbe:
@@ -38,6 +43,16 @@ class FakeInternetProbe:
     async def check(self) -> ConnectivityResult:
         self.calls += 1
         return self.result
+
+
+class FakeSub2Client:
+    def __init__(self, rates: list[Sub2ChannelRateSnapshot]):
+        self.rates = rates
+        self.calls = 0
+
+    async def fetch_rates_with_cached_token(self, session, config, secret_box):
+        self.calls += 1
+        return list(self.rates)
 
 
 def make_session():
@@ -65,6 +80,33 @@ def add_config(session, secret_box, name="cfg", target_type="group", target_id="
     session.add(config)
     session.commit()
     session.refresh(config)
+    return config
+
+
+def add_sub2_config(session, secret_box, name="sub2", target_id="123"):
+    config = Sub2Config(
+        name=name,
+        target_type="group",
+        target_id=target_id,
+        base_url="https://pool.example.com",
+        email="bot@example.com",
+        password_encrypted=secret_box.encrypt("password"),
+        access_token_encrypted=secret_box.encrypt("access-token"),
+        enabled=True,
+    )
+    session.add(config)
+    session.commit()
+    session.refresh(config)
+    session.add(
+        Sub2ChannelRate(
+            sub2_config_id=config.id,
+            platform="openai",
+            group_key="2",
+            group_name="OpenAi",
+            rate_multiplier=0.1,
+        )
+    )
+    session.commit()
     return config
 
 
@@ -160,6 +202,39 @@ async def test_run_all_scheduled_merges_same_target_outage_notifications():
     assert "【cfg-a】" in message
     assert "【cfg-b】" in message
     assert message.count("当前出现业务中断") == 2
+
+
+@pytest.mark.asyncio
+async def test_run_all_scheduled_sends_sub2_price_change_image():
+    session_factory = make_session_factory()
+    secret_box = SecretBox("test-key")
+    with session_factory() as session:
+        add_sub2_config(session, secret_box, name="gptstore", target_id="123")
+
+    notifier = FakeNotifier()
+    sub2_client = FakeSub2Client([Sub2ChannelRateSnapshot("openai", "2", "OpenAi", 0.06)])
+    monitor = MonitorService(
+        Settings(night_saver_enabled=False),
+        secret_box,
+        notifier,
+        probe=SequenceProbe([]),
+        sub2_client=sub2_client,
+    )
+
+    await monitor.run_all_scheduled(session_factory)
+
+    assert sub2_client.calls == 1
+    assert notifier.images == [(NotifyTarget("group", "123"), "sub2-price-change.png")]
+    with session_factory() as session:
+        row = session.scalar(select(Sub2ChannelRate).where(Sub2ChannelRate.group_key == "2"))
+        assert row.rate_multiplier == 0.06
+        history = session.scalars(
+            select(Sub2RateHistory)
+            .where(Sub2RateHistory.sub2_config_id == row.sub2_config_id)
+            .where(Sub2RateHistory.group_key == "2")
+            .order_by(Sub2RateHistory.recorded_at)
+        ).all()
+        assert [item.rate_multiplier for item in history] == [0.1, 0.06]
 
 
 @pytest.mark.asyncio

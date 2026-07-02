@@ -18,6 +18,9 @@ class Notifier:
     async def send(self, target: NotifyTarget, message: str) -> None:
         raise NotImplementedError
 
+    async def send_image(self, target: NotifyTarget, image_bytes: bytes, filename: str) -> None:
+        raise NotImplementedError
+
 
 class OneBotNotifier(Notifier):
     def __init__(self, client: OneBotClient, session_factory: sessionmaker | None = None) -> None:
@@ -26,6 +29,17 @@ class OneBotNotifier(Notifier):
 
     async def send(self, target: NotifyTarget, message: str) -> None:
         result = await self.client.send_message(target.target_type, target.target_id, message)
+        if self.session_factory is not None:
+            with self.session_factory() as session:
+                record_send_result(session, result)
+
+    async def send_image(self, target: NotifyTarget, image_bytes: bytes, filename: str) -> None:
+        result = await self.client.send_image_message(
+            target.target_type,
+            target.target_id,
+            image_bytes,
+            filename,
+        )
         if self.session_factory is not None:
             with self.session_factory() as session:
                 record_send_result(session, result)
