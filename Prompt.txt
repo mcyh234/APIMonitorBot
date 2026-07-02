@@ -1,0 +1,163 @@
+###1###计划模式 GPT5.5 XHigh
+这个项目文件夹是空项目
+我们来写一个API状态监视器bot，用于监听OpenAI BaseURL &Apikeys的可用性，  
+当服务不可用时，通过HTTP OneBot协议 （未来适配telegram 机器人） 向群聊或者私聊推送消息  
+你先了解Onebot v11 如何通过Http发送消息 并且 支持Onebot后端的accesstoken
+
+这套系统有完整的webui 以及可以在私聊内直接控制机器人 支持多个Bot管理员
+包含权限控制的命令系统
+
+
+比如管理员对Bot输入 /addapi
+此时添加一个多轮对话 ，
+bot发送： 请输入api配置名称
+管理员发送：G1234567890
+bot发送： 请输入报告群号/私聊QQ号 (G+群号 或者 P+QQ号)
+管理员发送：G1234567890
+bot发送： 你添加了一个群聊 我在（不在）这个群里面。请输入BeseURL
+管理员发送： https://<baseurl>/v1
+bot发送： 请输入APIKey
+管理员发送：<sk-码住>
+bot发送：请输入监听模型名称
+管理员发送：gpt-5.4-mini
+bot完成一次验证可用(调用api发送hi， 取返回结果) 后告诉管理员 添加成功
+
+添加一个可用性检查定时器任务， 每1分钟检查一次所有api的可用性，记录下返回code ，如果不可用  应当再检测一次 如果还是不可用 立即在通知群聊里面发布通报:
+"【API配置名】
+当前出现业务中断： <返回code>
+今日可用性占比: 99.0%
+"
+出现api不可用通报后 10分钟内不再通报不可用 10分钟(10次检查)后仍未恢复 则再发一次通报
+"【API配置名】
+10分钟仍未恢复业务： <返回code>
+今日可用性占比: 99.0%
+待恢复后会发布恢复通报
+"
+此后不再通报 继续每1分钟的检查  直到检测到2次恢复 则发布通报
+"【API配置名】
+当前服务恢复可用
+今日可用性占比: 99.0%
+"
+
+
+指令系统:
+/list 列出所有正在运行的配置名 《仅限机器人管理员》
+/remove <apiname> 删除名为apiname的检测项 《仅限机器人管理员》
+/addapi 开始多轮对话添加API《仅限机器人管理员》
+/check <apiname> 立即检查一次名为apiname的检测项  返回服务可用性通报 每5分钟每人只能用一次
+
+默认管理员QQ号：
+1234567890
+
+
+###2### plan
+API 状态监视器 Bot 实施计划
+Summary
+从空项目实现一个本机单服务：FastAPI 后端 + React WebUI + SQLite。后端负责 API 可用性巡检、OneBot v11 通知发送、OneBot 消息接收、管理员命令、多轮添加配置、权限控制和加密存储。
+OneBot 接入分两层：
+发消息：HTTP API 调用 send_group_msg / send_private_msg，支持 Authorization: Bearer <access_token>。
+收消息：优先支持 WebSocket 连接 OneBot 事件流，连接时携带 access token；同时保留 HTTP webhook 入口作为备用传输。
+Key Changes
+后端栈：FastAPI、Uvicorn、SQLite、SQLModel/SQLAlchemy、Alembic、httpx、APScheduler、websockets、cryptography。
+前端栈：React + Vite，构建后由 FastAPI 静态托管。
+本地配置：.env 包含 ONEBOT_API_BASE_URL、ONEBOT_WS_URL、ONEBOT_ACCESS_TOKEN、SECRET_MASTER_KEY、APP_HOST=127.0.0.1、APP_PORT。
+密钥策略：APIKey、OneBot token 使用环境主密钥加密后存 SQLite；Web API 不返回明文密钥。
+默认管理员：启动时自动创建 QQ 管理员 1234567890，后续支持 WebUI 管理多个管理员。
+Backend Behavior
+建立 OneBot 客户端模块：HTTP sender 负责群聊/私聊通知。
+WebSocket receiver 负责接收私聊和群聊消息事件，断线后自动重连。
+WebSocket 握手携带 Authorization: Bearer <token>；必要时兼容 query token 配置。
+
+命令系统：/list：仅管理员，列出配置名。
+/remove <apiname>：仅管理员，删除检测项。
+/addapi：仅管理员，进入多轮添加流程；APIKey 收集强制私聊完成。
+/check <apiname>：群聊只允许查询本群绑定的 API；私聊仅管理员；每个 QQ 用户 5 分钟限一次。
+
+/addapi 流程：配置名 -> 报告目标 G群号 / PQQ号 -> BaseURL -> APIKey -> 模型名。
+保存前立即调用 OpenAI 兼容 chat/completions 发送 hi 验证。
+验证成功后入库并启用巡检。
+
+Monitoring Behavior
+每 1 分钟检查所有启用 API。
+探测请求：POST {base_url}/chat/completions，使用对应 APIKey、模型名和 hi 消息。
+可用判定：HTTP 2xx 且返回 assistant 内容；401/403/429/5xx、超时、网络错误、JSON 异常都算不可用。
+首次失败后立即二次确认；二次仍失败才进入不可用状态。
+通知策略：首次确认不可用：立即发送“当前出现业务中断”。
+10 分钟内不重复发送不可用通知。
+10 次巡检后仍不可用：发送“10分钟仍未恢复业务”，之后静默。
+故障后连续 2 次恢复成功：发送“当前服务恢复可用”。
+
+今日可用性按 Asia/Shanghai 自然日统计，只统计定时巡检结果。
+WebUI
+首页显示所有 API 配置、当前状态、今日可用性、最近错误码、最近检查时间。
+支持新增、删除、启停、立即检查 API 配置。
+支持查看单个配置的巡检历史。
+支持管理员 QQ 列表管理。
+第一版 WebUI 仅监听 127.0.0.1，免登录；若以后开放局域网/公网，再补登录鉴权。
+Test Plan
+单元测试：BaseURL 拼接、API 探测解析、密钥加解密、命令解析、权限判断、限流判断。
+状态机测试：首次故障、10 分钟仍未恢复、连续 2 次恢复。
+OneBot 测试：mock HTTP 发送接口、mock WebSocket 消息事件、验证 access token header。
+集成测试：模拟 /addapi 多轮对话、配置入库、定时巡检、告警通知。
+前端测试：构建通过，页面能完成配置 CRUD、手动检查、历史查看和管理员维护。
+Assumptions
+第一版默认使用 OneBot WebSocket 收消息，HTTP POST webhook 作为备用。
+第一版不接 Telegram，但通知发送层预留 Notifier 抽象，后续可增加 Telegram 实现。
+WebUI 默认只本机访问，所以暂不做账号登录。
+群成员身份校验以 OneBot 能提供的信息为准；无法确认时只允许管理员操作。
+
+
+是的，执行此计划
+
+
+做了44m
+
+已按计划实现完整第一版。
+做好的东西包括：FastAPI 后端、SQLite 数据模型、APIKey 加密存储、OneBot HTTP 发消息、OneBot WebSocket 收消息、HTTP webhook 备用入口、管理员命令系统、/addapi 多轮对话、每分钟巡检和告警状态机、React WebUI、README、测试套件。
+验证已通过：
+.venv\Scripts\python.exe -m pytest：9 passed
+.venv\Scripts\python.exe -m py_compile ...：通过
+npm run build：通过
+本地冒烟：/api/status 正常、默认管理员 1234567890 自动创建、首页返回 200
+运行前按 README 复制 .env.example 为 .env，生成并填入 SECRET_MASTER_KEY，再配置 OneBot 的 HTTP/WS 地址和 access token。
+
+###3###
+再加一个 最近10条接收到的消息 在webui里体现 ，如果触发机器人动作 则添加高亮
+给 WebUI 加“最近发送失败原因”
+
+###4###
+添加夜间省流： 每1分钟检测改为每10分钟检测 注意时区检查，使用北京时间东八区 夜间22:00~08:00均省流
+
+###5###
+对于Timeout 不作为检查的依据，不应在群里通知 ， 如果出现timeout 尝试检查google.com的连接可用性 如果也不可用 应当通知默认管理员 当前国际互联网连接断开
+
+###6###
+修改 “今日可用性占比” 这个表述 改为最近请求成功率
+
+###7###
+在webui添加 api名称、模型名称编辑按钮 🖊
+
+###8###
+添加命令 /status 渲染显示状态条图  发送到通知里
+在webui添加状态条图，显示最近30分钟/5小时/24小时 内的接口状态 
+灰色代表未检查 绿色代表200可用 黄色代表部分时间可用 红色代表503 404之类的不可用状态
+如果status后面不加参数 默认发送本群(通知对象) 的所有接口状态 合成一张图 最近30分钟/每小时/每天 
+冷却时长5分钟
+
+另外 NETWORK_ERROR不需要通知 你先修这个
+
+###9###
+添加一个网页快照图 拉取功能
+命令 /stat
+访问https://网页/ 
+截图整个网页从上到下 ，将请求成功率时间改为1小时
+冷却时间5分钟
+发到通知对象里
+
+###10###
+操作太频繁，这个不对管理员生效 ， 管理员随便调用命令。
+
+###11###
+将本项目打包出一份可以提交到GitHub的zip
+以及提供中文readme  优化快速上手教程 、 待实现功能、许可证
+
