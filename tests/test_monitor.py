@@ -83,10 +83,10 @@ def add_config(session, secret_box, name="cfg", target_type="group", target_id="
     return config
 
 
-def add_sub2_config(session, secret_box, name="sub2", target_id="123"):
+def add_sub2_config(session, secret_box, name="sub2", target_type="group", target_id="123"):
     config = Sub2Config(
         name=name,
-        target_type="group",
+        target_type=target_type,
         target_id=target_id,
         base_url="https://pool.example.com",
         email="bot@example.com",
@@ -205,7 +205,30 @@ async def test_run_all_scheduled_merges_same_target_outage_notifications():
 
 
 @pytest.mark.asyncio
+async def test_run_all_scheduled_expands_multi_target_outage_notifications():
+    session_factory = make_session_factory()
+    secret_box = SecretBox("test-key")
+    with session_factory() as session:
+        add_config(session, secret_box, name="cfg-multi", target_type="multi", target_id="G123&P456")
+
+    notifier = FakeNotifier()
+    down = CheckResult(ok=False, code="500", error="boom")
+    monitor = MonitorService(
+        Settings(check_retry_delay_seconds=0, night_saver_enabled=False),
+        secret_box,
+        notifier,
+        probe=SequenceProbe([down, down]),
+    )
+
+    await monitor.run_all_scheduled(session_factory)
+
+    targets = sorted((target.target_type, target.target_id) for target, _message in notifier.messages)
+    assert targets == [("group", "123"), ("private", "456")]
+    assert all("【cfg-multi】" in message for _target, message in notifier.messages)
+
+@pytest.mark.asyncio
 async def test_run_all_scheduled_sends_sub2_price_change_image():
+
     session_factory = make_session_factory()
     secret_box = SecretBox("test-key")
     with session_factory() as session:
@@ -225,6 +248,11 @@ async def test_run_all_scheduled_sends_sub2_price_change_image():
 
     assert sub2_client.calls == 1
     assert notifier.images == [(NotifyTarget("group", "123"), "sub2-price-change.png")]
+    assert len(notifier.messages) == 1
+    message_target, message = notifier.messages[0]
+    assert message_target == NotifyTarget("group", "123")
+    assert "Sub2API 渠道分组发生变化" in message
+    assert "OpenAI / OpenAi：0.1x -> 0.06x，下跌 40.0%" in message
     with session_factory() as session:
         row = session.scalar(select(Sub2ChannelRate).where(Sub2ChannelRate.group_key == "2"))
         assert row.rate_multiplier == 0.06
@@ -238,7 +266,64 @@ async def test_run_all_scheduled_sends_sub2_price_change_image():
 
 
 @pytest.mark.asyncio
+async def test_run_all_scheduled_sends_sub2_price_change_image_to_multi_targets():
+    session_factory = make_session_factory()
+    secret_box = SecretBox("test-key")
+    with session_factory() as session:
+        add_sub2_config(session, secret_box, name="gptstore", target_type="multi", target_id="G123&P456")
+
+    notifier = FakeNotifier()
+    sub2_client = FakeSub2Client([Sub2ChannelRateSnapshot("openai", "2", "OpenAi", 0.06)])
+    monitor = MonitorService(
+        Settings(night_saver_enabled=False),
+        secret_box,
+        notifier,
+        probe=SequenceProbe([]),
+        sub2_client=sub2_client,
+    )
+
+    await monitor.run_all_scheduled(session_factory)
+
+    image_targets = sorted((target.target_type, target.target_id, filename) for target, filename in notifier.images)
+    assert image_targets == [
+        ("group", "123", "sub2-price-change.png"),
+        ("private", "456", "sub2-price-change.png"),
+    ]
+    message_targets = sorted((target.target_type, target.target_id) for target, _message in notifier.messages)
+    assert message_targets == [("group", "123"), ("private", "456")]
+    assert all("OpenAI / OpenAi：0.1x -> 0.06x，下跌 40.0%" in message for _target, message in notifier.messages)
+
+@pytest.mark.asyncio
+async def test_run_all_scheduled_notifies_sub2_deleted_group():
+    session_factory = make_session_factory()
+    secret_box = SecretBox("test-key")
+    with session_factory() as session:
+        add_sub2_config(session, secret_box, name="gptstore", target_id="123")
+
+    notifier = FakeNotifier()
+    sub2_client = FakeSub2Client([])
+    monitor = MonitorService(
+        Settings(night_saver_enabled=False),
+        secret_box,
+        notifier,
+        probe=SequenceProbe([]),
+        sub2_client=sub2_client,
+    )
+
+    await monitor.run_all_scheduled(session_factory)
+
+    assert notifier.images == [(NotifyTarget("group", "123"), "sub2-price-change.png")]
+    assert len(notifier.messages) == 1
+    target, message = notifier.messages[0]
+    assert target == NotifyTarget("group", "123")
+    assert "OpenAI / OpenAi：分组已删除，最后倍率 0.1x" in message
+    with session_factory() as session:
+        assert session.scalar(select(Sub2ChannelRate).where(Sub2ChannelRate.group_key == "2")) is None
+
+@pytest.mark.asyncio
 async def test_scheduled_timeout_is_ignored_when_google_is_reachable():
+
+
     session = make_session()
     secret_box = SecretBox("test-key")
     config = add_config(session, secret_box)

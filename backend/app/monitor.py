@@ -14,11 +14,11 @@ from backend.app.availability import ApiProbe, CheckResult, InternetConnectivity
 from backend.app.crypto import SecretBox
 from backend.app.models import APIConfig, CheckRecord, Sub2Config
 from backend.app.notifier import Notifier, NotifyTarget
-from backend.app.repository import today_availability
+from backend.app.repository import target_entries, today_availability
 from backend.app.settings import Settings
 from backend.app.sub2_price_image import Sub2PriceBoard, render_sub2_price_image
-from backend.app.sub2_rates import stored_sub2_rate_views, sync_sub2_rates
-from backend.app.sub2api import Sub2ApiClient
+from backend.app.sub2_rates import Sub2RateChange, stored_sub2_rate_views, sync_sub2_rates
+from backend.app.sub2api import Sub2ApiClient, format_rate, platform_label
 from backend.app.time_utils import coerce_aware_utc, utc_now
 
 logger = logging.getLogger(__name__)
@@ -28,6 +28,31 @@ IGNORED_SCHEDULED_CODES = {"TIMEOUT", "NETWORK_ERROR"}
 def status_message(config: APIConfig, body: str, availability: float, code: str | None = None) -> str:
     code_text = f": {code}" if code else ""
     return f"【{config.name}】\n{body}{code_text}\n最近请求成功率: {availability:.1f}%"
+
+
+def sub2_change_message(config: Sub2Config, changes: list[Sub2RateChange]) -> str:
+    lines = [f"【{config.name}】", "Sub2API 渠道分组发生变化："]
+    for change in changes:
+        prefix = f"- {platform_label(change.platform)} / {change.group_name}"
+        if change.is_deleted:
+            lines.append(f"{prefix}：分组已删除，最后倍率 {format_rate(change.old_rate)}")
+            continue
+        new_rate = change.new_rate
+        if new_rate is None:
+            continue
+        percent = _rate_change_percent(change.old_rate, new_rate)
+        direction = "上涨" if percent is not None and percent > 0 else "下跌" if percent is not None and percent < 0 else "变化"
+        percent_text = f"，{direction} {abs(percent):.1f}%" if percent is not None else ""
+        lines.append(
+            f"{prefix}：{format_rate(change.old_rate)} -> {format_rate(new_rate)}{percent_text}"
+        )
+    return "\n".join(lines)
+
+
+def _rate_change_percent(old_rate: float, new_rate: float | None) -> float | None:
+    if new_rate is None or math.isclose(old_rate, 0, rel_tol=0, abs_tol=1e-12):
+        return None
+    return (new_rate - old_rate) / old_rate * 100
 
 
 @dataclass(slots=True)
@@ -149,7 +174,7 @@ class MonitorService:
                         if result.code not in IGNORED_SCHEDULED_CODES:
                             event = self._notification_event(session, config, result)
                             if event is not None:
-                                events.append(event)
+                                events.extend(self._expand_event_targets(config, event))
                     except Exception:
                         logger.exception("Scheduled check failed for %s", config.name)
                 await self._send_grouped_notifications(events)
@@ -174,11 +199,15 @@ class MonitorService:
                         title="Sub2API 价格变动",
                         timezone_name=self.settings.app_timezone,
                     )
-                    await self.notifier.send_image(
-                        NotifyTarget(config.target_type, config.target_id),
-                        image,
-                        "sub2-price-change.png",
-                    )
+                    message = sub2_change_message(config, changes)
+                    for target_type, target_id in target_entries(config.target_type, config.target_id):
+                        target = NotifyTarget(target_type, target_id)
+                        await self.notifier.send_image(
+                            target,
+                            image,
+                            "sub2-price-change.png",
+                        )
+                        await self.notifier.send(target, message)
             except Exception as exc:
                 logger.exception("Scheduled Sub2API check failed for %s", config.name)
                 config.last_checked_at = utc_now()
@@ -301,7 +330,14 @@ class MonitorService:
     async def _handle_notifications(self, session: Session, config: APIConfig, result: CheckResult) -> None:
         event = self._notification_event(session, config, result)
         if event is not None:
-            await self.notifier.send(event.target, event.message)
+            for expanded_event in self._expand_event_targets(config, event):
+                await self.notifier.send(expanded_event.target, expanded_event.message)
+
+    def _expand_event_targets(self, config: APIConfig, event: NotificationEvent) -> list[NotificationEvent]:
+        return [
+            NotificationEvent(NotifyTarget(target_type, target_id), event.message)
+            for target_type, target_id in target_entries(config.target_type, config.target_id)
+        ]
 
     async def _send_grouped_notifications(self, events: list[NotificationEvent]) -> None:
         grouped: dict[tuple[str, str], list[NotificationEvent]] = {}

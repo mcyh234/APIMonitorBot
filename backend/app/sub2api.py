@@ -99,7 +99,7 @@ class Sub2ApiClient:
         )
 
     async def fetch_rates(self, base_url: str, access_token: str) -> list[Sub2ChannelRateSnapshot]:
-        url = normalize_sub2_url(base_url, "/api/v1/channels/available")
+        url = normalize_sub2_url(base_url, "/api/v1/groups/available")
         try:
             response = await self._get(url, {"Authorization": f"Bearer {access_token}"})
         except httpx.TimeoutException as exc:
@@ -116,7 +116,7 @@ class Sub2ApiClient:
         rows = data.get("data")
         if not isinstance(rows, list):
             raise Sub2ApiError("渠道响应 data 不是列表。")
-        return flatten_channel_rates(rows)
+        return flatten_group_rates(rows)
 
     async def fetch_rates_with_cached_token(
         self,
@@ -154,42 +154,34 @@ class Sub2ApiClient:
             return await client.get(url, headers=headers)
 
 
-def flatten_channel_rates(rows: list[Any]) -> list[Sub2ChannelRateSnapshot]:
+def flatten_group_rates(rows: list[Any]) -> list[Sub2ChannelRateSnapshot]:
     snapshots: list[Sub2ChannelRateSnapshot] = []
-    for channel in rows:
-        if not isinstance(channel, dict):
+    for group in rows:
+        if not isinstance(group, dict):
             continue
-        platforms = channel.get("platforms")
-        if not isinstance(platforms, list):
+        name = str(group.get("name") or "").strip()
+        if not name:
             continue
-        for platform_item in platforms:
-            if not isinstance(platform_item, dict):
-                continue
-            platform = str(platform_item.get("platform") or channel.get("name") or "unknown").strip().lower()
-            groups = platform_item.get("groups")
-            if not isinstance(groups, list):
-                continue
-            for group in groups:
-                if not isinstance(group, dict):
-                    continue
-                name = str(group.get("name") or "").strip()
-                if not name:
-                    continue
-                rate = group.get("rate_multiplier")
-                if not isinstance(rate, (int, float)):
-                    continue
-                group_id = group.get("id")
-                group_key = str(group_id) if group_id is not None else name
-                snapshots.append(
-                    Sub2ChannelRateSnapshot(
-                        platform=platform,
-                        group_key=group_key,
-                        group_name=name,
-                        rate_multiplier=float(rate),
-                    )
-                )
+        rate = group.get("rate_multiplier")
+        if not isinstance(rate, (int, float)):
+            continue
+        group_id = group.get("id")
+        group_key = str(group_id) if group_id is not None else name
+        platform = str(group.get("platform") or "unknown").strip().lower()
+        snapshots.append(
+            Sub2ChannelRateSnapshot(
+                platform=platform,
+                group_key=group_key,
+                group_name=name,
+                rate_multiplier=float(rate),
+            )
+        )
     snapshots.sort(key=lambda item: (platform_label(item.platform), item.group_name))
     return snapshots
+
+
+def flatten_channel_rates(rows: list[Any]) -> list[Sub2ChannelRateSnapshot]:
+    return flatten_group_rates(rows)
 
 
 def _cached_access_token(config: Sub2Config, secret_box: SecretBox) -> str | None:

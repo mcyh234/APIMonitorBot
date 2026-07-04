@@ -28,7 +28,7 @@ class APIConfig(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
     target_type: Mapped[str] = mapped_column(String(16), index=True)
-    target_id: Mapped[str] = mapped_column(String(64), index=True)
+    target_id: Mapped[str] = mapped_column(String(512), index=True)
     base_url: Mapped[str] = mapped_column(String(512))
     api_key_encrypted: Mapped[str] = mapped_column(Text)
     model_name: Mapped[str] = mapped_column(String(160))
@@ -77,7 +77,7 @@ class Sub2Config(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
     target_type: Mapped[str] = mapped_column(String(16), index=True)
-    target_id: Mapped[str] = mapped_column(String(64), index=True)
+    target_id: Mapped[str] = mapped_column(String(512), index=True)
     base_url: Mapped[str] = mapped_column(String(512))
     email: Mapped[str] = mapped_column(String(255))
     password_encrypted: Mapped[str] = mapped_column(Text)
@@ -144,6 +144,24 @@ class BotAdmin(TimestampMixin, Base):
     qq: Mapped[str] = mapped_column(String(64), unique=True, index=True)
 
 
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    value: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class BotCommandSetting(Base):
+    __tablename__ = "bot_command_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    command: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
 class ConversationState(Base):
     __tablename__ = "conversation_states"
     __table_args__ = (UniqueConstraint("user_id", name="uq_conversation_user_id"),)
@@ -187,7 +205,7 @@ class SendRecord(Base):
     sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
     action: Mapped[str] = mapped_column(String(64), index=True)
     target_type: Mapped[str] = mapped_column(String(16), index=True)
-    target_id: Mapped[str] = mapped_column(String(64), index=True)
+    target_id: Mapped[str] = mapped_column(String(512), index=True)
     message_preview: Mapped[str] = mapped_column(Text)
     ok: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)

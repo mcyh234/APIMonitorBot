@@ -270,7 +270,40 @@ async def test_handle_event_records_send_failure_reason():
 
 
 @pytest.mark.asyncio
+async def test_group_commands_match_multi_target_configs():
+    session = make_session()
+    secret_box = SecretBox("test-key")
+    session.add(
+        APIConfig(
+            name="cfg-multi",
+            target_type="multi",
+            target_id="G123456&P2087900785",
+            base_url="https://example.com/v1",
+            api_key_encrypted=secret_box.encrypt("sk-test"),
+            model_name="gpt-test",
+            enabled=True,
+        )
+    )
+    session.commit()
+    onebot = FakeOneBot()
+    router = CommandRouter(Settings(), onebot, secret_box, probe=FakeProbe())
+
+    check_reply = await router.handle_message(
+        session,
+        IncomingMessage(user_id="10001", message="/check cfg-multi", message_type="group", group_id="123456"),
+    )
+    status_reply = await router.handle_message(
+        session,
+        IncomingMessage(user_id="10001", message="/status cfg-multi", message_type="group", group_id="123456"),
+    )
+
+    assert "当前服务可用" in (check_reply or "")
+    assert status_reply == ""
+    assert onebot.sent == [("group", "123456", "[image:status.png]")]
+
+@pytest.mark.asyncio
 async def test_status_command_sends_group_status_image_and_uses_cooldown():
+
     session = make_session()
     secret_box = SecretBox("test-key")
     session.add(
@@ -300,6 +333,62 @@ async def test_status_command_sends_group_status_image_and_uses_cooldown():
 
     assert "操作太频繁" in (reply or "")
     assert onebot.sent == [("group", "123456", "[image:status.png]")]
+
+
+@pytest.mark.asyncio
+async def test_status_command_records_image_failure_without_followup_reply():
+    session = make_session()
+    secret_box = SecretBox("test-key")
+    session.add(
+        APIConfig(
+            name="cfg-one",
+            target_type="group",
+            target_id="123456",
+            base_url="https://example.com/v1",
+            api_key_encrypted=secret_box.encrypt("sk-test"),
+            model_name="gpt-test",
+            enabled=True,
+        )
+    )
+    session.commit()
+    onebot = FakeOneBot(ok=False, error="ws timeout")
+    router = CommandRouter(Settings(), onebot, secret_box, probe=FakeProbe())
+    incoming = IncomingMessage(user_id="10001", message="/status", message_type="group", group_id="123456")
+
+    reply = await router.handle_message(session, incoming)
+
+    assert reply == ""
+    assert onebot.sent == [("group", "123456", "[image:status.png]")]
+    send_row = session.scalar(select(SendRecord).where(SendRecord.message_preview == "[image:status.png]"))
+    assert send_row is not None
+    assert send_row.ok is False
+    assert send_row.error == "ws timeout"
+
+
+@pytest.mark.asyncio
+async def test_status_without_group_id_does_not_reply_permission_denied():
+    session = make_session()
+    secret_box = SecretBox("test-key")
+    session.add(
+        APIConfig(
+            name="cfg-one",
+            target_type="group",
+            target_id="123456",
+            base_url="https://example.com/v1",
+            api_key_encrypted=secret_box.encrypt("sk-test"),
+            model_name="gpt-test",
+            enabled=True,
+        )
+    )
+    session.commit()
+    onebot = FakeOneBot()
+    router = CommandRouter(Settings(), onebot, secret_box, probe=FakeProbe())
+    incoming = IncomingMessage(user_id="10001", message="/status", message_type="group", group_id=None)
+
+    reply = await router.handle_message(session, incoming)
+
+    assert reply == ""
+    assert onebot.sent == []
 
 
 @pytest.mark.asyncio

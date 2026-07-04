@@ -23,19 +23,18 @@ APIMonitorBot 是本机运行的 API 可用性监控服务：
 
 - 后端：FastAPI + SQLite + SQLAlchemy + APScheduler。
 - 前端：React + Vite + TypeScript。
-- 通知：OneBot v11 HTTP 发消息，WebSocket 或 HTTP webhook 收消息。
-- 第一版默认本机使用，WebUI 监听 `127.0.0.1`，暂不做登录鉴权。
+- 通知：OneBot v11 WebSocket 收发消息；OneBot HTTP 发送配置已弃用。
+- 第一版默认本机使用，WebUI 监听 `127.0.0.1`，首次进入必须设置 WebUI 进入密钥。
 - 通知发送层要保留未来适配 Telegram 的空间。
 
 ## OneBot 要求
 
-- 发消息使用 OneBot v11 HTTP API：
-  - `send_group_msg`
-  - `send_private_msg`
-- HTTP 发送必须支持 `Authorization: Bearer <ONEBOT_ACCESS_TOKEN>`。
-- 收消息优先使用 WebSocket，连接时携带 Bearer token。
+- 推荐 OneBot v11 WebSocket Server 单连接模式，NapCat 推荐开启 WebSocket Server。
+- WebSocket 连接既用于接收事件，也优先用于发送 `send_group_msg`、`send_private_msg`、`get_group_list` 等 action。
+- 收消息使用 WebSocket，连接时携带 Bearer token。
 - WebSocket 需要兼容 query token：`ONEBOT_WS_TOKEN_IN_QUERY=true`。
-- 保留 HTTP webhook 入口：`POST /onebot/webhook`。
+- 不要在 WebUI、README 或 `.env.example` 中引导配置 OneBot HTTP 发送；新部署只配置 WebSocket Server 和 NapCat token，避免重复发送。
+- `/onebot/webhook` 仅保留兼容响应，不再处理消息事件；避免 HTTP webhook 与 WebSocket 同时触发命令。
 - 图片发送使用 CQ 码 `base64://`，发送记录只保存短预览，例如 `[image:status.png]`，不要把完整 base64 写入 SQLite。
 
 ## 管理员和权限
@@ -44,7 +43,7 @@ APIMonitorBot 是本机运行的 API 可用性监控服务：
 - WebUI 支持维护多个管理员。
 - 管理员不受命令冷却限制，可以随便调用命令。
 - 普通用户调用 `/check`、`/status`、`/stat`、`/price` 有 5 分钟冷却。
-- 群聊普通用户只能操作或查看绑定本群通知对象的配置。
+- 群聊普通用户只能操作或查看绑定本群通知对象的配置；配置支持多个通知对象，例如 `G123456789&P1122334455`。
 - 私聊命令默认只允许管理员，除非后续明确开放。
 
 ## 命令系统
@@ -61,11 +60,13 @@ APIMonitorBot 是本机运行的 API 可用性监控服务：
 - `/price`：发送当前通知对象绑定的 Sub2API 价格表图片。
 - `/cancel`：取消多轮对话。
 
+除 `/cancel` 外，上述命令都必须支持 WebUI 命令开关；关闭后命令返回“该命令已关闭。”。
+
 `/addapi` 流程必须保持：
 
 1. 请输入 api 配置名称。
-2. 请输入报告群号/私聊 QQ 号，格式为 `G群号` 或 `PQQ号`。
-3. 如果是群聊目标，提示机器人在或不在该群。
+2. 请输入报告群号/私聊 QQ 号，格式为 `G群号` 或 `PQQ号`，多个通知对象用 `&` 连接，例如 `G123456789&P1122334455`。
+3. 如果包含群聊目标，逐个提示机器人在或不在对应群。
 4. 请输入 BaseURL。
 5. 请输入 APIKey，且 APIKey 必须在私聊中完成收集。
 6. 请输入监听模型名称。
@@ -79,8 +80,8 @@ APIMonitorBot 是本机运行的 API 可用性监控服务：
 3. 请输入 email。
 4. 请输入密码。
 5. 登录并读取渠道成功后，提示输入报告群号/私聊 QQ 号。
-6. 目标格式为 `G群号` 或 `PQQ号`。
-7. 如果是群聊目标，提示机器人在或不在该群。
+6. 目标格式为 `G群号` 或 `PQQ号`，多个通知对象用 `&` 连接。
+7. 如果包含群聊目标，逐个提示机器人在或不在对应群。
 8. 添加成功后立即保存当前渠道倍率，首次保存不发送价格变动通知。
 
 ## API 探测规则
@@ -109,7 +110,7 @@ POST {BaseURL}/chat/completions
 - 10 次巡检后仍未恢复，发送“10分钟仍未恢复业务”，之后保持静默。
 - 故障后连续 2 次恢复成功，发送“当前服务恢复可用”。
 - 通知文案中的可用性表述使用“最近请求成功率”，不要再写“今日可用性占比”。
-- 同一通知群或通知对象同一轮出现多个 API 状态变化时，合并成一条报告。
+- 同一通知群或通知对象同一轮出现多个 API 状态变化时，合并成一条报告；同一个 API 绑定多个通知对象时会分别投递到每个对象。
 
 ## 状态条图
 
@@ -140,24 +141,24 @@ WebUI 和 `/status` 都要使用一致的状态聚合逻辑。
 ## Sub2API 渠道倍率监控
 
 - 登录接口：`POST {BaseURL}/api/v1/auth/login`，请求体为 `{"email":"...","password":"..."}`。
-- 渠道接口：`GET {BaseURL}/api/v1/channels/available`，使用 `Authorization: Bearer <access_token>`。
-- 需要记录 `platforms[].groups[]` 中每个分组的 `rate_multiplier`。
+- 渠道接口：`GET {BaseURL}/api/v1/groups/available`，使用 `Authorization: Bearer <access_token>`。
+- 需要记录返回 `data[]` 中每个分组的 `platform`、`name` 和 `rate_multiplier`。
 - 首次看到分组和后续每次倍率变化都要追加倍率历史记录，用于 WebUI 和 `/price` 折线图。
 - token 和密码都要加密存储；token 未过期时复用，失效后重新登录。
 - 每分钟检测一次启用的 Sub2API 配置，不受 API 夜间省流跳过影响。
 - 首次添加只保存当前倍率，不通知。
-- 后续倍率变化时发送图片通报。
+- 后续倍率变化或分组被删除时发送图片通报，并在图片之后追加文字通报说明具体变化分组。
 - 图片要求：
   - Anthropic 渠道用橙色。
   - OpenAI 渠道用绿色。
   - 发生价格变动的分组高亮。
-  - 顶部列出 `旧倍率 -> 新倍率`。
+  - 顶部列出 `旧倍率 -> 新倍率`；分组删除时显示“已删除”和最后倍率。
   - 每个分组展示当前倍率大字、涨跌百分比和按日期为 x 轴的历史折线。
   - 上涨使用红色，下跌使用绿色。
   - `/price` 图片必须完整展开，不使用 WebUI 的收起状态。
 - `/price` 检索当前通知对象存在的价格表：
-  - 群聊：当前群绑定的 Sub2API 配置。
-  - 私聊：管理员私聊中与该 QQ 私聊通知对象绑定的 Sub2API 配置。
+  - 群聊：当前群绑定的 Sub2API 配置，支持匹配多通知对象中的任一群。
+  - 私聊：管理员私聊中与该 QQ 私聊通知对象绑定的 Sub2API 配置，支持匹配多通知对象中的私聊目标。
   - 普通用户 5 分钟冷却，管理员不冷却。
 
 ## WebUI 要求
@@ -169,6 +170,10 @@ WebUI 是运维后台，不是营销页。
 - 使用 lucide-react 图标，不用 emoji 作为结构性图标。
 - 控件要有稳定尺寸，避免刷新或 hover 造成布局跳动。
 - 需要展示：
+  - 首次设置 WebUI 进入密钥；未设置时只显示设置密钥页面。
+  - 忘记 WebUI 进入密钥时使用 `scripts/reset_webui_secret.py` 重置，不要手工指导用户改数据库。
+  - 登录页；未登录时不能访问业务 API。
+  - 快速上手面板，提供 NapCat WebSocket Server 配置教程和 OneBot WS 可视化设置；当 WS 已连接、已有管理员、已有至少一个 API 配置后自动隐藏。
   - API 配置和状态。
   - 最近请求成功率。
   - 最近检查时间，按 `Asia/Shanghai` 正确显示。
@@ -177,6 +182,7 @@ WebUI 是运维后台，不是营销页。
   - API 名称、模型名称编辑按钮。
   - 状态条图。
   - Sub2API 渠道倍率面板，默认收起，点击展开；展开后展示当前倍率、涨跌百分比和历史折线。
+  - 命令开关，位于 Sub2API 渠道倍率面板下方，允许开启或关闭 `/addapi`、`/addsub2`、`/list`、`/remove`、`/check`、`/status`、`/stat`、`/price`。
   - 管理员管理。
 
 ## 数据和安全

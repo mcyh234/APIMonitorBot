@@ -11,15 +11,63 @@ from backend.app.schemas import APIConfigCreate, APIConfigOut
 from backend.app.time_utils import api_datetime, coerce_aware_utc, local_day_start_utc, utc_now
 
 
-def parse_target(value: str) -> tuple[str, str]:
-    clean = value.strip().upper()
-    if len(clean) < 2 or clean[0] not in {"G", "P"} or not clean[1:].isdigit():
-        raise ValueError("目标格式必须是 G群号 或 PQQ号。")
-    return ("group" if clean[0] == "G" else "private", clean[1:])
+TargetTuple = tuple[str, str]
+
+
+def parse_target(value: str) -> TargetTuple:
+    targets = parse_targets(value)
+    if len(targets) != 1:
+        raise ValueError("目标格式必须是单个 G群号 或 PQQ号。")
+    return targets[0]
+
+
+def parse_targets(value: str) -> list[TargetTuple]:
+    clean = value.strip().upper().replace("＆", "&")
+    if not clean:
+        raise ValueError("目标格式必须是 G群号 或 PQQ号，多个目标用 & 连接。")
+    targets: list[TargetTuple] = []
+    seen: set[TargetTuple] = set()
+    for raw_part in clean.split("&"):
+        part = raw_part.strip()
+        if len(part) < 2 or part[0] not in {"G", "P"} or not part[1:].isdigit():
+            raise ValueError("目标格式必须是 G群号 或 PQQ号，多个目标用 & 连接。")
+        target = ("group" if part[0] == "G" else "private", part[1:])
+        if target not in seen:
+            targets.append(target)
+            seen.add(target)
+    if not targets:
+        raise ValueError("目标格式必须是 G群号 或 PQQ号，多个目标用 & 连接。")
+    return targets
+
+
+def storage_target(value: str) -> TargetTuple:
+    targets = parse_targets(value)
+    if len(targets) == 1:
+        return targets[0]
+    return ("multi", format_targets(targets))
 
 
 def format_target(target_type: str, target_id: str) -> str:
+    if target_type == "multi":
+        return format_targets(target_entries(target_type, target_id))
     return ("G" if target_type == "group" else "P") + target_id
+
+
+def format_targets(targets: list[TargetTuple] | tuple[TargetTuple, ...]) -> str:
+    return "&".join(("G" if target_type == "group" else "P") + target_id for target_type, target_id in targets)
+
+
+def target_entries(target_type: str, target_id: str) -> list[TargetTuple]:
+    if target_type == "multi":
+        return parse_targets(target_id)
+    return [(target_type, target_id)]
+
+
+def target_contains(target_type: str, target_id: str, expected_type: str, expected_id: str) -> bool:
+    return any(
+        item_type == expected_type and item_id == str(expected_id)
+        for item_type, item_id in target_entries(target_type, target_id)
+    )
 
 
 def is_admin(session: Session, qq: str) -> bool:
@@ -66,7 +114,7 @@ def config_to_out(session: Session, config: APIConfig, timezone_name: str) -> AP
 
 
 def create_api_config(session: Session, secret_box: SecretBox, data: APIConfigCreate) -> APIConfig:
-    target_type, target_id = parse_target(data.target)
+    target_type, target_id = storage_target(data.target)
     config = APIConfig(
         name=data.name.strip(),
         target_type=target_type,

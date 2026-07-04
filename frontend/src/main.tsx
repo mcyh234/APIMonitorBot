@@ -8,16 +8,22 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
-  Clock3,
+  Circle,
+  ClipboardList,
+  Cable,
   KeyRound,
+  LockKeyhole,
+  LogIn,
   Send,
   Plus,
   RefreshCcw,
   Server,
+  Settings2,
   Shield,
   Trash2,
   MessageSquareText,
   Pencil,
+  WandSparkles,
   TrendingDown,
   TrendingUp,
   Wifi,
@@ -29,7 +35,7 @@ import "./styles.css";
 type ApiConfig = {
   id: number;
   name: string;
-  target_type: "group" | "private";
+  target_type: "group" | "private" | "multi";
   target_id: string;
   target: string;
   base_url: string;
@@ -69,6 +75,27 @@ type AppStatus = {
   onebot_ws_configured: boolean;
   onebot_ws_connected: boolean;
   onebot_ws_last_error: string | null;
+};
+
+type AuthStatus = {
+  configured: boolean;
+  authenticated: boolean;
+};
+
+type OneBotSettings = {
+  ws_url: string;
+  access_token_configured: boolean;
+  access_token_preview: string | null;
+  ws_token_in_query: boolean;
+  connected: boolean;
+  last_error: string | null;
+};
+
+type CommandSetting = {
+  command: string;
+  label: string;
+  description: string;
+  enabled: boolean;
 };
 
 type ReceivedMessage = {
@@ -142,7 +169,7 @@ type Sub2Rate = {
 type Sub2PriceBoard = {
   config_id: number;
   name: string;
-  target_type: "group" | "private";
+  target_type: "group" | "private" | "multi";
   target_id: string;
   target: string;
   base_url: string;
@@ -168,13 +195,29 @@ const emptyForm: ConfigForm = {
   model_name: ""
 };
 
+const HISTORY_LIMIT = 60;
 const defaultTimeZone = "Asia/Shanghai";
+const authTokenKey = "apimonitorbot.webui.token";
+
+function getAuthToken(): string {
+  return window.localStorage.getItem(authTokenKey) || "";
+}
+
+function setAuthToken(token: string) {
+  window.localStorage.setItem(authTokenKey, token);
+}
+
+function clearAuthToken() {
+  window.localStorage.removeItem(authTokenKey);
+}
 
 async function requestJson<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
+  const token = getAuthToken();
   const response = await fetch(input, {
     ...init,
     headers: {
       "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(init?.headers ?? {})
     }
   });
@@ -270,7 +313,15 @@ function groupByPlatform(rates: Sub2Rate[]): [string, Sub2Rate[]][] {
   );
 }
 
+function generateAccessKey(prefix = "apim"): string {
+  const bytes = new Uint8Array(18);
+  window.crypto.getRandomValues(bytes);
+  const body = Array.from(bytes, (item) => item.toString(36).padStart(2, "0")).join("");
+  return `${prefix}-${body.slice(0, 12)}-${body.slice(12, 24)}-${body.slice(24, 36)}`;
+}
+
 function App() {
+  const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [configs, setConfigs] = useState<ApiConfig[]>([]);
   const [history, setHistory] = useState<CheckRecord[]>([]);
   const [admins, setAdmins] = useState<Admin[]>([]);
@@ -278,7 +329,10 @@ function App() {
   const [sendFailures, setSendFailures] = useState<SendFailure[]>([]);
   const [statusBars, setStatusBars] = useState<ConfigStatusBars[]>([]);
   const [sub2Prices, setSub2Prices] = useState<Sub2PriceBoard[]>([]);
+  const [oneBotSettings, setOneBotSettings] = useState<OneBotSettings | null>(null);
+  const [commandSettings, setCommandSettings] = useState<CommandSetting[]>([]);
   const [expandedSub2, setExpandedSub2] = useState<Record<number, boolean>>({});
+  const [historyExpanded, setHistoryExpanded] = useState(false);
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [selectedName, setSelectedName] = useState("");
   const [form, setForm] = useState<ConfigForm>(emptyForm);
@@ -293,14 +347,26 @@ function App() {
   );
 
   async function loadAll() {
-    const [nextStatus, nextConfigs, nextAdmins, nextMessages, nextSendFailures, nextStatusBars, nextSub2Prices] = await Promise.all([
+    const [
+      nextStatus,
+      nextConfigs,
+      nextAdmins,
+      nextMessages,
+      nextSendFailures,
+      nextStatusBars,
+      nextSub2Prices,
+      nextOneBotSettings,
+      nextCommandSettings
+    ] = await Promise.all([
       requestJson<AppStatus>("/api/status"),
       requestJson<ApiConfig[]>("/api/configs"),
       requestJson<Admin[]>("/api/admins"),
       requestJson<ReceivedMessage[]>("/api/messages/recent"),
       requestJson<SendFailure[]>("/api/sends/recent-failures"),
       requestJson<ConfigStatusBars[]>("/api/status-bars"),
-      requestJson<Sub2PriceBoard[]>("/api/sub2/prices")
+      requestJson<Sub2PriceBoard[]>("/api/sub2/prices"),
+      requestJson<OneBotSettings>("/api/settings/onebot"),
+      requestJson<CommandSetting[]>("/api/settings/commands")
     ]);
     setStatus(nextStatus);
     setConfigs(nextConfigs);
@@ -309,6 +375,8 @@ function App() {
     setSendFailures(nextSendFailures);
     setStatusBars(nextStatusBars);
     setSub2Prices(nextSub2Prices);
+    setOneBotSettings(nextOneBotSettings);
+    setCommandSettings(nextCommandSettings);
     if (!selectedName && nextConfigs.length > 0) {
       setSelectedName(nextConfigs[0].name);
     }
@@ -323,22 +391,125 @@ function App() {
     setHistory(rows);
   }
 
+  async function refreshAuthStatus() {
+    const next = await requestJson<AuthStatus>("/api/webui/auth-status");
+    setAuthStatus(next);
+    return next;
+  }
+
   useEffect(() => {
-    loadAll().catch((err) => setError(err.message));
-    const timer = window.setInterval(() => {
-      loadAll().catch((err) => setError(err.message));
-    }, 15000);
-    return () => window.clearInterval(timer);
+    refreshAuthStatus().catch((err) => setError(err.message));
   }, []);
 
   useEffect(() => {
+    if (!authStatus?.authenticated) return;
+    loadAll().catch((err) => {
+      if (err instanceof Error && err.message.includes("401")) {
+        clearAuthToken();
+        setAuthStatus({ configured: true, authenticated: false });
+      } else {
+        setError(err instanceof Error ? err.message : "加载失败");
+      }
+    });
+    const timer = window.setInterval(() => {
+      loadAll().catch((err) => setError(err instanceof Error ? err.message : "加载失败"));
+    }, 15000);
+    return () => window.clearInterval(timer);
+  }, [authStatus?.authenticated]);
+
+  useEffect(() => {
+    if (!authStatus?.authenticated) return;
     loadHistory(selectedConfig?.name).catch((err) => setError(err.message));
-  }, [selectedConfig?.name]);
+  }, [selectedConfig?.name, authStatus?.authenticated]);
 
   function showNotice(message: string) {
     setNotice(message);
     setError(null);
     window.setTimeout(() => setNotice(null), 3500);
+  }
+
+  async function completeAuth(token: string) {
+    setAuthToken(token);
+    const next = await refreshAuthStatus();
+    if (next.authenticated) {
+      await loadAll();
+    }
+  }
+
+  async function setupWebUI(secret: string) {
+    setBusy("webui-setup");
+    try {
+      const result = await requestJson<{ token: string }>("/api/webui/setup", {
+        method: "POST",
+        body: JSON.stringify({ secret })
+      });
+      await completeAuth(result.token);
+      showNotice("WebUI 进入密钥已设置");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "设置密钥失败");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function loginWebUI(secret: string) {
+    setBusy("webui-login");
+    try {
+      const result = await requestJson<{ token: string }>("/api/webui/login", {
+        method: "POST",
+        body: JSON.stringify({ secret })
+      });
+      await completeAuth(result.token);
+      showNotice("已登录");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "登录失败");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  function logoutWebUI() {
+    clearAuthToken();
+    setAuthStatus({ configured: true, authenticated: false });
+    setConfigs([]);
+    setHistory([]);
+    setNotice("已退出 WebUI");
+  }
+
+  async function saveOneBotSettings(data: { ws_url: string; access_token: string; ws_token_in_query: boolean }) {
+    setBusy("onebot-settings");
+    try {
+      await requestJson<OneBotSettings>("/api/settings/onebot", {
+        method: "PUT",
+        body: JSON.stringify({
+          ws_url: data.ws_url,
+          access_token: data.access_token.trim() ? data.access_token : null,
+          ws_token_in_query: data.ws_token_in_query
+        })
+      });
+      await loadAll();
+      showNotice("OneBot WebSocket 设置已保存");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存 OneBot 设置失败");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function toggleCommand(command: CommandSetting) {
+    setBusy(`command-${command.command}`);
+    try {
+      await requestJson<CommandSetting>(`/api/settings/commands/${encodeURIComponent(command.command.replace(/^\//, ""))}`, {
+        method: "PATCH",
+        body: JSON.stringify({ enabled: !command.enabled })
+      });
+      await loadAll();
+      showNotice(`${command.label} 已${command.enabled ? "关闭" : "开启"}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "更新命令开关失败");
+    } finally {
+      setBusy(null);
+    }
   }
 
   async function submitConfig(event: FormEvent) {
@@ -394,6 +565,28 @@ function App() {
       showNotice("API 名称已更新");
     } catch (err) {
       setError(err instanceof Error ? err.message : "更新 API 名称失败");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function editTarget(config: ApiConfig) {
+    const nextTarget = window.prompt("编辑通知对象，格式：G群号 或 PQQ号，多个用 & 连接", config.target)?.trim();
+    if (nextTarget == null || nextTarget === config.target) return;
+    if (!nextTarget) {
+      setError("通知对象不能为空");
+      return;
+    }
+    setBusy(`target-${config.name}`);
+    try {
+      await requestJson<ApiConfig>(`/api/configs/${encodeURIComponent(config.name)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ target: nextTarget })
+      });
+      await loadAll();
+      showNotice("通知对象已更新");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "更新通知对象失败");
     } finally {
       setBusy(null);
     }
@@ -487,6 +680,35 @@ function App() {
   const healthyCount = configs.filter((item) => item.status === "ok").length;
   const downCount = configs.filter((item) => item.status === "down").length;
   const displayTimeZone = status?.app_timezone || defaultTimeZone;
+  const quickStartComplete = Boolean(oneBotSettings?.connected && admins.length > 0 && configs.length > 0);
+
+  if (!authStatus) {
+    return (
+      <AuthShell title="正在检查 WebUI 进入密钥" icon={<LockKeyhole />}>
+        <div className="empty">正在加载鉴权状态。</div>
+      </AuthShell>
+    );
+  }
+
+  if (!authStatus.configured) {
+    return (
+      <AuthSetup
+        busy={busy === "webui-setup"}
+        error={error}
+        onSubmit={setupWebUI}
+      />
+    );
+  }
+
+  if (!authStatus.authenticated) {
+    return (
+      <AuthLogin
+        busy={busy === "webui-login"}
+        error={error}
+        onSubmit={loginWebUI}
+      />
+    );
+  }
 
   return (
     <main className="app-shell">
@@ -495,9 +717,15 @@ function App() {
           <p className="eyebrow">OneBot API Monitor</p>
           <h1>APIMonitorBot</h1>
         </div>
-        <button className="icon-button" onClick={() => loadAll().catch((err) => setError(err.message))} aria-label="刷新">
-          <RefreshCcw size={18} />
-        </button>
+        <div className="topbar-actions">
+          <button className="icon-button" onClick={() => loadAll().catch((err) => setError(err.message))} aria-label="刷新">
+            <RefreshCcw size={18} />
+          </button>
+          <button onClick={logoutWebUI}>
+            <LogIn size={16} />
+            退出
+          </button>
+        </div>
       </header>
 
       <section className="metrics" aria-label="系统状态">
@@ -516,6 +744,16 @@ function App() {
         <div className={error ? "toast error" : "toast"} role="status" aria-live="polite">
           {error || notice}
         </div>
+      )}
+
+      {!quickStartComplete && (
+        <QuickStartPanel
+          oneBotSettings={oneBotSettings}
+          admins={admins}
+          configs={configs}
+          busy={busy === "onebot-settings"}
+          onSaveOneBot={saveOneBotSettings}
+        />
       )}
 
       <section className="workspace">
@@ -564,7 +802,20 @@ function App() {
                         </div>
                         <div className="subtle">{config.base_url}</div>
                       </td>
-                      <td>{config.target}</td>
+                      <td>
+                        <div className="editable-cell target-cell">
+                          <span className="target-text">{config.target}</span>
+                          <button
+                            className="icon-button tiny edit-button"
+                            onClick={() => editTarget(config)}
+                            disabled={busy === `target-${config.name}`}
+                            aria-label={`编辑通知对象 ${config.target}`}
+                            title="编辑通知对象"
+                          >
+                            <Pencil size={14} />
+                          </button>
+                        </div>
+                      </td>
                       <td>
                         <div className="editable-cell">
                           <span className="model-name">{config.model_name}</span>
@@ -612,7 +863,7 @@ function App() {
               <Plus size={18} />
             </div>
             <Field label="配置名称" value={form.name} onChange={(name) => setForm({ ...form, name })} required />
-            <Field label="报告目标" value={form.target} placeholder="G123456789 或 P2087900785" onChange={(target) => setForm({ ...form, target })} required />
+            <Field label="报告目标" value={form.target} placeholder="G123456789 或 P2087900785，多个用 & 连接" onChange={(target) => setForm({ ...form, target })} required />
             <Field label="BaseURL" value={form.base_url} placeholder="https://example.com/v1" onChange={(base_url) => setForm({ ...form, base_url })} required />
             <Field label="APIKey" value={form.api_key} type="password" onChange={(api_key) => setForm({ ...form, api_key })} required />
             <Field label="模型名称" value={form.model_name} placeholder="gpt-4.1-mini" onChange={(model_name) => setForm({ ...form, model_name })} required />
@@ -702,11 +953,17 @@ function App() {
         timeZone={displayTimeZone}
       />
 
+      <CommandSettingsPanel
+        commands={commandSettings}
+        busy={busy}
+        onToggle={toggleCommand}
+      />
+
       <section className="panel send-failures-panel">
         <div className="panel-heading">
           <div>
             <h2>最近发送失败</h2>
-            <p>最近 10 条 OneBot 发送失败记录，用于排查 HTTP API、token 和群权限问题。</p>
+            <p>最近 10 条 OneBot 发送失败记录，用于排查 WebSocket、token 和群权限问题。</p>
           </div>
           <Send size={18} />
         </div>
@@ -721,7 +978,7 @@ function App() {
                   {item.action} · {item.target_type}:{item.target_id}
                 </span>
                 <span className="send-error">
-                  {item.status_code ? `HTTP ${item.status_code} · ` : ""}
+                  {item.status_code ? `状态码 ${item.status_code} · ` : ""}
                   {item.error || "发送失败"}
                 </span>
                 <span className="message-text">{JSON.stringify(item.response_payload || {})}</span>
@@ -757,39 +1014,258 @@ function App() {
         </div>
       </section>
 
-      <section className="panel history-panel">
+      <section className={historyExpanded ? "panel history-panel open" : "panel history-panel collapsed"}>
         <div className="panel-heading">
           <div>
             <h2>巡检历史</h2>
-            <p>{selectedConfig ? `${selectedConfig.name} 最近 200 条记录` : "选择一个配置查看记录"}</p>
+            <p>{selectedConfig ? `${selectedConfig.name} 最近 ${HISTORY_LIMIT} 条记录` : "选择一个配置查看记录"}</p>
           </div>
-          <Clock3 size={18} />
+          <button
+            className="history-toggle"
+            type="button"
+            aria-expanded={historyExpanded}
+            onClick={() => setHistoryExpanded((value) => !value)}
+          >
+            {historyExpanded ? <ChevronDown size={18} /> : <ChevronRight size={18} />}
+            {historyExpanded ? "收起" : "展开"}
+          </button>
         </div>
-        <div className="history-list">
-          {history.length === 0 ? (
-            <div className="empty">暂无历史记录。</div>
-          ) : (
-            history.map((row) => (
-              <div className="history-row" key={row.id}>
-                <span className={statusClass(row.status)}>{statusLabel(row.status)}</span>
-                <span>{formatTime(row.checked_at, displayTimeZone)}</span>
-                <span>{row.code || "-"}</span>
-                <span>{row.latency_ms == null ? "-" : `${row.latency_ms}ms`}</span>
-                <span>{row.scheduled ? "定时" : "手动"}</span>
-                <span className="history-error">{row.error || ""}</span>
-              </div>
-            ))
-          )}
-        </div>
+        {historyExpanded && (
+          <div className="history-list">
+            {history.length === 0 ? (
+              <div className="empty">暂无历史记录。</div>
+            ) : (
+              history.map((row) => (
+                <div className="history-row" key={row.id}>
+                  <span className={statusClass(row.status)}>{statusLabel(row.status)}</span>
+                  <span>{formatTime(row.checked_at, displayTimeZone)}</span>
+                  <span>{row.code || "-"}</span>
+                  <span>{row.latency_ms == null ? "-" : `${row.latency_ms}ms`}</span>
+                  <span>{row.scheduled ? "定时" : "手动"}</span>
+                  <span className="history-error">{row.error || ""}</span>
+                </div>
+              ))
+            )}
+          </div>
+        )}
       </section>
 
       <footer className="footer">
         <Bot size={16} />
-        HTTP {status?.onebot_http_configured ? "已配置" : "未配置"} · WebSocket {status?.onebot_ws_configured ? "已配置" : "未配置"}
+        WebSocket {status?.onebot_ws_configured ? "已配置" : "未配置"}
         {` · 时区 ${displayTimeZone}`}
         {status?.onebot_ws_last_error ? ` · ${status.onebot_ws_last_error}` : ""}
       </footer>
     </main>
+  );
+}
+
+function AuthShell({ title, icon, children }: { title: string; icon: React.ReactNode; children: React.ReactNode }) {
+  return (
+    <main className="auth-shell">
+      <section className="panel auth-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">APIMonitorBot</p>
+            <h1>{title}</h1>
+          </div>
+          {icon}
+        </div>
+        {children}
+      </section>
+    </main>
+  );
+}
+
+function AuthSetup({
+  busy,
+  error,
+  onSubmit
+}: {
+  busy: boolean;
+  error: string | null;
+  onSubmit: (secret: string) => void;
+}) {
+  const [secret, setSecret] = useState("");
+  return (
+    <AuthShell title="设置 WebUI 进入密钥" icon={<LockKeyhole size={22} />}>
+      <form className="auth-form" onSubmit={(event) => { event.preventDefault(); onSubmit(secret); }}>
+        <p className="auth-copy">首次进入需要设置一个本机 WebUI 密钥。后续打开后台时使用它登录。</p>
+        {error && <div className="toast error">{error}</div>}
+        <Field label="进入密钥" value={secret} onChange={setSecret} type="password" required />
+        <div className="button-row">
+          <button type="button" onClick={() => setSecret(generateAccessKey("webui"))}>
+            <WandSparkles size={16} />
+            自动生成
+          </button>
+          <button className="primary no-margin" type="submit" disabled={busy}>
+            <KeyRound size={16} />
+            保存并进入
+          </button>
+        </div>
+      </form>
+    </AuthShell>
+  );
+}
+
+function AuthLogin({
+  busy,
+  error,
+  onSubmit
+}: {
+  busy: boolean;
+  error: string | null;
+  onSubmit: (secret: string) => void;
+}) {
+  const [secret, setSecret] = useState("");
+  return (
+    <AuthShell title="登录 WebUI" icon={<LockKeyhole size={22} />}>
+      <form className="auth-form" onSubmit={(event) => { event.preventDefault(); onSubmit(secret); }}>
+        {error && <div className="toast error">{error}</div>}
+        <Field label="进入密钥" value={secret} onChange={setSecret} type="password" required />
+        <p className="auth-hint">
+          密钥不会明文保存；忘记时到本机数据库 data/apimonitor.sqlite3 的 app_settings 表删除 key=webui.secret_hash 后重启重新设置。
+        </p>
+        <button className="primary no-margin" type="submit" disabled={busy}>
+          <LogIn size={16} />
+          进入后台
+        </button>
+      </form>
+    </AuthShell>
+  );
+}
+
+function QuickStartPanel({
+  oneBotSettings,
+  admins,
+  configs,
+  busy,
+  onSaveOneBot
+}: {
+  oneBotSettings: OneBotSettings | null;
+  admins: Admin[];
+  configs: ApiConfig[];
+  busy: boolean;
+  onSaveOneBot: (data: { ws_url: string; access_token: string; ws_token_in_query: boolean }) => void;
+}) {
+  const [wsUrl, setWsUrl] = useState("ws://127.0.0.1:3001");
+  const [accessToken, setAccessToken] = useState("");
+  const [tokenInQuery, setTokenInQuery] = useState(true);
+
+  useEffect(() => {
+    if (!oneBotSettings) return;
+    setWsUrl(oneBotSettings.ws_url || "ws://127.0.0.1:3001");
+    setTokenInQuery(oneBotSettings.ws_token_in_query);
+  }, [oneBotSettings?.ws_url, oneBotSettings?.ws_token_in_query]);
+
+  const steps = [
+    { label: "WebUI 密钥", done: true },
+    { label: "NapCat WebSocket", done: Boolean(oneBotSettings?.ws_url) },
+    { label: "管理员 QQ", done: admins.length > 0 },
+    { label: "API 配置", done: configs.length > 0 }
+  ];
+
+  return (
+    <section className="panel quickstart-panel">
+      <div className="panel-heading">
+        <div>
+          <h2>快速上手</h2>
+          <p>按顺序完成 WebUI、NapCat、管理员和 API 配置。OneBot 第一版推荐只使用 WebSocket。</p>
+        </div>
+        <ClipboardList size={18} />
+      </div>
+      <div className="quickstart-grid">
+        <div className="quickstart-steps">
+          {steps.map((step, index) => (
+            <div className={step.done ? "quickstep done" : "quickstep"} key={step.label}>
+              {step.done ? <CheckCircle2 size={17} /> : <Circle size={17} />}
+              <span>{index + 1}. {step.label}</span>
+            </div>
+          ))}
+        </div>
+        <form className="onebot-setup" onSubmit={(event) => { event.preventDefault(); onSaveOneBot({ ws_url: wsUrl, access_token: accessToken, ws_token_in_query: tokenInQuery }); }}>
+          <div className="section-label">
+            <Cable size={16} />
+            NapCat WebSocket 服务端
+          </div>
+          <p className="guide-text">
+            在 NapCat 的网络配置里开启 WebSocket Server，监听地址建议 127.0.0.1，端口建议 3001。先在 NapCat 上设置 token，再复制到这里。
+          </p>
+          <div className="napcat-code">
+            本项目填写：{wsUrl || "ws://127.0.0.1:3001"}
+            {tokenInQuery && (accessToken || oneBotSettings?.access_token_configured) ? "?access_token=NapCat中配置的token" : ""}
+          </div>
+          <Field label="WebSocket 地址" value={wsUrl} placeholder="ws://127.0.0.1:3001" onChange={setWsUrl} />
+          <label className="field">
+            <span>NapCat token {oneBotSettings?.access_token_preview ? `当前 ${oneBotSettings.access_token_preview}` : ""}</span>
+            <input
+              value={accessToken}
+              onChange={(event) => setAccessToken(event.target.value)}
+              placeholder="复制 NapCat 上已配置的 token，留空则沿用现有值"
+              autoComplete="off"
+            />
+          </label>
+          <label className="switch-row">
+            <input
+              type="checkbox"
+              checked={tokenInQuery}
+              onChange={(event) => setTokenInQuery(event.target.checked)}
+            />
+            <span>连接时把 NapCat token 放到 query 参数里</span>
+          </label>
+          <div className="button-row">
+            <button className="primary no-margin" disabled={busy} type="submit">
+              <Settings2 size={16} />
+              保存并重连
+            </button>
+          </div>
+          <div className={oneBotSettings?.connected ? "connection-state ok" : "connection-state warn"}>
+            {oneBotSettings?.connected ? "WebSocket 已连接" : oneBotSettings?.last_error || "WebSocket 未连接"}
+          </div>
+        </form>
+      </div>
+    </section>
+  );
+}
+
+function CommandSettingsPanel({
+  commands,
+  busy,
+  onToggle
+}: {
+  commands: CommandSetting[];
+  busy: string | null;
+  onToggle: (command: CommandSetting) => void;
+}) {
+  return (
+    <section className="panel command-settings-panel">
+      <div className="panel-heading">
+        <div>
+          <h2>命令开关</h2>
+          <p>关闭后，群聊和私聊内对应命令都会返回“该命令已关闭”。/cancel 始终保留。</p>
+        </div>
+        <Settings2 size={18} />
+      </div>
+      <div className="command-grid">
+        {commands.map((command) => (
+          <div className="command-toggle-row" key={command.command}>
+            <div>
+              <strong>{command.command}</strong>
+              <span>{command.label} · {command.description}</span>
+            </div>
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={command.enabled}
+                disabled={busy === `command-${command.command}`}
+                onChange={() => onToggle(command)}
+              />
+              <span>{command.enabled ? "开启" : "关闭"}</span>
+            </label>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 

@@ -101,12 +101,8 @@ def _draw_board(
     change_keys = {change.identity for change in board.changes}
     if board.changes:
         for change in board.changes[:4]:
-            text = (
-                f"{platform_label(change.platform)}: {change.group_name} "
-                f"{format_rate(change.old_rate)} -> {format_rate(change.new_rate)} "
-                f"({_format_percent(_change_percent(change.old_rate, change.new_rate))})"
-            )
-            color = _trend_color(_change_percent(change.old_rate, change.new_rate))
+            text = _change_line(change)
+            color = _change_color(change)
             draw.text((x + 24, cursor_y), _fit_text(text, font_regular, width - 48), fill=color, font=font_regular)
             cursor_y += 28
         if len(board.changes) > 4:
@@ -269,8 +265,25 @@ def _trend_color(percent: float | None) -> str:
     return "#64748b"
 
 
-def _change_percent(old_rate: float, new_rate: float) -> float | None:
-    if math.isclose(old_rate, 0, rel_tol=0, abs_tol=1e-12):
+def _change_line(change: Sub2RateChange) -> str:
+    prefix = f"{platform_label(change.platform)}: {change.group_name}"
+    if change.is_deleted:
+        return f"{prefix} 已删除（最后倍率 {format_rate(change.old_rate)}）"
+    new_rate = change.new_rate
+    if new_rate is None:
+        return f"{prefix} 发生变化（原倍率 {format_rate(change.old_rate)}）"
+    percent = _format_percent(_change_percent(change.old_rate, new_rate))
+    return f"{prefix} {format_rate(change.old_rate)} -> {format_rate(new_rate)} ({percent})"
+
+
+def _change_color(change: Sub2RateChange) -> str:
+    if change.is_deleted:
+        return "#ef4444"
+    return _trend_color(_change_percent(change.old_rate, change.new_rate))
+
+
+def _change_percent(old_rate: float, new_rate: float | None) -> float | None:
+    if new_rate is None or math.isclose(old_rate, 0, rel_tol=0, abs_tol=1e-12):
         return None
     return (new_rate - old_rate) / old_rate * 100
 

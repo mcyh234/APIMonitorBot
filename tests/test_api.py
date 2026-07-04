@@ -1,11 +1,13 @@
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-from backend.app.api import update_config
+from backend.app.api import config_history, onebot_webhook, update_config
 from backend.app.crypto import SecretBox
-from backend.app.models import APIConfig, Base
+from backend.app.models import APIConfig, Base, CheckRecord
 from backend.app.schemas import APIConfigUpdate
 from backend.app.settings import Settings
 
@@ -50,7 +52,26 @@ def test_update_config_renames_api_config():
     assert session.scalar(select(APIConfig).where(APIConfig.name == "new-name")) is not None
 
 
+def test_update_config_accepts_multi_target():
+    session = make_session()
+    secret_box = SecretBox("test-key")
+    add_config(session, secret_box, "multi-target-api")
+
+    result = update_config(
+        "multi-target-api",
+        APIConfigUpdate(target="G123&P456"),
+        session,
+        Settings(),
+        secret_box,
+    )
+
+    assert result.target_type == "multi"
+    assert result.target_id == "G123&P456"
+    assert result.target == "G123&P456"
+
+
 def test_update_config_rejects_duplicate_name():
+
     session = make_session()
     secret_box = SecretBox("test-key")
     add_config(session, secret_box, "first")
@@ -66,3 +87,39 @@ def test_update_config_rejects_duplicate_name():
         )
 
     assert exc_info.value.status_code == 409
+
+
+def test_config_history_returns_latest_sixty_records():
+    session = make_session()
+    secret_box = SecretBox("test-key")
+    config = add_config(session, secret_box, "history-api")
+    base_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for index in range(75):
+        session.add(
+            CheckRecord(
+                api_config_id=config.id,
+                checked_at=base_time + timedelta(minutes=index),
+                status="available",
+                code=f"code-{index}",
+                scheduled=True,
+            )
+        )
+    session.commit()
+
+    rows = config_history("history-api", session)
+
+    assert len(rows) == 60
+    assert rows[0].code == "code-74"
+    assert rows[-1].code == "code-15"
+
+
+class FakeRequest:
+    async def body(self) -> bytes:
+        return b'{"post_type":"message","message":"/status"}'
+
+
+@pytest.mark.asyncio
+async def test_onebot_http_webhook_is_ignored():
+    result = await onebot_webhook(FakeRequest())
+
+    assert result["status"] == "ignored"

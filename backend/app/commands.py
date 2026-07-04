@@ -8,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.app.availability import ApiProbe
+from backend.app.command_settings import is_command_enabled
 from backend.app.crypto import SecretBox
 from backend.app.models import APIConfig, ReceivedMessage, Sub2Config
 from backend.app.onebot import OneBotClient
@@ -19,7 +20,9 @@ from backend.app.repository import (
     format_target,
     get_conversation,
     is_admin,
-    parse_target,
+    storage_target,
+    target_contains,
+    target_entries,
     today_availability,
     upsert_conversation,
 )
@@ -93,6 +96,8 @@ class CommandRouter:
         if command == "/cancel":
             clear_conversation(session, incoming.user_id)
             return "已取消当前对话。"
+        if not is_command_enabled(session, command):
+            return "该命令已关闭。"
         if command == "/list":
             if not is_admin(session, incoming.user_id):
                 return "权限不足。"
@@ -141,7 +146,7 @@ class CommandRouter:
             return f"没有找到配置：{name}"
         allowed = False
         if incoming.message_type == "group" and incoming.group_id:
-            allowed = config.target_type == "group" and config.target_id == incoming.group_id
+            allowed = target_contains(config.target_type, config.target_id, "group", incoming.group_id)
         else:
             allowed = is_admin(session, incoming.user_id)
         if not allowed:
@@ -158,6 +163,8 @@ class CommandRouter:
     async def _status(self, session: Session, incoming: IncomingMessage, name: str) -> str:
         configs = self._status_configs_for_context(session, incoming, name)
         if configs is None:
+            if not name:
+                return ""
             return "权限不足。"
         if not configs:
             return "没有可显示的 API 配置。"
@@ -175,9 +182,7 @@ class CommandRouter:
             target_id = incoming.user_id
         result = await self.onebot.send_image_message(target_type, target_id, image, "status.png")
         record_send_result(session, result)
-        if result.ok:
-            return ""
-        return f"状态图发送失败：{result.error or result.status_code or '未知错误'}"
+        return ""
 
     def _status_configs_for_context(
         self,
@@ -190,7 +195,7 @@ class CommandRouter:
             if config is None:
                 return []
             if incoming.message_type == "group" and incoming.group_id:
-                if config.target_type == "group" and config.target_id == incoming.group_id:
+                if target_contains(config.target_type, config.target_id, "group", incoming.group_id):
                     return [config]
                 return None
             if is_admin(session, incoming.user_id):
@@ -198,14 +203,11 @@ class CommandRouter:
             return None
 
         if incoming.message_type == "group" and incoming.group_id:
-            return list(
-                session.scalars(
-                    select(APIConfig)
-                    .where(APIConfig.target_type == "group")
-                    .where(APIConfig.target_id == incoming.group_id)
-                    .order_by(APIConfig.name)
-                ).all()
-            )
+            return [
+                config
+                for config in session.scalars(select(APIConfig).order_by(APIConfig.name)).all()
+                if target_contains(config.target_type, config.target_id, "group", incoming.group_id)
+            ]
         if not is_admin(session, incoming.user_id):
             return None
         return list(session.scalars(select(APIConfig).order_by(APIConfig.name)).all())
@@ -228,9 +230,7 @@ class CommandRouter:
         target_type, target_id = target
         result = await self.onebot.send_image_message(target_type, target_id, image, "gptstore-status.png")
         record_send_result(session, result)
-        if result.ok:
-            return ""
-        return f"网页快照发送失败：{result.error or result.status_code or '未知错误'}"
+        return ""
 
     async def _price(self, session: Session, incoming: IncomingMessage) -> str:
         configs = self._sub2_configs_for_notification_context(session, incoming)
@@ -268,9 +268,7 @@ class CommandRouter:
             target_id = incoming.user_id
         result = await self.onebot.send_image_message(target_type, target_id, image, "sub2-price.png")
         record_send_result(session, result)
-        if result.ok:
-            return ""
-        return f"价格表发送失败：{result.error or result.status_code or '未知错误'}"
+        return ""
 
     def _notification_target_for_context(
         self,
@@ -278,13 +276,11 @@ class CommandRouter:
         incoming: IncomingMessage,
     ) -> tuple[str, str] | None:
         if incoming.message_type == "group" and incoming.group_id:
-            bound_group = session.scalar(
-                select(APIConfig.id)
-                .where(APIConfig.target_type == "group")
-                .where(APIConfig.target_id == incoming.group_id)
-                .limit(1)
+            bound_group = any(
+                target_contains(config.target_type, config.target_id, "group", incoming.group_id)
+                for config in session.scalars(select(APIConfig)).all()
             )
-            if bound_group is not None or is_admin(session, incoming.user_id):
+            if bound_group or is_admin(session, incoming.user_id):
                 return ("group", incoming.group_id)
             return None
         if is_admin(session, incoming.user_id):
@@ -297,27 +293,21 @@ class CommandRouter:
         incoming: IncomingMessage,
     ) -> list[Sub2Config] | None:
         if incoming.message_type == "group" and incoming.group_id:
-            configs = list(
-                session.scalars(
-                    select(Sub2Config)
-                    .where(Sub2Config.target_type == "group")
-                    .where(Sub2Config.target_id == incoming.group_id)
-                    .order_by(Sub2Config.name)
-                ).all()
-            )
+            configs = [
+                config
+                for config in session.scalars(select(Sub2Config).order_by(Sub2Config.name)).all()
+                if target_contains(config.target_type, config.target_id, "group", incoming.group_id)
+            ]
             if configs or is_admin(session, incoming.user_id):
                 return configs
             return None
         if not is_admin(session, incoming.user_id):
             return None
-        return list(
-            session.scalars(
-                select(Sub2Config)
-                .where(Sub2Config.target_type == "private")
-                .where(Sub2Config.target_id == incoming.user_id)
-                .order_by(Sub2Config.name)
-            ).all()
-        )
+        return [
+            config
+            for config in session.scalars(select(Sub2Config).order_by(Sub2Config.name)).all()
+            if target_contains(config.target_type, config.target_id, "private", incoming.user_id)
+        ]
 
     def _consume_command_cooldown(
         self,
@@ -333,6 +323,27 @@ class CommandRouter:
             command,
             self.settings.command_check_cooldown_seconds,
         )
+
+
+    async def _target_confirmation_text(self, target_type: str, target_id: str) -> str:
+        entries = target_entries(target_type, target_id)
+        if len(entries) == 1:
+            entry_type, entry_id = entries[0]
+            if entry_type == "group":
+                in_group = await self.onebot.is_in_group(entry_id)
+                state_text = "在" if in_group else "不在" if in_group is False else "无法确认是否在"
+                return f"你添加了一个群聊，我{state_text}这个群里面。"
+            return "你添加了一个私聊通知目标。"
+
+        lines = ["你添加了多个通知对象："]
+        for entry_type, entry_id in entries:
+            if entry_type == "group":
+                in_group = await self.onebot.is_in_group(entry_id)
+                state_text = "在" if in_group else "不在" if in_group is False else "无法确认是否在"
+                lines.append(f"- G{entry_id}：群聊，我{state_text}这个群里面")
+            else:
+                lines.append(f"- P{entry_id}：私聊通知目标")
+        return "\n".join(lines)
 
     async def _continue_addsub2(
         self,
@@ -384,11 +395,11 @@ class CommandRouter:
             payload["token_expires_at"] = tokens.expires_at.isoformat() if tokens.expires_at else None
             payload["rate_count"] = len(rates)
             upsert_conversation(session, incoming.user_id, "sub2_target", payload)
-            return f"我测试，登录成功，已读取 {len(rates)} 个渠道分组。现在输入报告群号/私聊QQ号 (G+群号 或者 P+QQ号)"
+            return f"我测试，登录成功，已读取 {len(rates)} 个渠道分组。现在输入报告群号/私聊QQ号 (G+群号 或者 P+QQ号，多个用 & 连接)"
 
         if step == "sub2_target":
             try:
-                target_type, target_id = parse_target(text)
+                target_type, target_id = storage_target(text)
             except ValueError as exc:
                 return str(exc)
             token_expires_at = _parse_datetime(payload.get("token_expires_at"))
@@ -429,11 +440,8 @@ class CommandRouter:
                 session.commit()
 
             clear_conversation(session, incoming.user_id)
-            if target_type == "group":
-                in_group = await self.onebot.is_in_group(target_id)
-                state_text = "在" if in_group else "不在" if in_group is False else "无法确认是否在"
-                return f"你添加了一个群聊，我{state_text}这个群里面。添加成功。"
-            return "你添加了一个私聊通知目标。添加成功。"
+            target_text = await self._target_confirmation_text(target_type, target_id)
+            return f"{target_text}\n添加成功。"
 
         clear_conversation(session, incoming.user_id)
         return "Sub2API 对话状态异常，已重置。请重新发送 /addsub2。"
@@ -455,20 +463,17 @@ class CommandRouter:
                 return "这个配置名已经存在，请换一个名称。"
             payload["name"] = name
             upsert_conversation(session, incoming.user_id, "target", payload)
-            return "请输入报告群号/私聊QQ号 (G+群号 或者 P+QQ号)"
+            return "请输入报告群号/私聊QQ号 (G+群号 或者 P+QQ号，多个用 & 连接)"
 
         if step == "target":
             try:
-                target_type, target_id = parse_target(text)
+                target_type, target_id = storage_target(text)
             except ValueError as exc:
                 return str(exc)
-            payload["target"] = ("G" if target_type == "group" else "P") + target_id
+            payload["target"] = format_target(target_type, target_id)
             upsert_conversation(session, incoming.user_id, "base_url", payload)
-            if target_type == "group":
-                in_group = await self.onebot.is_in_group(target_id)
-                state_text = "在" if in_group else "不在" if in_group is False else "无法确认是否在"
-                return f"你添加了一个群聊，我{state_text}这个群里面。请输入BaseURL"
-            return "你添加了一个私聊通知目标。请输入BaseURL"
+            target_text = await self._target_confirmation_text(target_type, target_id)
+            return f"{target_text}\n请输入BaseURL"
 
         if step == "base_url":
             base_url = text.strip()

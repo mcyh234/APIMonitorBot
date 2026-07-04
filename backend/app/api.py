@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.app.availability import ApiProbe
+from backend.app.command_settings import list_command_settings, set_command_enabled
 from backend.app.crypto import SecretBox, get_secret_box
 from backend.app.db import get_session
 from backend.app.models import APIConfig, BotAdmin, CheckRecord, ReceivedMessage, SendRecord, Sub2Config
@@ -17,9 +18,10 @@ from backend.app.repository import (
     config_to_out,
     create_api_config,
     format_target,
-    parse_target,
+    storage_target,
     today_availability,
 )
+from backend.app.runtime_settings import current_onebot_runtime_settings, save_onebot_runtime_settings
 from backend.app.schemas import (
     APIConfigCreate,
     APIConfigOut,
@@ -28,8 +30,12 @@ from backend.app.schemas import (
     AdminOut,
     AppStatusOut,
     CheckRecordOut,
+    CommandSettingOut,
+    CommandSettingUpdate,
     ConfigStatusBarsOut,
     ManualCheckOut,
+    OneBotSettingsOut,
+    OneBotSettingsUpdate,
     ReceivedMessageOut,
     SendRecordOut,
     StatusBucketOut,
@@ -37,11 +43,23 @@ from backend.app.schemas import (
     Sub2PriceBoardOut,
     Sub2RateHistoryPointOut,
     Sub2RateOut,
+    WebUIAuthStatusOut,
+    WebUILoginIn,
+    WebUISecretIn,
+    WebUITokenOut,
 )
 from backend.app.settings import Settings, get_settings
 from backend.app.status_bars import ConfigStatusBarsData, build_status_bars
 from backend.app.sub2_rates import Sub2StoredRate, stored_sub2_rate_views
 from backend.app.time_utils import api_datetime
+from backend.app.webui_auth import (
+    bearer_token,
+    create_webui_token,
+    set_webui_secret,
+    verify_webui_secret,
+    verify_webui_token,
+    webui_secret_configured,
+)
 
 
 api_router = APIRouter(prefix="/api")
@@ -57,6 +75,123 @@ def get_monitor(request: Request) -> MonitorService:
     if monitor is None:
         raise HTTPException(status_code=503, detail="Monitor service is not ready.")
     return monitor
+
+
+@api_router.get("/webui/auth-status", response_model=WebUIAuthStatusOut)
+def webui_auth_status(
+    authorization: str | None = Header(default=None),
+    session: Session = Depends(get_session),
+) -> WebUIAuthStatusOut:
+    configured = webui_secret_configured(session)
+    authenticated = configured and verify_webui_token(session, bearer_token(authorization))
+    return WebUIAuthStatusOut(configured=configured, authenticated=authenticated)
+
+
+@api_router.post("/webui/setup", response_model=WebUITokenOut, status_code=status.HTTP_201_CREATED)
+def setup_webui_secret(data: WebUISecretIn, session: Session = Depends(get_session)) -> WebUITokenOut:
+    if webui_secret_configured(session):
+        raise HTTPException(status_code=409, detail="WebUI 进入密钥已设置。")
+    try:
+        set_webui_secret(session, data.secret)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return WebUITokenOut(token=create_webui_token(session))
+
+
+@api_router.post("/webui/login", response_model=WebUITokenOut)
+def login_webui(data: WebUILoginIn, session: Session = Depends(get_session)) -> WebUITokenOut:
+    if not webui_secret_configured(session):
+        raise HTTPException(status_code=409, detail="WebUI 进入密钥尚未设置。")
+    if not verify_webui_secret(session, data.secret):
+        raise HTTPException(status_code=401, detail="WebUI 进入密钥不正确。")
+    return WebUITokenOut(token=create_webui_token(session))
+
+
+@api_router.get("/settings/onebot", response_model=OneBotSettingsOut)
+def get_onebot_settings(
+    request: Request,
+    session: Session = Depends(get_session),
+    settings: Settings = Depends(get_app_settings),
+    secret_box: SecretBox = Depends(get_secret_box),
+) -> OneBotSettingsOut:
+    receiver = getattr(request.app.state, "onebot_ws_receiver", None)
+    current = current_onebot_runtime_settings(session, settings, secret_box)
+    return OneBotSettingsOut(
+        ws_url=current.ws_url,
+        access_token_configured=current.access_token_configured,
+        access_token_preview=current.access_token_preview,
+        ws_token_in_query=current.ws_token_in_query,
+        connected=bool(getattr(receiver, "connected", False)),
+        last_error=getattr(receiver, "last_error", None),
+    )
+
+
+@api_router.put("/settings/onebot", response_model=OneBotSettingsOut)
+async def update_onebot_settings(
+    data: OneBotSettingsUpdate,
+    request: Request,
+    session: Session = Depends(get_session),
+    settings: Settings = Depends(get_app_settings),
+    secret_box: SecretBox = Depends(get_secret_box),
+) -> OneBotSettingsOut:
+    token = data.access_token if data.access_token is not None and data.access_token.strip() else None
+    try:
+        current = save_onebot_runtime_settings(
+            session,
+            settings,
+            secret_box,
+            ws_url=data.ws_url,
+            access_token=token,
+            ws_token_in_query=data.ws_token_in_query,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    receiver = getattr(request.app.state, "onebot_ws_receiver", None)
+    if receiver is not None:
+        await receiver.restart()
+    return OneBotSettingsOut(
+        ws_url=current.ws_url,
+        access_token_configured=current.access_token_configured,
+        access_token_preview=current.access_token_preview,
+        ws_token_in_query=current.ws_token_in_query,
+        connected=bool(getattr(receiver, "connected", False)),
+        last_error=getattr(receiver, "last_error", None),
+    )
+
+
+@api_router.get("/settings/commands", response_model=list[CommandSettingOut])
+def get_command_settings(session: Session = Depends(get_session)) -> list[CommandSettingOut]:
+    return [
+        CommandSettingOut(
+            command=definition.command,
+            label=definition.label,
+            description=definition.description,
+            enabled=enabled,
+        )
+        for definition, enabled in list_command_settings(session)
+    ]
+
+
+@api_router.patch("/settings/commands/{command}", response_model=CommandSettingOut)
+def update_command_setting(
+    command: str,
+    data: CommandSettingUpdate,
+    session: Session = Depends(get_session),
+) -> CommandSettingOut:
+    normalized = "/" + command.lstrip("/").lower()
+    try:
+        row = set_command_enabled(session, normalized, data.enabled)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    for definition, _enabled in list_command_settings(session):
+        if definition.command == row.command:
+            return CommandSettingOut(
+                command=definition.command,
+                label=definition.label,
+                description=definition.description,
+                enabled=row.enabled,
+            )
+    raise HTTPException(status_code=404, detail="未知命令。")
 
 
 @api_router.get("/status", response_model=AppStatusOut)
@@ -121,7 +256,7 @@ def update_config(
             raise HTTPException(status_code=422, detail="配置名不能为空。")
         config.name = next_name
     if data.target is not None:
-        target_type, target_id = parse_target(data.target)
+        target_type, target_id = storage_target(data.target)
         config.target_type = target_type
         config.target_id = target_id
     if data.base_url is not None:
@@ -179,7 +314,7 @@ def config_history(name: str, session: Session = Depends(get_session)) -> list[C
         select(CheckRecord)
         .where(CheckRecord.api_config_id == config.id)
         .order_by(CheckRecord.checked_at.desc())
-        .limit(200)
+        .limit(60)
     ).all()
     return [
         CheckRecordOut(
@@ -357,19 +492,9 @@ def delete_admin(qq: str, session: Session = Depends(get_session)) -> Response:
 @onebot_router.post("/webhook")
 async def onebot_webhook(
     request: Request,
-    authorization: str | None = Header(default=None),
-    session: Session = Depends(get_session),
-    settings: Settings = Depends(get_app_settings),
 ) -> dict[str, str]:
-    expected = settings.onebot_inbound_access_token
-    if expected and authorization != f"Bearer {expected}":
-        raise HTTPException(status_code=401, detail="Invalid OneBot inbound token.")
-    event = await request.json()
-    router = getattr(request.app.state, "command_router", None)
-    if router is None:
-        raise HTTPException(status_code=503, detail="Command router is not ready.")
-    await router.handle_event(session, event)
-    return {"status": "ok"}
+    await request.body()
+    return {"status": "ignored", "reason": "OneBot HTTP webhook is deprecated. Use WebSocket only."}
 
 
 def mount_spa_routes(app, frontend_dist: Path) -> None:

@@ -18,11 +18,16 @@ class Sub2RateChange:
     group_key: str
     group_name: str
     old_rate: float
-    new_rate: float
+    new_rate: float | None
+    change_type: str = "rate"
 
     @property
     def identity(self) -> tuple[str, str]:
         return (self.platform, self.group_key)
+
+    @property
+    def is_deleted(self) -> bool:
+        return self.change_type == "deleted"
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +125,16 @@ def sync_sub2_rates(
 
     for key, row in existing.items():
         if key not in next_keys:
+            changes.append(
+                Sub2RateChange(
+                    platform=row.platform,
+                    group_key=row.group_key,
+                    group_name=row.group_name,
+                    old_rate=row.rate_multiplier,
+                    new_rate=None,
+                    change_type="deleted",
+                )
+            )
             session.delete(row)
     session.commit()
     return changes

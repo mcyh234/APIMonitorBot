@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 class APIConfigCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
-    target: str = Field(pattern=r"^[GP]\d+$")
+    target: str = Field(pattern=r"^[GPgp]\d+([&＆][GPgp]\d+)*$", max_length=512)
     base_url: str = Field(min_length=1, max_length=512)
     api_key: str = Field(min_length=1)
     model_name: str = Field(min_length=1, max_length=160)
@@ -16,7 +16,7 @@ class APIConfigCreate(BaseModel):
 
 class APIConfigUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
-    target: str | None = Field(default=None, pattern=r"^[GP]\d+$")
+    target: str | None = Field(default=None, pattern=r"^[GPgp]\d+([&＆][GPgp]\d+)*$", max_length=512)
     base_url: str | None = Field(default=None, min_length=1, max_length=512)
     api_key: str | None = Field(default=None, min_length=1)
     model_name: str | None = Field(default=None, min_length=1, max_length=160)
@@ -77,6 +77,49 @@ class ConfigStatusBarsOut(BaseModel):
     last_code: str | None
     success_rate: float
     windows: list[StatusWindowOut]
+
+
+class WebUIAuthStatusOut(BaseModel):
+    configured: bool
+    authenticated: bool
+
+
+class WebUISecretIn(BaseModel):
+    secret: str = Field(min_length=8, max_length=256)
+
+
+class WebUILoginIn(BaseModel):
+    secret: str = Field(min_length=1, max_length=256)
+
+
+class WebUITokenOut(BaseModel):
+    token: str
+
+
+class OneBotSettingsOut(BaseModel):
+    ws_url: str
+    access_token_configured: bool
+    access_token_preview: str | None
+    ws_token_in_query: bool
+    connected: bool
+    last_error: str | None
+
+
+class OneBotSettingsUpdate(BaseModel):
+    ws_url: str = Field(default="", max_length=512)
+    access_token: str | None = Field(default=None, max_length=512)
+    ws_token_in_query: bool = True
+
+
+class CommandSettingOut(BaseModel):
+    command: str
+    label: str
+    description: str
+    enabled: bool
+
+
+class CommandSettingUpdate(BaseModel):
+    enabled: bool
 
 
 class Sub2RateHistoryPointOut(BaseModel):
