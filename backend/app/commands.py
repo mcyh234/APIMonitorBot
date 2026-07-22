@@ -8,7 +8,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.app.availability import ApiProbe
-from backend.app.command_settings import is_command_enabled
+from backend.app.check_image import CheckResultImageRow, render_check_result_image
+from backend.app.command_settings import is_command_enabled, resolve_command_text
+from backend.app.codex_radar import CodexRadarClient, CodexRadarError, render_codex_radar_image
 from backend.app.crypto import SecretBox
 from backend.app.models import APIConfig, ReceivedMessage, Sub2Config
 from backend.app.onebot import OneBotClient
@@ -32,7 +34,9 @@ from backend.app.status_bars import build_status_bars
 from backend.app.status_image import render_status_image
 from backend.app.sub2_price_image import Sub2PriceBoard, render_sub2_price_image
 from backend.app.sub2_rates import stored_sub2_rate_views, sync_sub2_rates
+from backend.app.sub2_sentiment import record_sentiment_vote, sentiment_summary
 from backend.app.sub2api import Sub2ApiClient, Sub2ApiError
+from backend.app.tibo_radar import TiboRadarClient, TiboRadarError, render_tibo_radar_image
 from backend.app.time_utils import utc_now
 from backend.app.web_snapshot import StatusPageSnapshotter, StatusSnapshotError
 
@@ -45,6 +49,12 @@ class IncomingMessage:
     group_id: str | None = None
 
 
+@dataclass(slots=True)
+class ManualCheckResult:
+    text: str
+    image_row: CheckResultImageRow
+
+
 class CommandRouter:
     def __init__(
         self,
@@ -54,6 +64,8 @@ class CommandRouter:
         probe: ApiProbe | None = None,
         snapshotter: StatusPageSnapshotter | None = None,
         sub2_client: Sub2ApiClient | None = None,
+        radar_client: CodexRadarClient | None = None,
+        tibo_client: TiboRadarClient | None = None,
     ) -> None:
         self.settings = settings
         self.onebot = onebot
@@ -61,6 +73,14 @@ class CommandRouter:
         self.probe = probe or ApiProbe(timeout_seconds=settings.request_timeout_seconds)
         self.snapshotter = snapshotter or StatusPageSnapshotter(settings)
         self.sub2_client = sub2_client or Sub2ApiClient(timeout_seconds=settings.request_timeout_seconds)
+        self.radar_client = radar_client or CodexRadarClient(
+            settings.codex_radar_source_url,
+            timeout_seconds=settings.codex_radar_timeout_seconds,
+        )
+        self.tibo_client = tibo_client or TiboRadarClient(
+            settings.tibo_radar_source_url,
+            timeout_seconds=settings.tibo_radar_timeout_seconds,
+        )
 
     async def handle_event(self, session: Session, event: dict) -> None:
         message = parse_onebot_message(event)
@@ -87,11 +107,11 @@ class CommandRouter:
                 return await self._continue_addsub2(session, incoming, state.step, payload, text)
             return await self._continue_addapi(session, incoming, state.step, payload, text)
 
-        if not text.startswith("/"):
+        resolved = resolve_command_text(session, text)
+        if resolved is None:
             return None
-        parts = text.split(maxsplit=1)
-        command = parts[0].lower()
-        arg = parts[1].strip() if len(parts) > 1 else ""
+        command = resolved.command
+        arg = resolved.arg
 
         if command == "/cancel":
             clear_conversation(session, incoming.user_id)
@@ -129,8 +149,6 @@ class CommandRouter:
             upsert_conversation(session, incoming.user_id, "sub2_name", {})
             return "请输入API名称"
         if command == "/check":
-            if not arg:
-                return "用法：/check <apiname>"
             return await self._manual_check(session, incoming, arg)
         if command == "/status":
             return await self._status(session, incoming, arg)
@@ -138,27 +156,94 @@ class CommandRouter:
             return await self._stat(session, incoming)
         if command == "/price":
             return await self._price(session, incoming)
+        if command == "/up":
+            return self._sentiment_vote(session, incoming, "up", arg)
+        if command == "/down":
+            return self._sentiment_vote(session, incoming, "down", arg)
+        if command == "/radar":
+            return await self._radar(session, incoming)
+        if command == "/tibo":
+            return await self._tibo(session, incoming)
         return None
 
     async def _manual_check(self, session: Session, incoming: IncomingMessage, name: str) -> str:
-        config = session.scalar(select(APIConfig).where(APIConfig.name == name))
-        if config is None:
-            return f"没有找到配置：{name}"
-        allowed = False
-        if incoming.message_type == "group" and incoming.group_id:
-            allowed = target_contains(config.target_type, config.target_id, "group", incoming.group_id)
-        else:
-            allowed = is_admin(session, incoming.user_id)
-        if not allowed:
-            return "权限不足。"
+        configs = self._check_configs_for_context(session, incoming, name)
+        if configs is None:
+            return "\u6743\u9650\u4e0d\u8db3\u3002"
+        if not configs:
+            if name:
+                return f"\u6ca1\u6709\u627e\u5230\u914d\u7f6e\uff1a{name}"
+            return "\u5f53\u524d\u901a\u77e5\u5bf9\u8c61\u6ca1\u6709\u7ed1\u5b9a API \u68c0\u6d4b\u4efb\u52a1\u3002"
         ok, remaining = self._consume_command_cooldown(session, incoming, "check")
         if not ok:
-            return f"操作太频繁，请 {remaining} 秒后再试。"
+            return f"\u64cd\u4f5c\u592a\u9891\u7e41\uff0c\u8bf7 {remaining} \u79d2\u540e\u518d\u8bd5\u3002"
+
+        results = [await self._manual_check_config(session, config) for config in configs]
+        if name:
+            return results[0].text
+
+        image = render_check_result_image(
+            [result.image_row for result in results],
+            timezone_name=self.settings.app_timezone,
+        )
+        if incoming.message_type == "group" and incoming.group_id:
+            target_type = "group"
+            target_id = incoming.group_id
+        else:
+            target_type = "private"
+            target_id = incoming.user_id
+        send_result = await self.onebot.send_image_message(target_type, target_id, image, "api-check.png")
+        record_send_result(session, send_result)
+        return ""
+
+    def _check_configs_for_context(
+        self,
+        session: Session,
+        incoming: IncomingMessage,
+        name: str,
+    ) -> list[APIConfig] | None:
+        if name:
+            config = session.scalar(select(APIConfig).where(APIConfig.name == name))
+            if config is None:
+                return []
+            if incoming.message_type == "group" and incoming.group_id:
+                if target_contains(config.target_type, config.target_id, "group", incoming.group_id):
+                    return [config]
+                return None
+            if is_admin(session, incoming.user_id):
+                return [config]
+            return None
+
+        if incoming.message_type == "group" and incoming.group_id:
+            return [
+                config
+                for config in session.scalars(select(APIConfig).order_by(APIConfig.name)).all()
+                if target_contains(config.target_type, config.target_id, "group", incoming.group_id)
+            ]
+        if not is_admin(session, incoming.user_id):
+            return None
+        return [
+            config
+            for config in session.scalars(select(APIConfig).order_by(APIConfig.name)).all()
+            if target_contains(config.target_type, config.target_id, "private", incoming.user_id)
+        ]
+
+    async def _manual_check_config(self, session: Session, config: APIConfig) -> ManualCheckResult:
         api_key = self.secret_box.decrypt(config.api_key_encrypted)
         result = await self.probe.probe(config.base_url, api_key, config.model_name)
         availability = today_availability(session, config.id, self.settings.app_timezone)
-        state = "服务可用" if result.ok else "服务不可用"
-        return f"【{config.name}】\n当前{state}: {result.code}\n最近请求成功率: {availability:.1f}%"
+        state = "\u670d\u52a1\u53ef\u7528" if result.ok else "\u670d\u52a1\u4e0d\u53ef\u7528"
+        text = f"\u3010{config.name}\u3011\n\u5f53\u524d{state}: {result.code}\n\u6700\u8fd1\u8bf7\u6c42\u6210\u529f\u7387: {availability:.1f}%"
+        return ManualCheckResult(
+            text=text,
+            image_row=CheckResultImageRow(
+                name=config.name,
+                ok=result.ok,
+                code=result.code,
+                success_rate=availability,
+                latency_ms=result.latency_ms,
+            ),
+        )
 
     async def _status(self, session: Session, incoming: IncomingMessage, name: str) -> str:
         configs = self._status_configs_for_context(session, incoming, name)
@@ -245,21 +330,45 @@ class CommandRouter:
         boards: list[Sub2PriceBoard] = []
         for config in configs:
             rate_views = stored_sub2_rate_views(session, config)
-            if not rate_views and config.enabled:
+            model_prices = ()
+            if config.enabled and config.upstream_type != "newapi":
                 try:
-                    rates = await self.sub2_client.fetch_rates_with_cached_token(
+                    catalog = await self.sub2_client.fetch_available_catalog_with_cached_token(
                         session,
                         config,
                         self.secret_box,
                     )
+                    if catalog.rates:
+                        sync_sub2_rates(session, config, list(catalog.rates))
+                    rate_views = stored_sub2_rate_views(session, config)
+                    model_prices = catalog.model_prices
+                    config.last_error = None
+                    session.commit()
+                except Sub2ApiError as exc:
+                    config.last_error = str(exc)
+                    session.commit()
+            elif not rate_views and config.enabled:
+                try:
+                    rates = await self.sub2_client.fetch_rates_with_cached_token(session, config, self.secret_box)
                     sync_sub2_rates(session, config, rates)
                     rate_views = stored_sub2_rate_views(session, config)
                 except Sub2ApiError as exc:
                     config.last_error = str(exc)
                     session.commit()
-            boards.append(Sub2PriceBoard(config.name, rate_views))
+            boards.append(
+                Sub2PriceBoard(
+                    config.name,
+                    rate_views,
+                    model_prices=model_prices,
+                )
+            )
 
-        image = render_sub2_price_image(boards, title="Sub2API 渠道倍率", timezone_name=self.settings.app_timezone)
+        image = render_sub2_price_image(
+            boards,
+            title="Sub2API 渠道倍率",
+            timezone_name=self.settings.app_timezone,
+            sentiment=sentiment_summary(session),
+        )
         if incoming.message_type == "group" and incoming.group_id:
             target_type = "group"
             target_id = incoming.group_id
@@ -267,6 +376,89 @@ class CommandRouter:
             target_type = "private"
             target_id = incoming.user_id
         result = await self.onebot.send_image_message(target_type, target_id, image, "sub2-price.png")
+        record_send_result(session, result)
+        return ""
+
+    def _sentiment_vote(
+        self,
+        session: Session,
+        incoming: IncomingMessage,
+        direction: str,
+        arg: str,
+    ) -> str:
+        if arg:
+            return f"用法：/{direction}（无需参数）"
+        if incoming.message_type == "group" and incoming.group_id:
+            bound = any(
+                target_contains(config.target_type, config.target_id, "group", incoming.group_id)
+                for config in session.scalars(select(Sub2Config)).all()
+            )
+            if not bound and not is_admin(session, incoming.user_id):
+                return "权限不足，当前群不是 Sub2API 通知对象。"
+            source_type = "group"
+            source_id = incoming.group_id
+        elif is_admin(session, incoming.user_id):
+            source_type = "private"
+            source_id = incoming.user_id
+        else:
+            return "权限不足，私聊投票仅限管理员。"
+
+        result = record_sentiment_vote(
+            session,
+            incoming.user_id,
+            direction,
+            source_type,
+            source_id,
+        )
+        direction_label = "看涨" if direction == "up" else "看跌"
+        action_labels = {
+            "created": f"已记录今日{direction_label}投票。",
+            "changed": f"已将今日投票改为{direction_label}。",
+            "unchanged": f"你今天已经投过{direction_label}。",
+        }
+        summary = result.summary
+        return (
+            f"{action_labels[result.action]}\n"
+            f"当前：看涨 {summary.up_percent:.1f}% · 看跌 {summary.down_percent:.1f}% · 共 {summary.total_count} 票"
+        )
+
+    async def _radar(self, session: Session, incoming: IncomingMessage) -> str:
+        target = self._notification_target_for_context(session, incoming)
+        if target is None:
+            return "权限不足，当前会话不是通知对象。"
+        ok, remaining = self._consume_command_cooldown(session, incoming, "radar")
+        if not ok:
+            return f"操作太频繁，请 {remaining} 秒后再试。"
+        try:
+            report = await self.radar_client.fetch()
+            image = render_codex_radar_image(report)
+        except CodexRadarError as exc:
+            return f"降智雷达数据读取失败：{exc}"
+        except Exception as exc:
+            detail = str(exc).strip() or exc.__class__.__name__
+            return f"降智雷达图片生成失败：{detail}"
+        target_type, target_id = target
+        result = await self.onebot.send_image_message(target_type, target_id, image, "codex-radar.png")
+        record_send_result(session, result)
+        return ""
+
+    async def _tibo(self, session: Session, incoming: IncomingMessage) -> str:
+        target = self._notification_target_for_context(session, incoming)
+        if target is None:
+            return "权限不足，当前会话不是通知对象。"
+        ok, remaining = self._consume_command_cooldown(session, incoming, "tibo")
+        if not ok:
+            return f"操作太频繁，请 {remaining} 秒后再试。"
+        try:
+            report = await self.tibo_client.fetch()
+            image = render_tibo_radar_image(report)
+        except TiboRadarError as exc:
+            return f"Tibo 雷达数据读取失败：{exc}"
+        except Exception as exc:
+            detail = str(exc).strip() or exc.__class__.__name__
+            return f"Tibo 雷达图片生成失败：{detail}"
+        target_type, target_id = target
+        result = await self.onebot.send_image_message(target_type, target_id, image, "tibo-radar.png")
         record_send_result(session, result)
         return ""
 
@@ -556,13 +748,12 @@ def parse_onebot_message(event: dict) -> IncomingMessage | None:
     )
 
 
-def trigger_type_for_message(message: IncomingMessage, reply: str | None) -> str | None:
+def trigger_type_for_message(session: Session, message: IncomingMessage, reply: str | None) -> str | None:
     if reply is None:
         return None
-    text = message.message.strip()
-    if text.startswith("/"):
-        command = text.split(maxsplit=1)[0].lower()
-        return f"command:{command}"
+    resolved = resolve_command_text(session, message.message)
+    if resolved is not None:
+        return f"command:{resolved.command}"
     return "conversation"
 
 
@@ -573,7 +764,7 @@ def log_incoming_message(session: Session, message: IncomingMessage, reply: str 
         group_id=message.group_id,
         message=message.message[:2000],
         triggered=reply is not None,
-        trigger_type=trigger_type_for_message(message, reply),
+        trigger_type=trigger_type_for_message(session, message, reply),
         reply_preview=reply[:500] if reply else None,
     )
     session.add(row)

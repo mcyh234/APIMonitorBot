@@ -41,7 +41,7 @@ def render_status_image(
     now = coerce_aware_utc(generated_at or utc_now()).astimezone(ZoneInfo(timezone_name))
     width = 1120
     header_height = 112
-    config_height = 156
+    config_height = 164
     footer_height = 34
     height = header_height + max(1, len(configs)) * config_height + footer_height
 
@@ -95,16 +95,23 @@ def _draw_config_block(
     font_small: ImageFont.ImageFont,
     font_tiny: ImageFont.ImageFont,
 ) -> None:
-    draw.rounded_rectangle((x, y, x + width, y + 132), radius=12, fill="#ffffff", outline="#e2e8f0", width=1)
+    card_height = 144
+    draw.rounded_rectangle((x, y, x + width, y + card_height), radius=12, fill="#ffffff", outline="#e2e8f0", width=1)
     title = _fit_text(config.config_name, font_heading, 420)
     draw.text((x + 22, y + 18), title, fill="#0f172a", font=font_heading)
     status_text = STATUS_LABELS.get(config.status, "未知")
     status_color = STATE_COLORS["ok"] if config.status == "ok" else STATE_COLORS["down"] if config.status == "down" else STATE_COLORS["unknown"]
     pill_x = x + 448
     draw.rounded_rectangle((pill_x, y + 18, pill_x + 88, y + 46), radius=14, fill=status_color)
-    draw.text((pill_x + 18, y + 22), status_text, fill="#ffffff" if config.status != "unknown" else "#334155", font=font_small)
+    _draw_text_centered_y(
+        draw,
+        (pill_x + 18, y + 32),
+        status_text,
+        font_small,
+        fill="#ffffff" if config.status != "unknown" else "#334155",
+    )
 
-    meta = f"{config.target} · {config.model_name}"
+    meta = config.model_name
     if config.last_code:
         meta += f" · {config.last_code}"
     draw.text((x + 22, y + 52), _fit_text(meta, font_small, 520), fill="#64748b", font=font_small)
@@ -112,10 +119,32 @@ def _draw_config_block(
 
     row_y = y + 78
     for window in config.windows:
-        draw.text((x + 22, row_y - 1), window.label, fill="#334155", font=font_small)
+        bucket_height = 14
+        center_y = row_y + bucket_height / 2
+        _draw_text_centered_y(draw, (x + 22, center_y), window.label, font_small, fill="#334155")
         _draw_buckets(draw, window.buckets, x + 132, row_y, 700)
-        draw.text((x + 850, row_y - 1), f"每 {window.bucket_minutes} 分钟一格", fill="#94a3b8", font=font_tiny)
+        _draw_text_centered_y(
+            draw,
+            (x + 850, center_y),
+            f"每 {window.bucket_minutes} 分钟一格",
+            font_tiny,
+            fill="#94a3b8",
+        )
         row_y += 24
+
+
+def _draw_text_centered_y(
+    draw: ImageDraw.ImageDraw,
+    position: tuple[float, float],
+    text: str,
+    font: ImageFont.ImageFont,
+    *,
+    fill: str,
+) -> None:
+    x, center_y = position
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_y = center_y - (bbox[3] - bbox[1]) / 2 - bbox[1]
+    draw.text((int(x), int(round(text_y))), text, fill=fill, font=font)
 
 
 def _draw_buckets(draw: ImageDraw.ImageDraw, buckets, x: int, y: int, max_width: int) -> None:

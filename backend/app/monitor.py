@@ -18,11 +18,13 @@ from backend.app.repository import target_entries, today_availability
 from backend.app.settings import Settings
 from backend.app.sub2_price_image import Sub2PriceBoard, render_sub2_price_image
 from backend.app.sub2_rates import Sub2RateChange, stored_sub2_rate_views, sync_sub2_rates
-from backend.app.sub2api import Sub2ApiClient, format_rate, platform_label
+from backend.app.sub2_sentiment import sentiment_summary
+from backend.app.sub2api import Sub2ApiClient, Sub2ApiError, format_rate, platform_label
 from backend.app.time_utils import coerce_aware_utc, utc_now
 
 logger = logging.getLogger(__name__)
 IGNORED_SCHEDULED_CODES = {"TIMEOUT", "NETWORK_ERROR"}
+MODEL_FALLBACK_ALLOWED_CODES = {"400", "404", "429", "EMPTY_ASSISTANT_CONTENT"}
 
 
 def status_message(config: APIConfig, body: str, availability: float, code: str | None = None) -> str:
@@ -64,14 +66,15 @@ class NotificationEvent:
 def night_saver_active(settings: Settings, at: datetime | None = None) -> bool:
     if not settings.night_saver_enabled:
         return False
-    start_hour = settings.night_saver_start_hour
-    end_hour = settings.night_saver_end_hour
-    if start_hour == end_hour:
+    start_minute = settings.night_saver_start_hour * 60 + settings.night_saver_start_minute
+    end_minute = settings.night_saver_end_hour * 60 + settings.night_saver_end_minute
+    if start_minute == end_minute:
         return False
     local = coerce_aware_utc(at or utc_now()).astimezone(ZoneInfo(settings.app_timezone))
-    if start_hour < end_hour:
-        return start_hour <= local.hour < end_hour
-    return local.hour >= start_hour or local.hour < end_hour
+    current_minute = local.hour * 60 + local.minute
+    if start_minute < end_minute:
+        return start_minute <= current_minute < end_minute
+    return current_minute >= start_minute or current_minute < end_minute
 
 
 def scheduled_interval_seconds(settings: Settings, at: datetime | None = None) -> int:
@@ -117,6 +120,66 @@ class MonitorService:
         base_window = self.settings.outage_repeat_checks * self.settings.check_interval_seconds
         return max(2, math.ceil(base_window / interval))
 
+    def _fallback_model_candidates(self, current_model: str) -> list[str]:
+        candidates: list[str] = []
+
+        def add(model: str) -> None:
+            clean = model.strip()
+            if not clean:
+                return
+            if clean.casefold() == current_model.strip().casefold():
+                return
+            if any(item.casefold() == clean.casefold() for item in candidates):
+                return
+            candidates.append(clean)
+
+        if "5.5" in current_model:
+            add(current_model.replace("5.5", "5.4"))
+        configured = self.settings.api_probe_fallback_models
+        for separator in ("\uff0c", "\u3001", ";", "\uff1b", "\n", "\t", " "):
+            configured = configured.replace(separator, ",")
+        for item in configured.split(","):
+            add(item)
+        return candidates
+
+    def _should_try_model_fallback(self, result: CheckResult) -> bool:
+        if not self.settings.api_probe_model_fallback_enabled:
+            return False
+        if result.ok:
+            return False
+        return result.code in MODEL_FALLBACK_ALLOWED_CODES
+
+    async def _try_model_fallback(
+        self,
+        session: Session,
+        config: APIConfig,
+        api_key: str,
+        failed_result: CheckResult,
+    ) -> CheckResult | None:
+        if not self._should_try_model_fallback(failed_result):
+            return None
+        old_model = config.model_name
+        for candidate in self._fallback_model_candidates(old_model):
+            result = await self.probe.probe(config.base_url, api_key, candidate)
+            if not result.ok:
+                continue
+            config.model_name = candidate
+            config.outage_first_at = None
+            config.outage_notified_at = None
+            config.outage_followup_sent = False
+            session.commit()
+            session.refresh(config)
+            result.model_switched = True
+            logger.info(
+                "Switched API config %s probe model from %s to %s after %s.",
+                config.name,
+                old_model,
+                candidate,
+                failed_result.code,
+            )
+            return result
+        return None
+
     async def check_config(
         self,
         session: Session,
@@ -138,12 +201,17 @@ class MonitorService:
             else:
                 result = retry
 
+        if scheduled and not result.ok:
+            fallback = await self._try_model_fallback(session, config, api_key, result)
+            if fallback is not None:
+                result = fallback
+
         if scheduled and result.code in IGNORED_SCHEDULED_CODES:
             await self._handle_ignored_scheduled_result(config, result, notify_timeouts)
             return result
 
         self._record_result(session, config, result, scheduled)
-        if scheduled and notify:
+        if scheduled and notify and not result.model_switched:
             await self._handle_notifications(session, config, result)
         return result
 
@@ -171,7 +239,7 @@ class MonitorService:
                             notify=False,
                             notify_timeouts=True,
                         )
-                        if result.code not in IGNORED_SCHEDULED_CODES:
+                        if result.code not in IGNORED_SCHEDULED_CODES and not result.model_switched:
                             event = self._notification_event(session, config, result)
                             if event is not None:
                                 events.extend(self._expand_event_targets(config, event))
@@ -195,9 +263,16 @@ class MonitorService:
                 if changes:
                     rate_views = stored_sub2_rate_views(session, config)
                     image = render_sub2_price_image(
-                        [Sub2PriceBoard(config.name, rate_views, changes)],
+                        [
+                            Sub2PriceBoard(
+                                config.name,
+                                rate_views,
+                                changes,
+                            )
+                        ],
                         title="Sub2API 价格变动",
                         timezone_name=self.settings.app_timezone,
+                        sentiment=sentiment_summary(session),
                     )
                     message = sub2_change_message(config, changes)
                     for target_type, target_id in target_entries(config.target_type, config.target_id):
@@ -208,10 +283,16 @@ class MonitorService:
                             "sub2-price-change.png",
                         )
                         await self.notifier.send(target, message)
+            except Sub2ApiError as exc:
+                error = str(exc).strip() or exc.__class__.__name__
+                logger.warning("Scheduled Sub2API check failed for %s: %s", config.name, error)
+                config.last_checked_at = utc_now()
+                config.last_error = error
+                session.commit()
             except Exception as exc:
                 logger.exception("Scheduled Sub2API check failed for %s", config.name)
                 config.last_checked_at = utc_now()
-                config.last_error = str(exc)
+                config.last_error = str(exc).strip() or exc.__class__.__name__
                 session.commit()
 
     def _record_result(self, session: Session, config: APIConfig, result: CheckResult, scheduled: bool) -> None:

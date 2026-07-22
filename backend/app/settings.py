@@ -32,10 +32,15 @@ class Settings(BaseSettings):
     check_interval_seconds: int = 60
     night_saver_enabled: bool = True
     night_saver_start_hour: int = Field(default=0, ge=0, le=23)
+    night_saver_start_minute: int = Field(default=0, ge=0, le=59)
     night_saver_end_hour: int = Field(default=8, ge=0, le=23)
+    night_saver_end_minute: int = Field(default=0, ge=0, le=59)
     night_saver_interval_seconds: int = Field(default=600, ge=60)
     check_retry_delay_seconds: int = 5
     request_timeout_seconds: float = 20.0
+    api_probe_model_fallback_enabled: bool = True
+    api_probe_fallback_models: str = "gpt-5.4,gpt-5.4-mini"
+    onebot_action_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
     internet_check_url: str = "https://www.google.com/generate_204"
     internet_check_timeout_seconds: float = 8.0
     internet_disconnect_notify_cooldown_seconds: int = 600
@@ -49,6 +54,12 @@ class Settings(BaseSettings):
     status_snapshot_browser_path: str = ""
     status_snapshot_timeout_seconds: float = 45.0
     status_snapshot_viewport_width: int = Field(default=1920, ge=800, le=3840)
+
+    codex_radar_source_url: str = "https://codexradar.com/current.jsor"
+    codex_radar_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
+
+    tibo_radar_source_url: str = "https://codexradar.com/current.json"
+    tibo_radar_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
 
 
 @lru_cache

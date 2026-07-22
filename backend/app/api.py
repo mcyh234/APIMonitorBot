@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.app.availability import ApiProbe
-from backend.app.command_settings import list_command_settings, set_command_enabled
+from backend.app.command_settings import list_command_settings, set_command_setting
 from backend.app.crypto import SecretBox, get_secret_box
 from backend.app.db import get_session
 from backend.app.models import APIConfig, BotAdmin, CheckRecord, ReceivedMessage, SendRecord, Sub2Config
@@ -21,7 +23,12 @@ from backend.app.repository import (
     storage_target,
     today_availability,
 )
-from backend.app.runtime_settings import current_onebot_runtime_settings, save_onebot_runtime_settings
+from backend.app.runtime_settings import (
+    current_monitoring_runtime_settings,
+    current_onebot_runtime_settings,
+    save_monitoring_runtime_settings,
+    save_onebot_runtime_settings,
+)
 from backend.app.schemas import (
     APIConfigCreate,
     APIConfigOut,
@@ -34,6 +41,8 @@ from backend.app.schemas import (
     CommandSettingUpdate,
     ConfigStatusBarsOut,
     ManualCheckOut,
+    MonitoringSettingsOut,
+    MonitoringSettingsUpdate,
     OneBotSettingsOut,
     OneBotSettingsUpdate,
     ReceivedMessageOut,
@@ -41,8 +50,17 @@ from backend.app.schemas import (
     StatusBucketOut,
     StatusWindowOut,
     Sub2PriceBoardOut,
+    Sub2DailyCandleOut,
     Sub2RateHistoryPointOut,
     Sub2RateOut,
+    Sub2SentimentOut,
+    BestGroupOut,
+    UpstreamImportIn,
+    UpstreamImportOut,
+    UpstreamLoginIn,
+    UpgradeInstallOut,
+    UpgradePackageInfoOut,
+    UpgradeStatusOut,
     WebUIAuthStatusOut,
     WebUILoginIn,
     WebUISecretIn,
@@ -50,8 +68,23 @@ from backend.app.schemas import (
 )
 from backend.app.settings import Settings, get_settings
 from backend.app.status_bars import ConfigStatusBarsData, build_status_bars
-from backend.app.sub2_rates import Sub2StoredRate, stored_sub2_rate_views
+from backend.app.sub2_rates import Sub2StoredRate, best_subscription_groups, daily_rate_candles, stored_sub2_rate_views, sync_sub2_rates
+from backend.app.sub2_sentiment import sentiment_summary
+from backend.app.sub2api import Sub2ApiClient, Sub2ApiError
 from backend.app.time_utils import api_datetime
+from backend.app.time_utils import utc_now
+from backend.app.upgrades import (
+    MAX_PACKAGE_BYTES,
+    UpgradeError,
+    build_frontend,
+    create_upgrade_package,
+    install_upgrade_package,
+    load_upgrade_status,
+    project_root,
+    read_current_version,
+    schedule_application_restart,
+    validate_upgrade_package,
+)
 from backend.app.webui_auth import (
     bearer_token,
     create_webui_token,
@@ -159,6 +192,44 @@ async def update_onebot_settings(
     )
 
 
+@api_router.get("/settings/monitoring", response_model=MonitoringSettingsOut)
+def get_monitoring_settings(
+    settings: Settings = Depends(get_app_settings),
+) -> MonitoringSettingsOut:
+    return _monitoring_settings_out(current_monitoring_runtime_settings(settings))
+
+
+@api_router.put("/settings/monitoring", response_model=MonitoringSettingsOut)
+def update_monitoring_settings(
+    data: MonitoringSettingsUpdate,
+    session: Session = Depends(get_session),
+    settings: Settings = Depends(get_app_settings),
+) -> MonitoringSettingsOut:
+    try:
+        current = save_monitoring_runtime_settings(
+            session,
+            settings,
+            night_saver_enabled=data.night_saver_enabled,
+            night_saver_start_time=data.night_saver_start_time,
+            night_saver_end_time=data.night_saver_end_time,
+            night_saver_interval_minutes=data.night_saver_interval_minutes,
+            command_cooldown_minutes=data.command_cooldown_minutes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _monitoring_settings_out(current)
+
+
+def _monitoring_settings_out(current) -> MonitoringSettingsOut:
+    return MonitoringSettingsOut(
+        night_saver_enabled=current.night_saver_enabled,
+        night_saver_start_time=current.night_saver_start_time,
+        night_saver_end_time=current.night_saver_end_time,
+        night_saver_interval_minutes=current.night_saver_interval_minutes,
+        command_cooldown_minutes=current.command_cooldown_minutes,
+    )
+
+
 @api_router.get("/settings/commands", response_model=list[CommandSettingOut])
 def get_command_settings(session: Session = Depends(get_session)) -> list[CommandSettingOut]:
     return [
@@ -167,8 +238,9 @@ def get_command_settings(session: Session = Depends(get_session)) -> list[Comman
             label=definition.label,
             description=definition.description,
             enabled=enabled,
+            aliases=aliases,
         )
-        for definition, enabled in list_command_settings(session)
+        for definition, enabled, aliases in list_command_settings(session)
     ]
 
 
@@ -180,16 +252,18 @@ def update_command_setting(
 ) -> CommandSettingOut:
     normalized = "/" + command.lstrip("/").lower()
     try:
-        row = set_command_enabled(session, normalized, data.enabled)
+        row = set_command_setting(session, normalized, enabled=data.enabled, aliases=data.aliases)
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    for definition, _enabled in list_command_settings(session):
+        code = 404 if str(exc) == "未知命令。" else 422
+        raise HTTPException(status_code=code, detail=str(exc)) from exc
+    for definition, _enabled, aliases in list_command_settings(session):
         if definition.command == row.command:
             return CommandSettingOut(
                 command=definition.command,
                 label=definition.label,
                 description=definition.description,
                 enabled=row.enabled,
+                aliases=aliases,
             )
     raise HTTPException(status_code=404, detail="未知命令。")
 
@@ -384,13 +458,156 @@ def list_sub2_prices(session: Session = Depends(get_session)) -> list[Sub2PriceB
             target_id=config.target_id,
             target=format_target(config.target_type, config.target_id),
             base_url=config.base_url,
+            upstream_type=config.upstream_type,
+            credential_configured=bool(config.email and config.password_encrypted) or bool(config.access_token_encrypted),
             enabled=config.enabled,
             last_checked_at=api_datetime(config.last_checked_at),
             last_error=config.last_error,
             rates=[sub2_rate_to_out(rate) for rate in stored_sub2_rate_views(session, config)],
+            best_groups=[
+                BestGroupOut(
+                    category=item.category,
+                    label=item.label,
+                    group_name=item.group_name,
+                    platform=item.platform,
+                    rate_multiplier=item.rate_multiplier,
+                )
+                for item in best_subscription_groups(stored_sub2_rate_views(session, config))
+            ],
         )
         for config in configs
     ]
+
+
+@api_router.get("/sub2/sentiment", response_model=Sub2SentimentOut)
+def get_sub2_sentiment(session: Session = Depends(get_session)) -> Sub2SentimentOut:
+    summary = sentiment_summary(session)
+    return Sub2SentimentOut(
+        date=summary.date.isoformat(),
+        up_count=summary.up_count,
+        down_count=summary.down_count,
+        total_count=summary.total_count,
+        up_percent=summary.up_percent,
+        down_percent=summary.down_percent,
+    )
+
+
+@api_router.post("/upstream-groups/import", response_model=UpstreamImportOut, status_code=status.HTTP_201_CREATED)
+def import_upstream_group_urls(
+    data: UpstreamImportIn,
+    session: Session = Depends(get_session),
+    secret_box: SecretBox = Depends(get_secret_box),
+) -> UpstreamImportOut:
+    target_type, target_id = storage_target(data.target)
+    created: list[str] = []
+    skipped: list[str] = []
+    known_urls = {item.base_url.rstrip("/").casefold() for item in session.scalars(select(Sub2Config)).all()}
+    known_names = {item.name.casefold() for item in session.scalars(select(Sub2Config)).all()}
+    for raw in data.urls.splitlines():
+        url = raw.strip().rstrip("/")
+        if not url:
+            continue
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            skipped.append(f"{raw.strip()}（不是有效 URL）")
+            continue
+        if url.casefold() in known_urls:
+            skipped.append(f"{url}（已导入）")
+            continue
+        name = _upstream_name_from_url(parsed.netloc, known_names)
+        session.add(
+            Sub2Config(
+                name=name,
+                target_type=target_type,
+                target_id=target_id,
+                base_url=url,
+                upstream_type=data.upstream_type,
+                credential_mode="password",
+                email="",
+                password_encrypted="",
+                enabled=False,
+            )
+        )
+        known_urls.add(url.casefold())
+        known_names.add(name.casefold())
+        created.append(name)
+    session.commit()
+    return UpstreamImportOut(created=created, skipped=skipped)
+
+
+@api_router.post("/sub2/{name}/login", response_model=Sub2PriceBoardOut)
+async def login_upstream_group(
+    name: str,
+    data: UpstreamLoginIn,
+    session: Session = Depends(get_session),
+    secret_box: SecretBox = Depends(get_secret_box),
+    settings: Settings = Depends(get_app_settings),
+) -> Sub2PriceBoardOut:
+    config = session.scalar(select(Sub2Config).where(Sub2Config.name == name))
+    if config is None:
+        raise HTTPException(status_code=404, detail="上游配置不存在。")
+    upstream_type = data.upstream_type if data.upstream_type != "auto" else config.upstream_type
+    if data.access_token:
+        if upstream_type != "newapi" or not data.user_id:
+            raise HTTPException(status_code=422, detail="NewAPI 令牌登录需要同时填写用户 ID。")
+        config.upstream_type = "newapi"
+        config.credential_mode = "token"
+        config.newapi_user_id = data.user_id.strip()
+        config.access_token_encrypted = secret_box.encrypt(data.access_token.strip())
+        config.session_cookie_encrypted = None
+    else:
+        if not data.username or not data.password:
+            raise HTTPException(status_code=422, detail="请填写账号和密码，或填写 NewAPI 令牌与用户 ID。")
+        config.email = data.username.strip()
+        config.password_encrypted = secret_box.encrypt(data.password)
+        config.credential_mode = "password"
+        config.upstream_type = upstream_type
+        config.access_token_encrypted = None
+        config.refresh_token_encrypted = None
+        config.session_cookie_encrypted = None
+        config.newapi_user_id = None
+    client = Sub2ApiClient(timeout_seconds=settings.request_timeout_seconds)
+    try:
+        rates = await client.fetch_rates_with_cached_token(session, config, secret_box)
+    except Sub2ApiError as exc:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=f"登录或读取分组失败：{exc}") from exc
+    config.enabled = True
+    sync_sub2_rates(session, config, rates)
+    config.last_checked_at = utc_now()
+    config.last_error = None
+    session.commit()
+    session.refresh(config)
+    views = stored_sub2_rate_views(session, config)
+    return Sub2PriceBoardOut(
+        config_id=config.id,
+        name=config.name,
+        target_type=config.target_type,
+        target_id=config.target_id,
+        target=format_target(config.target_type, config.target_id),
+        base_url=config.base_url,
+        upstream_type=config.upstream_type,
+        credential_configured=True,
+        enabled=config.enabled,
+        last_checked_at=api_datetime(config.last_checked_at),
+        last_error=config.last_error,
+        rates=[sub2_rate_to_out(rate) for rate in views],
+        best_groups=[
+            BestGroupOut(category=item.category, label=item.label, group_name=item.group_name, platform=item.platform, rate_multiplier=item.rate_multiplier)
+            for item in best_subscription_groups(views)
+        ],
+    )
+
+
+def _upstream_name_from_url(host: str, known_names: set[str]) -> str:
+    base = host.split(":", 1)[0].replace(".", "-").strip("-") or "upstream"
+    candidate = base[:110]
+    index = 2
+    while candidate.casefold() in known_names:
+        suffix = f"-{index}"
+        candidate = f"{base[:120 - len(suffix)]}{suffix}"
+        index += 1
+    return candidate
 
 
 def sub2_rate_to_out(rate: Sub2StoredRate) -> Sub2RateOut:
@@ -408,6 +625,16 @@ def sub2_rate_to_out(rate: Sub2StoredRate) -> Sub2RateOut:
                 rate_multiplier=point.rate_multiplier,
             )
             for point in rate.history
+        ],
+        candles=[
+            Sub2DailyCandleOut(
+                date=item.date.isoformat(),
+                open=item.open,
+                high=item.high,
+                low=item.low,
+                close=item.close,
+            )
+            for item in daily_rate_candles(rate.history)
         ],
     )
 
@@ -487,6 +714,92 @@ def delete_admin(qq: str, session: Session = Depends(get_session)) -> Response:
     if not deleted:
         raise HTTPException(status_code=404, detail="管理员不存在。")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@api_router.get("/upgrade/status", response_model=UpgradeStatusOut)
+def upgrade_status() -> UpgradeStatusOut:
+    return UpgradeStatusOut(**load_upgrade_status(project_root()))
+
+
+@api_router.post("/upgrade/inspect", response_model=UpgradePackageInfoOut)
+async def inspect_upgrade_package(request: Request) -> UpgradePackageInfoOut:
+    package = await _read_upgrade_upload(request)
+    try:
+        validated = await asyncio.to_thread(validate_upgrade_package, package)
+    except UpgradeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return UpgradePackageInfoOut(
+        version=validated.info.version,
+        created_at=validated.info.created_at,
+        file_count=validated.info.file_count,
+        total_size=validated.info.total_size,
+    )
+
+
+@api_router.post("/upgrade/install", response_model=UpgradeInstallOut)
+async def install_upgrade(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    restart: bool = Query(default=True),
+    install_dependencies: bool = Query(default=True),
+) -> UpgradeInstallOut:
+    package = await _read_upgrade_upload(request)
+    root = project_root()
+    try:
+        result = await asyncio.to_thread(
+            install_upgrade_package,
+            package,
+            root,
+            install_dependencies=install_dependencies,
+        )
+    except UpgradeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if restart:
+        background_tasks.add_task(schedule_application_restart, root)
+    return UpgradeInstallOut(
+        version=result.version,
+        previous_version=result.previous_version,
+        installed_at=result.installed_at,
+        updated_files=result.updated_files,
+        backup_path=result.backup_path,
+        dependencies_installed=result.dependencies_installed,
+        restarting=restart,
+    )
+
+
+@api_router.get("/upgrade/package")
+async def download_upgrade_package(version: str | None = Query(default=None)) -> Response:
+    root = project_root()
+    package_version = version or read_current_version(root)
+    try:
+        await asyncio.to_thread(build_frontend, root)
+        package = await asyncio.to_thread(create_upgrade_package, root, package_version)
+    except UpgradeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    filename = f"APIMonitorBot-upgrade-{package_version}.zip"
+    return Response(
+        content=package,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+async def _read_upgrade_upload(request: Request) -> bytes:
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_PACKAGE_BYTES:
+                raise HTTPException(status_code=413, detail="升级包超过 100 MB 限制。")
+        except ValueError:
+            pass
+    package = bytearray()
+    async for chunk in request.stream():
+        package.extend(chunk)
+        if len(package) > MAX_PACKAGE_BYTES:
+            raise HTTPException(status_code=413, detail="升级包超过 100 MB 限制。")
+    if not package:
+        raise HTTPException(status_code=400, detail="没有收到升级包文件。")
+    return bytes(package)
 
 
 @onebot_router.post("/webhook")

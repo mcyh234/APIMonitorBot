@@ -83,18 +83,19 @@ class OneBotClient:
         message: str,
     ) -> OneBotSendResult:
         assert self.websocket_receiver is not None
+        timeout_seconds = self.settings.onebot_action_timeout_seconds
         try:
             data = await self.websocket_receiver.call_action(
                 action,
                 payload,
-                timeout_seconds=self.settings.request_timeout_seconds,
+                timeout_seconds=timeout_seconds,
             )
         except asyncio.TimeoutError:
             return OneBotSendResult(
                 ok=True,
                 payload={
                     "ack_timeout": True,
-                    "timeout_seconds": self.settings.request_timeout_seconds,
+                    "timeout_seconds": timeout_seconds,
                     "message": "OneBot WebSocket action sent, but echo response timed out.",
                 },
                 action=action,
@@ -210,6 +211,7 @@ class OneBotWebSocketReceiver:
         self._websocket = None
         self._send_lock = asyncio.Lock()
         self._pending: dict[str, asyncio.Future] = {}
+        self._handler_tasks: set[asyncio.Task] = set()
         self.connected = False
         self.last_error: str | None = None
 
@@ -231,6 +233,11 @@ class OneBotWebSocketReceiver:
             if not future.done():
                 future.cancel()
         self._pending.clear()
+        for task in list(self._handler_tasks):
+            task.cancel()
+        if self._handler_tasks:
+            await asyncio.gather(*self._handler_tasks, return_exceptions=True)
+        self._handler_tasks.clear()
 
     async def restart(self) -> None:
         await self.stop()
@@ -286,7 +293,7 @@ class OneBotWebSocketReceiver:
                                 if future is not None and not future.done():
                                     future.set_result(event)
                                 continue
-                            await self.handler(event)
+                            self._schedule_handler(event)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -304,3 +311,16 @@ class OneBotWebSocketReceiver:
                     if not future.done():
                         future.cancel()
                 self._pending.clear()
+
+    def _schedule_handler(self, event: dict) -> None:
+        task = asyncio.create_task(self._handle_event(event), name="onebot-event-handler")
+        self._handler_tasks.add(task)
+        task.add_done_callback(self._handler_tasks.discard)
+
+    async def _handle_event(self, event: dict) -> None:
+        try:
+            await self.handler(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("OneBot event handler failed.")

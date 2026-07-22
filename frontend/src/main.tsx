@@ -11,6 +11,9 @@ import {
   Circle,
   ClipboardList,
   Cable,
+  Download,
+  FileArchive,
+  Github,
   KeyRound,
   LockKeyhole,
   LogIn,
@@ -22,10 +25,13 @@ import {
   Shield,
   Trash2,
   MessageSquareText,
+  Moon,
   Pencil,
+  Save,
   WandSparkles,
   TrendingDown,
   TrendingUp,
+  UploadCloud,
   Wifi,
   WifiOff,
   XCircle
@@ -82,6 +88,31 @@ type AuthStatus = {
   authenticated: boolean;
 };
 
+type UpgradeStatus = {
+  current_version: string;
+  process_id: number;
+  last_installed_version: string | null;
+  last_installed_at: string | null;
+  last_backup_path: string | null;
+};
+
+type UpgradePackageInfo = {
+  version: string;
+  created_at: string;
+  file_count: number;
+  total_size: number;
+};
+
+type UpgradeInstallResult = {
+  version: string;
+  previous_version: string;
+  installed_at: string;
+  updated_files: number;
+  backup_path: string;
+  dependencies_installed: boolean;
+  restarting: boolean;
+};
+
 type OneBotSettings = {
   ws_url: string;
   access_token_configured: boolean;
@@ -91,11 +122,20 @@ type OneBotSettings = {
   last_error: string | null;
 };
 
+type MonitoringSettings = {
+  night_saver_enabled: boolean;
+  night_saver_start_time: string;
+  night_saver_end_time: string;
+  night_saver_interval_minutes: number;
+  command_cooldown_minutes: number;
+};
+
 type CommandSetting = {
   command: string;
   label: string;
   description: string;
   enabled: boolean;
+  aliases: string[];
 };
 
 type ReceivedMessage = {
@@ -155,6 +195,14 @@ type Sub2RateHistoryPoint = {
   rate_multiplier: number;
 };
 
+type Sub2DailyCandle = {
+  date: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+};
+
 type Sub2Rate = {
   platform: string;
   group_key: string;
@@ -164,6 +212,16 @@ type Sub2Rate = {
   change_percent: number | null;
   last_seen_at: string;
   history: Sub2RateHistoryPoint[];
+  candles: Sub2DailyCandle[];
+};
+
+type Sub2Sentiment = {
+  date: string;
+  up_count: number;
+  down_count: number;
+  total_count: number;
+  up_percent: number;
+  down_percent: number;
 };
 
 type Sub2PriceBoard = {
@@ -173,11 +231,30 @@ type Sub2PriceBoard = {
   target_id: string;
   target: string;
   base_url: string;
+  upstream_type: "auto" | "sub2api" | "newapi";
+  credential_configured: boolean;
   enabled: boolean;
   last_checked_at: string | null;
   last_error: string | null;
   rates: Sub2Rate[];
+  best_groups: BestGroup[];
 };
+
+type BestGroup = {
+  category: string;
+  label: string;
+  group_name: string;
+  platform: string;
+  rate_multiplier: number;
+};
+
+type UpstreamImportForm = {
+  urls: string;
+  target: string;
+  upstream_type: "auto" | "sub2api" | "newapi";
+};
+
+const emptyUpstreamImport: UpstreamImportForm = { urls: "", target: "", upstream_type: "auto" };
 
 type ConfigForm = {
   name: string;
@@ -198,6 +275,42 @@ const emptyForm: ConfigForm = {
 const HISTORY_LIMIT = 60;
 const defaultTimeZone = "Asia/Shanghai";
 const authTokenKey = "apimonitorbot.webui.token";
+const sidePanelStateKey = "apimonitorbot.webui.side-panels.v2";
+
+type SidePanelState = {
+  addApi: boolean;
+  admins: boolean;
+  monitoring: boolean;
+  upgrade: boolean;
+};
+
+function initialSidePanelState(): SidePanelState {
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(sidePanelStateKey) || "{}") as Partial<SidePanelState>;
+    return {
+      addApi: saved.addApi ?? false,
+      admins: saved.admins ?? false,
+      monitoring: saved.monitoring ?? false,
+      upgrade: saved.upgrade ?? false
+    };
+  } catch {
+    return { addApi: false, admins: false, monitoring: false, upgrade: false };
+  }
+}
+
+function parseCommandAliases(value: string): string[] {
+  const aliases: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value.split(/[,，、;；\s]+/)) {
+    const alias = item.trim();
+    if (!alias) continue;
+    const key = alias.toLocaleLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    aliases.push(alias);
+  }
+  return aliases;
+}
 
 function getAuthToken(): string {
   return window.localStorage.getItem(authTokenKey) || "";
@@ -235,6 +348,64 @@ async function requestJson<T>(input: RequestInfo, init?: RequestInit): Promise<T
     return undefined as T;
   }
   return response.json() as Promise<T>;
+}
+
+async function responseErrorMessage(response: Response): Promise<string> {
+  let message = `${response.status} ${response.statusText}`;
+  try {
+    const data = await response.json();
+    message = data.detail || message;
+  } catch {
+    // Keep default status text.
+  }
+  return message;
+}
+
+async function requestUpgradeFile<T>(url: string, file: File): Promise<T> {
+  const token = getAuthToken();
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/zip",
+      ...(token ? { Authorization: `Bearer ${token}` } : {})
+    },
+    body: file
+  });
+  if (!response.ok) {
+    throw new Error(await responseErrorMessage(response));
+  }
+  return response.json() as Promise<T>;
+}
+
+async function downloadAuthorizedFile(url: string): Promise<string> {
+  const token = getAuthToken();
+  const response = await fetch(url, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {}
+  });
+  if (!response.ok) {
+    throw new Error(await responseErrorMessage(response));
+  }
+  const disposition = response.headers.get("Content-Disposition") || "";
+  const filename = disposition.match(/filename="?([^";]+)"?/i)?.[1] || "APIMonitorBot-upgrade.zip";
+  const objectUrl = URL.createObjectURL(await response.blob());
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(objectUrl);
+  return filename;
+}
+
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
 function parseApiDate(value: string): Date {
@@ -329,10 +500,19 @@ function App() {
   const [sendFailures, setSendFailures] = useState<SendFailure[]>([]);
   const [statusBars, setStatusBars] = useState<ConfigStatusBars[]>([]);
   const [sub2Prices, setSub2Prices] = useState<Sub2PriceBoard[]>([]);
+  const [sub2Sentiment, setSub2Sentiment] = useState<Sub2Sentiment | null>(null);
   const [oneBotSettings, setOneBotSettings] = useState<OneBotSettings | null>(null);
+  const [monitoringSettings, setMonitoringSettings] = useState<MonitoringSettings | null>(null);
   const [commandSettings, setCommandSettings] = useState<CommandSetting[]>([]);
+  const [upgradeStatus, setUpgradeStatus] = useState<UpgradeStatus | null>(null);
+  const [upgradeFile, setUpgradeFile] = useState<File | null>(null);
+  const [upgradePackageInfo, setUpgradePackageInfo] = useState<UpgradePackageInfo | null>(null);
+  const [upgradeVersion, setUpgradeVersion] = useState("");
+  const [upstreamImport, setUpstreamImport] = useState<UpstreamImportForm>(emptyUpstreamImport);
+  const [commandAliasDrafts, setCommandAliasDrafts] = useState<Record<string, string>>({});
   const [expandedSub2, setExpandedSub2] = useState<Record<number, boolean>>({});
   const [historyExpanded, setHistoryExpanded] = useState(false);
+  const [sidePanels, setSidePanels] = useState<SidePanelState>(initialSidePanelState);
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [selectedName, setSelectedName] = useState("");
   const [form, setForm] = useState<ConfigForm>(emptyForm);
@@ -355,8 +535,11 @@ function App() {
       nextSendFailures,
       nextStatusBars,
       nextSub2Prices,
+      nextSub2Sentiment,
       nextOneBotSettings,
-      nextCommandSettings
+      nextMonitoringSettings,
+      nextCommandSettings,
+      nextUpgradeStatus
     ] = await Promise.all([
       requestJson<AppStatus>("/api/status"),
       requestJson<ApiConfig[]>("/api/configs"),
@@ -365,8 +548,11 @@ function App() {
       requestJson<SendFailure[]>("/api/sends/recent-failures"),
       requestJson<ConfigStatusBars[]>("/api/status-bars"),
       requestJson<Sub2PriceBoard[]>("/api/sub2/prices"),
+      requestJson<Sub2Sentiment>("/api/sub2/sentiment"),
       requestJson<OneBotSettings>("/api/settings/onebot"),
-      requestJson<CommandSetting[]>("/api/settings/commands")
+      requestJson<MonitoringSettings>("/api/settings/monitoring"),
+      requestJson<CommandSetting[]>("/api/settings/commands"),
+      requestJson<UpgradeStatus>("/api/upgrade/status")
     ]);
     setStatus(nextStatus);
     setConfigs(nextConfigs);
@@ -375,8 +561,13 @@ function App() {
     setSendFailures(nextSendFailures);
     setStatusBars(nextStatusBars);
     setSub2Prices(nextSub2Prices);
+    setSub2Sentiment(nextSub2Sentiment);
     setOneBotSettings(nextOneBotSettings);
+    setMonitoringSettings(nextMonitoringSettings);
     setCommandSettings(nextCommandSettings);
+    setUpgradeStatus(nextUpgradeStatus);
+    setUpgradeVersion((current) => current || nextUpgradeStatus.current_version);
+    setCommandAliasDrafts(Object.fromEntries(nextCommandSettings.map((item) => [item.command, item.aliases.join(", ")])));
     if (!selectedName && nextConfigs.length > 0) {
       setSelectedName(nextConfigs[0].name);
     }
@@ -421,6 +612,14 @@ function App() {
     if (!authStatus?.authenticated) return;
     loadHistory(selectedConfig?.name).catch((err) => setError(err.message));
   }, [selectedConfig?.name, authStatus?.authenticated]);
+
+  useEffect(() => {
+    window.localStorage.setItem(sidePanelStateKey, JSON.stringify(sidePanels));
+  }, [sidePanels]);
+
+  function toggleSidePanel(panel: keyof SidePanelState) {
+    setSidePanels((current) => ({ ...current, [panel]: !current[panel] }));
+  }
 
   function showNotice(message: string) {
     setNotice(message);
@@ -496,6 +695,22 @@ function App() {
     }
   }
 
+  async function saveMonitoringSettings(data: MonitoringSettings) {
+    setBusy("monitoring-settings");
+    try {
+      const updated = await requestJson<MonitoringSettings>("/api/settings/monitoring", {
+        method: "PUT",
+        body: JSON.stringify(data)
+      });
+      setMonitoringSettings(updated);
+      showNotice("巡检与冷却设置已保存并立即生效");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存巡检设置失败");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function toggleCommand(command: CommandSetting) {
     setBusy(`command-${command.command}`);
     try {
@@ -512,6 +727,23 @@ function App() {
     }
   }
 
+
+  async function saveCommandAliases(command: CommandSetting) {
+    const aliases = parseCommandAliases(commandAliasDrafts[command.command] ?? command.aliases.join(", "));
+    setBusy(`command-alias-${command.command}`);
+    try {
+      await requestJson<CommandSetting>(`/api/settings/commands/${encodeURIComponent(command.command.replace(/^\//, ""))}`, {
+        method: "PATCH",
+        body: JSON.stringify({ aliases })
+      });
+      await loadAll();
+      showNotice(`${command.label} 别名已保存`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存命令别名失败");
+    } finally {
+      setBusy(null);
+    }
+  }
   async function submitConfig(event: FormEvent) {
     event.preventDefault();
     setBusy("add-config");
@@ -541,6 +773,56 @@ function App() {
       showNotice(config.enabled ? "配置已停用" : "配置已启用");
     } catch (err) {
       setError(err instanceof Error ? err.message : "更新失败");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function importUpstreams(event: FormEvent) {
+    event.preventDefault();
+    setBusy("import-upstreams");
+    try {
+      const result = await requestJson<{ created: string[]; skipped: string[] }>("/api/upstream-groups/import", {
+        method: "POST",
+        body: JSON.stringify(upstreamImport)
+      });
+      setUpstreamImport((current) => ({ ...emptyUpstreamImport, target: current.target }));
+      await loadAll();
+      const detail = [
+        result.created.length ? `已导入 ${result.created.length} 个` : "没有新增地址",
+        result.skipped.length ? `跳过 ${result.skipped.length} 个` : ""
+      ].filter(Boolean).join("，");
+      showNotice(`${detail}。请在价格面板中补充登录信息。`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "批量导入失败");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function loginUpstream(board: Sub2PriceBoard) {
+    const upstreamType = board.upstream_type === "auto"
+      ? window.prompt("选择来源：sub2api 或 newapi", "sub2api")?.trim().toLowerCase()
+      : board.upstream_type;
+    if (upstreamType == null) return;
+    if (upstreamType !== "sub2api" && upstreamType !== "newapi") {
+      setError("来源类型只能是 sub2api 或 newapi");
+      return;
+    }
+    const username = window.prompt(upstreamType === "newapi" ? "NewAPI 用户名" : "Sub2API 邮箱")?.trim();
+    if (!username) return;
+    const password = window.prompt("登录密码");
+    if (!password) return;
+    setBusy(`upstream-login-${board.config_id}`);
+    try {
+      await requestJson<Sub2PriceBoard>(`/api/sub2/${encodeURIComponent(board.name)}/login`, {
+        method: "POST",
+        body: JSON.stringify({ username, password, upstream_type: upstreamType })
+      });
+      await loadAll();
+      showNotice(`${board.name} 已登录并读取分组。`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "上游登录失败");
     } finally {
       setBusy(null);
     }
@@ -677,6 +959,84 @@ function App() {
     }
   }
 
+  async function inspectUpgradeFile(file: File | null) {
+    setUpgradeFile(file);
+    setUpgradePackageInfo(null);
+    if (!file) return;
+    if (!file.name.toLocaleLowerCase().endsWith(".zip")) {
+      setUpgradeFile(null);
+      setError("请选择 ZIP 格式的 APIMonitorBot 升级包");
+      return;
+    }
+    setBusy("upgrade-inspect");
+    try {
+      const info = await requestUpgradeFile<UpgradePackageInfo>("/api/upgrade/inspect", file);
+      setUpgradePackageInfo(info);
+      setError(null);
+    } catch (err) {
+      setUpgradeFile(null);
+      setError(err instanceof Error ? err.message : "升级包校验失败");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function waitForRestart(previousProcessId: number): Promise<boolean> {
+    await delay(2500);
+    for (let attempt = 0; attempt < 45; attempt += 1) {
+      try {
+        const next = await requestJson<UpgradeStatus>("/api/upgrade/status", { cache: "no-store" });
+        if (next.process_id !== previousProcessId) return true;
+      } catch {
+        // The old process is stopping or the new process is starting.
+      }
+      await delay(2000);
+    }
+    return false;
+  }
+
+  async function installUpgrade() {
+    if (!upgradeFile || !upgradePackageInfo || !upgradeStatus) return;
+    if (!window.confirm(`安装版本 ${upgradePackageInfo.version} 并自动重启 APIMonitorBot？`)) return;
+    setBusy("upgrade-install");
+    setError(null);
+    try {
+      const result = await requestUpgradeFile<UpgradeInstallResult>(
+        "/api/upgrade/install?restart=true&install_dependencies=true",
+        upgradeFile
+      );
+      setNotice(`版本 ${result.version} 已安装，正在重启服务`);
+      const restarted = await waitForRestart(upgradeStatus.process_id);
+      if (restarted) {
+        window.location.reload();
+        return;
+      }
+      setError(`版本 ${result.version} 已写入，但自动重启未完成。请手动重启服务，备份位于 ${result.backup_path}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "安装升级包失败");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function generateUpgradePackage() {
+    const version = upgradeVersion.trim();
+    if (!version) {
+      setError("请输入升级包版本号");
+      return;
+    }
+    setBusy("upgrade-generate");
+    setError(null);
+    try {
+      const filename = await downloadAuthorizedFile(`/api/upgrade/package?version=${encodeURIComponent(version)}`);
+      showNotice(`升级包已生成：${filename}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "生成升级包失败");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   const healthyCount = configs.filter((item) => item.status === "ok").length;
   const downCount = configs.filter((item) => item.status === "down").length;
   const displayTimeZone = status?.app_timezone || defaultTimeZone;
@@ -718,6 +1078,16 @@ function App() {
           <h1>APIMonitorBot</h1>
         </div>
         <div className="topbar-actions">
+          <a
+            className="icon-button github-link"
+            href="https://github.com/mcyh234/APIMonitorBot"
+            target="_blank"
+            rel="noreferrer"
+            aria-label="打开 APIMonitorBot GitHub 项目"
+            title="GitHub：mcyh234/APIMonitorBot"
+          >
+            <Github size={19} />
+          </a>
           <button className="icon-button" onClick={() => loadAll().catch((err) => setError(err.message))} aria-label="刷新">
             <RefreshCcw size={18} />
           </button>
@@ -857,42 +1227,89 @@ function App() {
         </div>
 
         <aside className="side-stack">
-          <form className="panel form-panel" onSubmit={submitConfig}>
+          <form
+            className={sidePanels.addApi ? "panel form-panel collapsible-panel" : "panel form-panel collapsible-panel collapsed"}
+            onSubmit={submitConfig}
+          >
             <div className="panel-heading compact">
               <h2>添加 API</h2>
-              <Plus size={18} />
+              <div className="panel-heading-actions">
+                <Plus size={18} />
+                <PanelCollapseButton
+                  expanded={sidePanels.addApi}
+                  label="添加 API"
+                  onClick={() => toggleSidePanel("addApi")}
+                />
+              </div>
             </div>
-            <Field label="配置名称" value={form.name} onChange={(name) => setForm({ ...form, name })} required />
-            <Field label="报告目标" value={form.target} placeholder="G123456789 或 P2087900785，多个用 & 连接" onChange={(target) => setForm({ ...form, target })} required />
-            <Field label="BaseURL" value={form.base_url} placeholder="https://example.com/v1" onChange={(base_url) => setForm({ ...form, base_url })} required />
-            <Field label="APIKey" value={form.api_key} type="password" onChange={(api_key) => setForm({ ...form, api_key })} required />
-            <Field label="模型名称" value={form.model_name} placeholder="gpt-4.1-mini" onChange={(model_name) => setForm({ ...form, model_name })} required />
-            <button className="primary" disabled={busy === "add-config"} type="submit">
-              <KeyRound size={16} />
-              验证并添加
-            </button>
+            {sidePanels.addApi && (
+              <>
+                <Field label="配置名称" value={form.name} onChange={(name) => setForm({ ...form, name })} required />
+                <Field label="报告目标" value={form.target} placeholder="G123456789 或 P2087900785，多个用 & 连接" onChange={(target) => setForm({ ...form, target })} required />
+                <Field label="BaseURL" value={form.base_url} placeholder="https://example.com/v1" onChange={(base_url) => setForm({ ...form, base_url })} required />
+                <Field label="APIKey" value={form.api_key} type="password" onChange={(api_key) => setForm({ ...form, api_key })} required />
+                <Field label="模型名称" value={form.model_name} placeholder="gpt-4.1-mini" onChange={(model_name) => setForm({ ...form, model_name })} required />
+                <button className="primary" disabled={busy === "add-config"} type="submit">
+                  <KeyRound size={16} />
+                  验证并添加
+                </button>
+              </>
+            )}
           </form>
 
-          <div className="panel">
+          <section className={sidePanels.admins ? "panel collapsible-panel" : "panel collapsible-panel collapsed"}>
             <div className="panel-heading compact">
               <h2>管理员</h2>
-              <Shield size={18} />
+              <div className="panel-heading-actions">
+                <Shield size={18} />
+                <PanelCollapseButton
+                  expanded={sidePanels.admins}
+                  label="管理员"
+                  onClick={() => toggleSidePanel("admins")}
+                />
+              </div>
             </div>
-            <form className="inline-form" onSubmit={addAdmin}>
-              <input value={adminQq} onChange={(event) => setAdminQq(event.target.value)} placeholder="QQ号" aria-label="管理员QQ号" />
-              <button disabled={busy === "add-admin"} type="submit">添加</button>
-            </form>
-            <div className="admin-list">
-              {admins.map((admin) => (
-                <div className="admin-row" key={admin.id}>
-                  <span>{admin.qq}</span>
-                  <button className="icon-button small" onClick={() => deleteAdmin(admin)} aria-label={`移除管理员 ${admin.qq}`}>
-                    <Trash2 size={15} />
-                  </button>
+            {sidePanels.admins && (
+              <>
+                <form className="inline-form" onSubmit={addAdmin}>
+                  <input value={adminQq} onChange={(event) => setAdminQq(event.target.value)} placeholder="QQ号" aria-label="管理员QQ号" />
+                  <button disabled={busy === "add-admin"} type="submit">添加</button>
+                </form>
+                <div className="admin-list">
+                  {admins.map((admin) => (
+                    <div className="admin-row" key={admin.id}>
+                      <span>{admin.qq}</span>
+                      <button className="icon-button small" onClick={() => deleteAdmin(admin)} aria-label={`移除管理员 ${admin.qq}`}>
+                        <Trash2 size={15} />
+                      </button>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
-          </div>
+              </>
+            )}
+          </section>
+
+          <MonitoringSettingsPanel
+            settings={monitoringSettings}
+            busy={busy === "monitoring-settings"}
+            expanded={sidePanels.monitoring}
+            onToggle={() => toggleSidePanel("monitoring")}
+            onSave={saveMonitoringSettings}
+          />
+
+          <UpgradePanel
+            status={upgradeStatus}
+            file={upgradeFile}
+            packageInfo={upgradePackageInfo}
+            version={upgradeVersion}
+            busy={busy}
+            expanded={sidePanels.upgrade}
+            onToggle={() => toggleSidePanel("upgrade")}
+            onVersionChange={setUpgradeVersion}
+            onFileChange={inspectUpgradeFile}
+            onInstall={installUpgrade}
+            onGenerate={generateUpgradePackage}
+          />
         </aside>
       </section>
 
@@ -946,16 +1363,31 @@ function App() {
 
       <Sub2PriceSection
         boards={sub2Prices}
+        sentiment={sub2Sentiment}
         expanded={expandedSub2}
+        busy={busy}
+        onLogin={loginUpstream}
         onToggle={(configId) =>
           setExpandedSub2((current) => ({ ...current, [configId]: !current[configId] }))
         }
         timeZone={displayTimeZone}
       />
 
+      <UpstreamImportPanel
+        form={upstreamImport}
+        busy={busy === "import-upstreams"}
+        onChange={setUpstreamImport}
+        onSubmit={importUpstreams}
+      />
+
       <CommandSettingsPanel
         commands={commandSettings}
         busy={busy}
+        aliasDrafts={commandAliasDrafts}
+        onAliasDraftChange={(command, value) =>
+          setCommandAliasDrafts((current) => ({ ...current, [command]: value }))
+        }
+        onSaveAliases={saveCommandAliases}
         onToggle={toggleCommand}
       />
 
@@ -1057,6 +1489,281 @@ function App() {
         {status?.onebot_ws_last_error ? ` · ${status.onebot_ws_last_error}` : ""}
       </footer>
     </main>
+  );
+}
+
+function MonitoringSettingsPanel({
+  settings,
+  busy,
+  expanded,
+  onToggle,
+  onSave
+}: {
+  settings: MonitoringSettings | null;
+  busy: boolean;
+  expanded: boolean;
+  onToggle: () => void;
+  onSave: (settings: MonitoringSettings) => void;
+}) {
+  const [draft, setDraft] = useState<MonitoringSettings>({
+    night_saver_enabled: true,
+    night_saver_start_time: "00:00",
+    night_saver_end_time: "08:00",
+    night_saver_interval_minutes: 10,
+    command_cooldown_minutes: 5
+  });
+
+  useEffect(() => {
+    if (settings) setDraft(settings);
+  }, [
+    settings?.night_saver_enabled,
+    settings?.night_saver_start_time,
+    settings?.night_saver_end_time,
+    settings?.night_saver_interval_minutes,
+    settings?.command_cooldown_minutes
+  ]);
+
+  const summary = settings?.night_saver_enabled
+    ? `${settings.night_saver_start_time}-${settings.night_saver_end_time} · 冷却 ${settings.command_cooldown_minutes} 分钟`
+    : `夜间省流已关闭 · 冷却 ${settings?.command_cooldown_minutes ?? 0} 分钟`;
+
+  return (
+    <section className={expanded ? "panel monitoring-settings-panel collapsible-panel" : "panel monitoring-settings-panel collapsible-panel collapsed"}>
+      <div className="panel-heading compact">
+        <div>
+          <h2>巡检与冷却</h2>
+          <p>{settings ? summary : "正在读取设置"}</p>
+        </div>
+        <div className="panel-heading-actions">
+          <Moon size={18} />
+          <PanelCollapseButton expanded={expanded} label="巡检与冷却" onClick={onToggle} />
+        </div>
+      </div>
+      {expanded && (
+        <form className="monitoring-settings-form" onSubmit={(event) => { event.preventDefault(); onSave(draft); }}>
+          <label className="monitoring-toggle-row">
+            <div>
+              <strong>夜间省流</strong>
+              <span>夜间按较长间隔执行 API 探测</span>
+            </div>
+            <span className="toggle">
+              <input
+                type="checkbox"
+                checked={draft.night_saver_enabled}
+                onChange={(event) => setDraft({ ...draft, night_saver_enabled: event.target.checked })}
+              />
+              <span>{draft.night_saver_enabled ? "开启" : "关闭"}</span>
+            </span>
+          </label>
+
+          <div className="monitoring-settings-grid">
+            <label>
+              <span>开始时间</span>
+              <input
+                type="time"
+                value={draft.night_saver_start_time}
+                disabled={!draft.night_saver_enabled}
+                onChange={(event) => setDraft({ ...draft, night_saver_start_time: event.target.value })}
+              />
+            </label>
+            <label>
+              <span>结束时间</span>
+              <input
+                type="time"
+                value={draft.night_saver_end_time}
+                disabled={!draft.night_saver_enabled}
+                onChange={(event) => setDraft({ ...draft, night_saver_end_time: event.target.value })}
+              />
+            </label>
+            <label>
+              <span>夜间巡检间隔（分钟）</span>
+              <input
+                type="number"
+                min={1}
+                max={1440}
+                value={draft.night_saver_interval_minutes}
+                disabled={!draft.night_saver_enabled}
+                onChange={(event) => setDraft({ ...draft, night_saver_interval_minutes: Number(event.target.value) })}
+              />
+            </label>
+            <label>
+              <span>命令冷却时间（分钟）</span>
+              <input
+                type="number"
+                min={0}
+                max={1440}
+                value={draft.command_cooldown_minutes}
+                onChange={(event) => setDraft({ ...draft, command_cooldown_minutes: Number(event.target.value) })}
+              />
+            </label>
+          </div>
+          <p className="monitoring-settings-hint">命令冷却只限制普通用户的 /check、/status、/stat、/price、/radar、/tibo；设为 0 可关闭冷却。</p>
+          <button className="primary no-margin" type="submit" disabled={busy || !settings}>
+            <Save size={16} />
+            {busy ? "正在保存" : "保存设置"}
+          </button>
+        </form>
+      )}
+    </section>
+  );
+}
+
+function PanelCollapseButton({
+  expanded,
+  label,
+  onClick
+}: {
+  expanded: boolean;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      className="icon-button small panel-collapse-button"
+      type="button"
+      aria-expanded={expanded}
+      aria-label={`${expanded ? "收起" : "展开"}${label}`}
+      title={`${expanded ? "收起" : "展开"}${label}`}
+      onClick={onClick}
+    >
+      {expanded ? <ChevronDown size={17} /> : <ChevronRight size={17} />}
+    </button>
+  );
+}
+
+function UpgradePanel({
+  status,
+  file,
+  packageInfo,
+  version,
+  busy,
+  expanded,
+  onToggle,
+  onVersionChange,
+  onFileChange,
+  onInstall,
+  onGenerate
+}: {
+  status: UpgradeStatus | null;
+  file: File | null;
+  packageInfo: UpgradePackageInfo | null;
+  version: string;
+  busy: string | null;
+  expanded: boolean;
+  onToggle: () => void;
+  onVersionChange: (value: string) => void;
+  onFileChange: (file: File | null) => void;
+  onInstall: () => void;
+  onGenerate: () => void;
+}) {
+  const [dragging, setDragging] = useState(false);
+  const inspecting = busy === "upgrade-inspect";
+  const installing = busy === "upgrade-install";
+  const generating = busy === "upgrade-generate";
+
+  function acceptFiles(files: FileList | null) {
+    onFileChange(files?.[0] || null);
+  }
+
+  return (
+    <section className={expanded ? "panel upgrade-panel collapsible-panel" : "panel upgrade-panel collapsible-panel collapsed"}>
+      <div className="panel-heading compact">
+        <div>
+          <h2>版本升级</h2>
+          <p>当前版本 {status?.current_version || "读取中"}</p>
+        </div>
+        <div className="panel-heading-actions">
+          <FileArchive size={18} />
+          <PanelCollapseButton expanded={expanded} label="版本升级" onClick={onToggle} />
+        </div>
+      </div>
+      {expanded && <div className="upgrade-body">
+        <input
+          className="visually-hidden"
+          id="upgrade-package-file"
+          type="file"
+          accept=".zip,application/zip"
+          onChange={(event) => acceptFiles(event.target.files)}
+        />
+        <label
+          className={dragging ? "upgrade-dropzone dragging" : "upgrade-dropzone"}
+          htmlFor="upgrade-package-file"
+          onDragEnter={(event) => { event.preventDefault(); setDragging(true); }}
+          onDragOver={(event) => { event.preventDefault(); setDragging(true); }}
+          onDragLeave={(event) => { event.preventDefault(); setDragging(false); }}
+          onDrop={(event) => {
+            event.preventDefault();
+            setDragging(false);
+            acceptFiles(event.dataTransfer.files);
+          }}
+        >
+          <UploadCloud size={24} />
+          <strong>{inspecting ? "正在校验升级包" : "拖入升级包"}</strong>
+          <span>或点击选择 ZIP 文件</span>
+        </label>
+
+        {file && (
+          <div className="upgrade-file-row">
+            <div>
+              <strong>{file.name}</strong>
+              <span>{formatBytes(file.size)}</span>
+            </div>
+            <button
+              className="icon-button small"
+              type="button"
+              onClick={() => onFileChange(null)}
+              disabled={installing}
+              aria-label="移除升级包"
+              title="移除升级包"
+            >
+              <XCircle size={16} />
+            </button>
+          </div>
+        )}
+
+        {packageInfo && (
+          <div className="upgrade-package-meta">
+            <span><b>目标版本</b>{packageInfo.version}</span>
+            <span><b>文件数量</b>{packageInfo.file_count}</span>
+            <span><b>解压体积</b>{formatBytes(packageInfo.total_size)}</span>
+          </div>
+        )}
+
+        <button
+          className="primary no-margin upgrade-install-button"
+          type="button"
+          disabled={!packageInfo || installing || inspecting}
+          onClick={onInstall}
+        >
+          <UploadCloud size={16} />
+          {installing ? "正在安装并重启" : "安装并重启"}
+        </button>
+
+        <div className="upgrade-divider" />
+
+        <label className="upgrade-version-field">
+          <span>生成升级包版本</span>
+          <input
+            value={version}
+            onChange={(event) => onVersionChange(event.target.value)}
+            placeholder="例如 1.1.0"
+            maxLength={64}
+          />
+        </label>
+        <button type="button" disabled={generating || installing} onClick={onGenerate}>
+          <Download size={16} />
+          {generating ? "正在构建 WebUI" : "生成升级包"}
+        </button>
+
+        <p className="upgrade-hint">仅安装可信来源的升级包。安装前会校验并备份现有版本，不会覆盖 .env 和 data。</p>
+        {status?.last_installed_version && (
+          <p className="upgrade-last-install">
+            上次安装 {status.last_installed_version}
+            {status.last_installed_at ? ` · ${formatTime(status.last_installed_at)}` : ""}
+          </p>
+        )}
+      </div>}
+    </section>
   );
 }
 
@@ -1231,10 +1938,16 @@ function QuickStartPanel({
 function CommandSettingsPanel({
   commands,
   busy,
+  aliasDrafts,
+  onAliasDraftChange,
+  onSaveAliases,
   onToggle
 }: {
   commands: CommandSetting[];
   busy: string | null;
+  aliasDrafts: Record<string, string>;
+  onAliasDraftChange: (command: string, value: string) => void;
+  onSaveAliases: (command: CommandSetting) => void;
   onToggle: (command: CommandSetting) => void;
 }) {
   return (
@@ -1249,19 +1962,41 @@ function CommandSettingsPanel({
       <div className="command-grid">
         {commands.map((command) => (
           <div className="command-toggle-row" key={command.command}>
-            <div>
-              <strong>{command.command}</strong>
-              <span>{command.label} · {command.description}</span>
+            <div className="command-toggle-main">
+              <div className="command-toggle-head">
+                <div>
+                  <strong>{command.command}</strong>
+                  <span>{command.label} · {command.description}</span>
+                </div>
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={command.enabled}
+                    disabled={busy === `command-${command.command}`}
+                    onChange={() => onToggle(command)}
+                  />
+                  <span>{command.enabled ? "开启" : "关闭"}</span>
+                </label>
+              </div>
+              <div className="command-alias-editor">
+                <label>
+                  <span>别名</span>
+                  <input
+                    value={aliasDrafts[command.command] ?? command.aliases.join(", ")}
+                    placeholder="例如：状态，查状态"
+                    disabled={busy === `command-alias-${command.command}`}
+                    onChange={(event) => onAliasDraftChange(command.command, event.target.value)}
+                  />
+                </label>
+                <button
+                  type="button"
+                  disabled={busy === `command-alias-${command.command}`}
+                  onClick={() => onSaveAliases(command)}
+                >
+                  保存
+                </button>
+              </div>
             </div>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={command.enabled}
-                disabled={busy === `command-${command.command}`}
-                onChange={() => onToggle(command)}
-              />
-              <span>{command.enabled ? "开启" : "关闭"}</span>
-            </label>
           </div>
         ))}
       </div>
@@ -1269,15 +2004,70 @@ function CommandSettingsPanel({
   );
 }
 
+function UpstreamImportPanel({
+  form,
+  busy,
+  onChange,
+  onSubmit
+}: {
+  form: UpstreamImportForm;
+  busy: boolean;
+  onChange: React.Dispatch<React.SetStateAction<UpstreamImportForm>>;
+  onSubmit: (event: FormEvent) => void;
+}) {
+  return (
+    <section className="panel upstream-import-panel">
+      <div className="panel-heading">
+        <div>
+          <h2>批量导入上游</h2>
+          <p>每行一个地址。可先导入，稍后在上游分组倍率面板补充账号登录。</p>
+        </div>
+        <Plus size={18} />
+      </div>
+      <form className="upstream-import-form" onSubmit={onSubmit}>
+        <label>
+          上游地址
+          <textarea
+            value={form.urls}
+            onChange={(event) => onChange((current) => ({ ...current, urls: event.target.value }))}
+            placeholder={"https://one.example.com\nhttps://two.example.com"}
+            rows={5}
+            required
+          />
+        </label>
+        <label>
+          通知对象
+          <input value={form.target} onChange={(event) => onChange((current) => ({ ...current, target: event.target.value }))} placeholder="G123456789&P1122334455" required />
+        </label>
+        <label>
+          上游类型
+          <select value={form.upstream_type} onChange={(event) => onChange((current) => ({ ...current, upstream_type: event.target.value as UpstreamImportForm["upstream_type"] }))}>
+            <option value="auto">自动识别（登录时确认）</option>
+            <option value="sub2api">Sub2API</option>
+            <option value="newapi">NewAPI</option>
+          </select>
+        </label>
+        <button type="submit" disabled={busy}>{busy ? "导入中..." : "导入地址"}</button>
+      </form>
+    </section>
+  );
+}
+
 function Sub2PriceSection({
   boards,
+  sentiment,
   expanded,
   onToggle,
+  onLogin,
+  busy,
   timeZone
 }: {
   boards: Sub2PriceBoard[];
+  sentiment: Sub2Sentiment | null;
   expanded: Record<number, boolean>;
   onToggle: (configId: number) => void;
+  onLogin: (board: Sub2PriceBoard) => void;
+  busy: string | null;
   timeZone: string;
 }) {
   return (
@@ -1289,6 +2079,7 @@ function Sub2PriceSection({
         </div>
         <BadgePercent size={18} />
       </div>
+      <Sub2SentimentBar sentiment={sentiment} />
       <div className="sub2-board-list">
         {boards.length === 0 ? (
           <div className="empty">暂无 Sub2API 渠道倍率数据。</div>
@@ -1317,7 +2108,24 @@ function Sub2PriceSection({
                 </button>
                 {isOpen && (
                   <div className="sub2-board-body">
+                    {!board.credential_configured && (
+                      <div className="upstream-login-row">
+                        <span>尚未登录，当前不会参与巡检。</span>
+                        <button type="button" onClick={() => onLogin(board)} disabled={busy === `upstream-login-${board.config_id}`}>
+                          {busy === `upstream-login-${board.config_id}` ? "登录中..." : "补充登录"}
+                        </button>
+                      </div>
+                    )}
                     {board.last_error && <div className="sub2-error">最近错误：{board.last_error}</div>}
+                    {board.best_groups.length > 0 && (
+                      <div className="best-group-list" aria-label="自动识别的最低订阅倍率">
+                        {board.best_groups.map((item) => (
+                          <span key={item.category} title={`${item.platform} · ${item.group_name}`}>
+                            {item.label} <strong>{formatRate(item.rate_multiplier)}</strong> {item.group_name}
+                          </span>
+                        ))}
+                      </div>
+                    )}
                     {groupByPlatform(board.rates).map(([platform, rates]) => (
                       <div className="sub2-platform" key={`${board.config_id}-${platform}`}>
                         <div className={`sub2-platform-badge ${platformClass(platform)}`}>
@@ -1353,7 +2161,7 @@ function Sub2RateCard({ rate, timeZone }: { rate: Sub2Rate; timeZone: string }) 
         <strong>{rate.group_name}</strong>
         <span>{formatTime(rate.last_seen_at, timeZone)}</span>
       </div>
-      <div className="sub2-rate-body">
+      <div className="sub2-rate-summary">
         <div>
           <div className={`sub2-current-rate ${trend}`}>{formatRate(rate.rate_multiplier)}</div>
           <div className={`sub2-rate-change ${trend}`}>
@@ -1362,7 +2170,37 @@ function Sub2RateCard({ rate, timeZone }: { rate: Sub2Rate; timeZone: string }) 
             {rate.previous_rate != null && <small>上次 {formatRate(rate.previous_rate)}</small>}
           </div>
         </div>
-        <Sub2Sparkline points={rate.history} trend={trend} timeZone={timeZone} />
+      </div>
+      <div className="sub2-chart-grid">
+        <div className="sub2-chart-block">
+          <span>倍率折线</span>
+          <Sub2Sparkline points={rate.history} trend={trend} timeZone={timeZone} />
+        </div>
+        <div className="sub2-chart-block">
+          <span>日 K（30天）</span>
+          <Sub2CandleChart candles={rate.candles} timeZone={timeZone} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Sub2SentimentBar({ sentiment }: { sentiment: Sub2Sentiment | null }) {
+  const hasVotes = Boolean(sentiment?.total_count);
+  const upPercent = hasVotes ? Math.min(100, Math.max(0, sentiment?.up_percent ?? 0)) : 0;
+  return (
+    <div className="sub2-sentiment" aria-label="全 Bot 今日看涨看跌比例">
+      <div className={`sub2-sentiment-line ${hasVotes ? "has-votes" : "empty"}`}>
+        {hasVotes && <span className="up" style={{ width: `${upPercent}%` }} />}
+        {hasVotes && <span className="down" style={{ width: `${100 - upPercent}%` }} />}
+      </div>
+      <div className="sub2-sentiment-meta">
+        <strong>
+          {hasVotes
+            ? `看涨 ${sentiment!.up_percent.toFixed(1)}% · 看跌 ${sentiment!.down_percent.toFixed(1)}% · 共 ${sentiment!.total_count} 票`
+            : "今日暂无投票"}
+        </strong>
+        <span>{sentiment?.date ?? "-"} · 全 Bot</span>
       </div>
     </div>
   );
@@ -1407,6 +2245,73 @@ function Sub2Sparkline({
       </div>
     </div>
   );
+}
+
+function Sub2CandleChart({ candles, timeZone }: { candles: Sub2DailyCandle[]; timeZone: string }) {
+  const width = 210;
+  const height = 60;
+  const dayCount = 30;
+  const todayKey = dateKeyInTimeZone(new Date(), timeZone);
+  const todayNumber = dateKeyToDayNumber(todayKey);
+  const firstDayNumber = todayNumber - (dayCount - 1);
+  const values = candles.flatMap((item) => [item.low, item.high]);
+  const minimum = values.length ? Math.min(...values) : 0;
+  const maximum = values.length ? Math.max(...values) : 0;
+  const range = maximum - minimum;
+  const slot = width / dayCount;
+  const priceY = (value: number) => height - (range === 0 ? 0.5 : (value - minimum) / range) * height;
+
+  return (
+    <div className="sub2-candles" aria-label="最近30天倍率日K线">
+      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-hidden="true">
+        <line className="axis" x1="0" y1={height} x2={width} y2={height} />
+        {candles.map((candle) => {
+          const dayIndex = dateKeyToDayNumber(candle.date) - firstDayNumber;
+          if (dayIndex < 0 || dayIndex >= dayCount) return null;
+          const x = (dayIndex + 0.5) * slot;
+          const openY = priceY(candle.open);
+          const closeY = priceY(candle.close);
+          const highY = priceY(candle.high);
+          const lowY = priceY(candle.low);
+          const candleTrend = candle.close > candle.open ? "up" : candle.close < candle.open ? "down" : "flat";
+          const top = Math.min(openY, closeY);
+          const bodyHeight = Math.max(2, Math.abs(closeY - openY));
+          return (
+            <g className={candleTrend} key={candle.date}>
+              <line x1={x} y1={highY} x2={x} y2={lowY} />
+              <rect x={x - 2.5} y={top} width="5" height={bodyHeight} />
+            </g>
+          );
+        })}
+        {candles.length === 0 && <text x="105" y="34" textAnchor="middle">暂无日线数据</text>}
+      </svg>
+      <div className="sub2-sparkline-axis">
+        <span>{formatDateKey(firstDayNumber)}</span>
+        <span>{formatDateKey(todayNumber)}</span>
+      </div>
+    </div>
+  );
+}
+
+function dateKeyInTimeZone(value: Date, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(value);
+  const part = (type: string) => parts.find((item) => item.type === type)?.value ?? "00";
+  return `${part("year")}-${part("month")}-${part("day")}`;
+}
+
+function dateKeyToDayNumber(value: string): number {
+  const [year, month, day] = value.split("-").map(Number);
+  return Math.floor(Date.UTC(year, month - 1, day) / 86400000);
+}
+
+function formatDateKey(dayNumber: number): string {
+  const value = new Date(dayNumber * 86400000);
+  return `${String(value.getUTCMonth() + 1).padStart(2, "0")}-${String(value.getUTCDate()).padStart(2, "0")}`;
 }
 
 function downsamplePoints<T>(points: T[], limit: number): T[] {

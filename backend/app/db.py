@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Generator
 from pathlib import Path
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from backend.app.models import Base, BotAdmin
@@ -38,9 +38,35 @@ def init_db(app_settings: Settings | None = None) -> None:
     current_settings = app_settings or settings
     _ensure_sqlite_parent(current_settings.database_url)
     Base.metadata.create_all(engine)
+    _ensure_schema_compatibility()
     with SessionLocal() as session:
         seed_defaults(session, current_settings)
 
+
+
+
+def _ensure_schema_compatibility() -> None:
+    """Apply tiny SQLite migrations for users upgrading without Alembic."""
+    if engine.dialect.name != "sqlite":
+        return
+    inspector = inspect(engine)
+    with engine.begin() as connection:
+        if "bot_command_settings" in inspector.get_table_names():
+            columns = {column["name"] for column in inspector.get_columns("bot_command_settings")}
+            if "aliases" not in columns:
+                connection.execute(text("ALTER TABLE bot_command_settings ADD COLUMN aliases JSON"))
+        if "sub2_configs" in inspector.get_table_names():
+            columns = {column["name"] for column in inspector.get_columns("sub2_configs")}
+            additions = {
+                "upstream_type": "VARCHAR(24) NOT NULL DEFAULT 'sub2api'",
+                "credential_mode": "VARCHAR(24) NOT NULL DEFAULT 'password'",
+                "newapi_user_id": "VARCHAR(64)",
+                "session_cookie_encrypted": "TEXT",
+                "login_extra_params_encrypted": "TEXT",
+            }
+            for name, definition in additions.items():
+                if name not in columns:
+                    connection.execute(text(f"ALTER TABLE sub2_configs ADD COLUMN {name} {definition}"))
 
 def seed_defaults(session: Session, app_settings: Settings | None = None) -> None:
     current_settings = app_settings or settings
@@ -56,4 +82,3 @@ def seed_defaults(session: Session, app_settings: Settings | None = None) -> Non
 def get_session() -> Generator[Session, None, None]:
     with SessionLocal() as session:
         yield session
-

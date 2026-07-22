@@ -25,7 +25,13 @@ class TimeoutReceiver:
 
 @pytest.mark.asyncio
 async def test_onebot_client_uses_connected_websocket_for_send():
-    client = OneBotClient(Settings(onebot_ws_url="ws://127.0.0.1:3001", onebot_api_base_url=""))
+    client = OneBotClient(
+        Settings(
+            onebot_ws_url="ws://127.0.0.1:3001",
+            onebot_api_base_url="",
+            onebot_action_timeout_seconds=1.25,
+        )
+    )
     receiver = FakeReceiver()
     client.websocket_receiver = receiver
 
@@ -34,6 +40,7 @@ async def test_onebot_client_uses_connected_websocket_for_send():
     assert result.ok is True
     assert receiver.action == "send_group_msg"
     assert receiver.params == {"group_id": 123456, "message": "hi"}
+    assert receiver.timeout_seconds == 1.25
 
 
 @pytest.mark.asyncio
@@ -54,7 +61,9 @@ async def test_onebot_client_does_not_fallback_to_http_sender():
 
 @pytest.mark.asyncio
 async def test_onebot_client_treats_websocket_action_timeout_as_soft_success():
-    client = OneBotClient(Settings(onebot_ws_url="ws://127.0.0.1:3001", request_timeout_seconds=20))
+    client = OneBotClient(
+        Settings(onebot_ws_url="ws://127.0.0.1:3001", onebot_action_timeout_seconds=1.5)
+    )
     client.websocket_receiver = TimeoutReceiver()
 
     result = await client.send_group_msg("123456", "hi")
@@ -63,6 +72,6 @@ async def test_onebot_client_treats_websocket_action_timeout_as_soft_success():
     assert result.error is None
     assert result.payload == {
         "ack_timeout": True,
-        "timeout_seconds": 20,
+        "timeout_seconds": 1.5,
         "message": "OneBot WebSocket action sent, but echo response timed out.",
     }

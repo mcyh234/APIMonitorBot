@@ -14,6 +14,7 @@ class CheckResult:
     error: str | None = None
     latency_ms: int | None = None
     response_preview: str | None = None
+    model_switched: bool = False
 
 
 @dataclass(slots=True)
@@ -93,7 +94,6 @@ class ApiProbe:
             "model": model_name,
             "messages": [{"role": "user", "content": "hi"}],
             "temperature": 0,
-            "max_tokens": 16,
         }
         headers = {
             "Authorization": f"Bearer {api_key}",

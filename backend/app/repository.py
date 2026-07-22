@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from html import unescape as html_unescape
+from unicodedata import normalize as unicode_normalize
 
 from sqlalchemy import case, delete, func, select
 from sqlalchemy.orm import Session
@@ -22,7 +24,13 @@ def parse_target(value: str) -> TargetTuple:
 
 
 def parse_targets(value: str) -> list[TargetTuple]:
-    clean = value.strip().upper().replace("＆", "&")
+    clean = value.strip()
+    for _ in range(2):
+        unescaped = html_unescape(clean)
+        if unescaped == clean:
+            break
+        clean = unescaped
+    clean = unicode_normalize("NFKC", clean).upper()
     if not clean:
         raise ValueError("目标格式必须是 G群号 或 PQQ号，多个目标用 & 连接。")
     targets: list[TargetTuple] = []

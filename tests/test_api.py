@@ -5,11 +5,12 @@ from fastapi import HTTPException
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-from backend.app.api import config_history, onebot_webhook, update_config
+from backend.app.api import config_history, get_command_settings, get_sub2_sentiment, onebot_webhook, update_command_setting, update_config
 from backend.app.crypto import SecretBox
 from backend.app.models import APIConfig, Base, CheckRecord
-from backend.app.schemas import APIConfigUpdate
+from backend.app.schemas import APIConfigUpdate, CommandSettingUpdate
 from backend.app.settings import Settings
+from backend.app.sub2_sentiment import record_sentiment_vote
 
 
 def make_session():
@@ -123,3 +124,31 @@ async def test_onebot_http_webhook_is_ignored():
     result = await onebot_webhook(FakeRequest())
 
     assert result["status"] == "ignored"
+
+
+def test_command_setting_aliases_roundtrip():
+    session = make_session()
+
+    updated = update_command_setting(
+        "status",
+        CommandSettingUpdate(aliases=["状态"]),
+        session,
+    )
+
+    assert updated.command == "/status"
+    assert updated.aliases == ["状态"]
+    rows = get_command_settings(session)
+    status_row = next(item for item in rows if item.command == "/status")
+    assert status_row.aliases == ["状态"]
+
+
+def test_sub2_sentiment_api_returns_global_summary():
+    session = make_session()
+    record_sentiment_vote(session, "10001", "up", "group", "123")
+    record_sentiment_vote(session, "10002", "down", "group", "456")
+
+    result = get_sub2_sentiment(session)
+
+    assert result.total_count == 2
+    assert result.up_percent == 50.0
+    assert result.down_percent == 50.0

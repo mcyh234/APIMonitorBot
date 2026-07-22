@@ -45,6 +45,18 @@ class FakeInternetProbe:
         return self.result
 
 
+class ModelFallbackProbe:
+    def __init__(self, failure_code: str = "429"):
+        self.failure_code = failure_code
+        self.calls: list[str] = []
+
+    async def probe(self, base_url: str, api_key: str, model_name: str):
+        self.calls.append(model_name)
+        if model_name == "gpt-5.4":
+            return CheckResult(ok=True, code="200")
+        return CheckResult(ok=False, code=self.failure_code, error="probe failed")
+
+
 class FakeSub2Client:
     def __init__(self, rates: list[Sub2ChannelRateSnapshot]):
         self.rates = rates
@@ -67,14 +79,14 @@ def make_session_factory():
     return sessionmaker(bind=engine, expire_on_commit=False, future=True)
 
 
-def add_config(session, secret_box, name="cfg", target_type="group", target_id="123"):
+def add_config(session, secret_box, name="cfg", target_type="group", target_id="123", model_name="gpt-test"):
     config = APIConfig(
         name=name,
         target_type=target_type,
         target_id=target_id,
         base_url="https://example.com/v1",
         api_key_encrypted=secret_box.encrypt("sk-test"),
-        model_name="gpt-test",
+        model_name=model_name,
         enabled=True,
     )
     session.add(config)
@@ -128,6 +140,26 @@ def test_night_saver_uses_ten_minute_interval_at_night():
     assert scheduled_interval_seconds(settings, shanghai_9am) == 60
 
 
+def test_night_saver_supports_minute_precision_across_midnight():
+    settings = Settings(
+        app_timezone="Asia/Shanghai",
+        night_saver_enabled=True,
+        night_saver_start_hour=23,
+        night_saver_start_minute=30,
+        night_saver_end_hour=7,
+        night_saver_end_minute=15,
+    )
+    before_start = datetime(2026, 7, 1, 15, 29, tzinfo=timezone.utc)
+    at_start = datetime(2026, 7, 1, 15, 30, tzinfo=timezone.utc)
+    before_end = datetime(2026, 7, 1, 23, 14, tzinfo=timezone.utc)
+    at_end = datetime(2026, 7, 1, 23, 15, tzinfo=timezone.utc)
+
+    assert night_saver_active(settings, before_start) is False
+    assert night_saver_active(settings, at_start) is True
+    assert night_saver_active(settings, before_end) is True
+    assert night_saver_active(settings, at_end) is False
+
+
 def test_night_saver_skips_scheduled_runs_until_interval_passes():
     settings = Settings(
         app_timezone="Asia/Shanghai",
@@ -174,6 +206,40 @@ async def test_monitor_outage_followup_and_recovery_notifications():
     assert len(notifier.messages) == 3
     assert "当前服务恢复可用" in notifier.messages[2][1]
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_code", ["429", "EMPTY_ASSISTANT_CONTENT"])
+async def test_scheduled_check_switches_to_fallback_model_without_notification(failure_code):
+    session_factory = make_session_factory()
+    secret_box = SecretBox("test-key")
+    with session_factory() as session:
+        add_config(session, secret_box, name="cfg-fallback", model_name="gpt-5.5")
+
+    notifier = FakeNotifier()
+    probe = ModelFallbackProbe(failure_code)
+    monitor = MonitorService(
+        Settings(
+            check_retry_delay_seconds=0,
+            night_saver_enabled=False,
+            api_probe_fallback_models="gpt-5.4",
+        ),
+        secret_box,
+        notifier,
+        probe=probe,
+    )
+
+    await monitor.run_all_scheduled(session_factory)
+
+    assert probe.calls == ["gpt-5.5", "gpt-5.5", "gpt-5.4"]
+    assert notifier.messages == []
+    with session_factory() as session:
+        config = session.scalar(select(APIConfig).where(APIConfig.name == "cfg-fallback"))
+        assert config.model_name == "gpt-5.4"
+        assert config.status == "ok"
+        record = session.scalar(select(CheckRecord).where(CheckRecord.api_config_id == config.id))
+        assert record is not None
+        assert record.status == "ok"
+        assert record.code == "200"
 
 @pytest.mark.asyncio
 async def test_run_all_scheduled_merges_same_target_outage_notifications():

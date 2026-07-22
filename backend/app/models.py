@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from backend.app.time_utils import utc_now
@@ -79,11 +79,17 @@ class Sub2Config(TimestampMixin, Base):
     target_type: Mapped[str] = mapped_column(String(16), index=True)
     target_id: Mapped[str] = mapped_column(String(512), index=True)
     base_url: Mapped[str] = mapped_column(String(512))
+    # The table name is kept for compatibility with existing Sub2API installations.
+    upstream_type: Mapped[str] = mapped_column(String(24), default="sub2api", index=True)
+    credential_mode: Mapped[str] = mapped_column(String(24), default="password")
     email: Mapped[str] = mapped_column(String(255))
     password_encrypted: Mapped[str] = mapped_column(Text)
     access_token_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     refresh_token_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    newapi_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    session_cookie_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    login_extra_params_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -137,6 +143,20 @@ class Sub2RateHistory(Base):
     sub2_config: Mapped[Sub2Config] = relationship(back_populates="rate_history")
 
 
+class Sub2SentimentVote(TimestampMixin, Base):
+    __tablename__ = "sub2_sentiment_votes"
+    __table_args__ = (
+        UniqueConstraint("user_id", "vote_date", name="uq_sub2_sentiment_user_day"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    vote_date: Mapped[date] = mapped_column(Date, index=True)
+    direction: Mapped[str] = mapped_column(String(8), index=True)
+    source_type: Mapped[str] = mapped_column(String(16))
+    source_id: Mapped[str] = mapped_column(String(64))
+
+
 class BotAdmin(TimestampMixin, Base):
     __tablename__ = "bot_admins"
 
@@ -159,6 +179,7 @@ class BotCommandSetting(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     command: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    aliases: Mapped[list[str]] = mapped_column(JSON, default=list)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
 

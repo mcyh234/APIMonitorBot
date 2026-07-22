@@ -111,20 +111,46 @@ class OneBotSettingsUpdate(BaseModel):
     ws_token_in_query: bool = True
 
 
+class MonitoringSettingsOut(BaseModel):
+    night_saver_enabled: bool
+    night_saver_start_time: str
+    night_saver_end_time: str
+    night_saver_interval_minutes: int
+    command_cooldown_minutes: int
+
+
+class MonitoringSettingsUpdate(BaseModel):
+    night_saver_enabled: bool
+    night_saver_start_time: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    night_saver_end_time: str = Field(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    night_saver_interval_minutes: int = Field(ge=1, le=1440)
+    command_cooldown_minutes: int = Field(ge=0, le=1440)
+
+
 class CommandSettingOut(BaseModel):
     command: str
     label: str
     description: str
     enabled: bool
+    aliases: list[str] = Field(default_factory=list)
 
 
 class CommandSettingUpdate(BaseModel):
-    enabled: bool
+    enabled: bool | None = None
+    aliases: list[str] | None = Field(default=None, max_length=16)
 
 
 class Sub2RateHistoryPointOut(BaseModel):
     recorded_at: datetime
     rate_multiplier: float
+
+
+class Sub2DailyCandleOut(BaseModel):
+    date: str
+    open: float
+    high: float
+    low: float
+    close: float
 
 
 class Sub2RateOut(BaseModel):
@@ -136,6 +162,16 @@ class Sub2RateOut(BaseModel):
     change_percent: float | None
     last_seen_at: datetime
     history: list[Sub2RateHistoryPointOut]
+    candles: list[Sub2DailyCandleOut]
+
+
+class Sub2SentimentOut(BaseModel):
+    date: str
+    up_count: int
+    down_count: int
+    total_count: int
+    up_percent: float
+    down_percent: float
 
 
 class Sub2PriceBoardOut(BaseModel):
@@ -145,10 +181,40 @@ class Sub2PriceBoardOut(BaseModel):
     target_id: str
     target: str
     base_url: str
+    upstream_type: str
+    credential_configured: bool
     enabled: bool
     last_checked_at: datetime | None
     last_error: str | None
     rates: list[Sub2RateOut]
+    best_groups: list["BestGroupOut"] = Field(default_factory=list)
+
+
+class BestGroupOut(BaseModel):
+    category: str
+    label: str
+    group_name: str
+    platform: str
+    rate_multiplier: float
+
+
+class UpstreamImportIn(BaseModel):
+    urls: str = Field(min_length=1, max_length=20000)
+    target: str = Field(pattern=r"^[GPgp]\d+([&\uff06][GPgp]\d+)*$", max_length=512)
+    upstream_type: str = Field(default="auto", pattern=r"^(auto|sub2api|newapi)$")
+
+
+class UpstreamImportOut(BaseModel):
+    created: list[str]
+    skipped: list[str]
+
+
+class UpstreamLoginIn(BaseModel):
+    username: str | None = Field(default=None, max_length=255)
+    password: str | None = Field(default=None, max_length=1024)
+    access_token: str | None = Field(default=None, max_length=4096)
+    user_id: str | None = Field(default=None, max_length=64)
+    upstream_type: str = Field(default="auto", pattern=r"^(auto|sub2api|newapi)$")
 
 
 class ReceivedMessageOut(BaseModel):
@@ -202,3 +268,28 @@ class AppStatusOut(BaseModel):
     onebot_ws_configured: bool
     onebot_ws_connected: bool
     onebot_ws_last_error: str | None
+
+
+class UpgradeStatusOut(BaseModel):
+    current_version: str
+    process_id: int
+    last_installed_version: str | None = None
+    last_installed_at: str | None = None
+    last_backup_path: str | None = None
+
+
+class UpgradePackageInfoOut(BaseModel):
+    version: str
+    created_at: str
+    file_count: int
+    total_size: int
+
+
+class UpgradeInstallOut(BaseModel):
+    version: str
+    previous_version: str
+    installed_at: str
+    updated_files: int
+    backup_path: str
+    dependencies_installed: bool
+    restarting: bool

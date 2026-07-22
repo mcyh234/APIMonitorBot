@@ -42,7 +42,7 @@ APIMonitorBot 是本机运行的 API 可用性监控服务：
 - 默认管理员 QQ：`2087900785`。
 - WebUI 支持维护多个管理员。
 - 管理员不受命令冷却限制，可以随便调用命令。
-- 普通用户调用 `/check`、`/status`、`/stat`、`/price` 有 5 分钟冷却。
+- 普通用户调用 `/check`、`/status`、`/stat`、`/price`、`/radar`、`/tibo` 有 5 分钟冷却。
 - 群聊普通用户只能操作或查看绑定本群通知对象的配置；配置支持多个通知对象，例如 `G123456789&P1122334455`。
 - 私聊命令默认只允许管理员，除非后续明确开放。
 
@@ -53,11 +53,14 @@ APIMonitorBot 是本机运行的 API 可用性监控服务：
 - `/addapi`：管理员专用，多轮对话添加 API。
 - `/list`：管理员专用，列出所有配置。
 - `/remove <apiname>`：管理员专用，删除配置。
-- `/check <apiname>`：立即检查一次配置。
+- `/check [apiname]`：立即检查配置；不带参数时检查当前通知对象绑定的所有 API，命中多条时用图片渲染结果，避免发送过长文本。
 - `/status [apiname]`：生成 API 状态条 PNG 并发送。
 - `/stat`：抓取 `https://status.gptstore.club/` 全页快照，切到 1 小时视图后发送。
 - `/addsub2`：管理员专用，多轮对话添加 Sub2API 渠道倍率监控。
 - `/price`：发送当前通知对象绑定的 Sub2API 价格表图片。
+- `/up`、`up`：对全 Bot 整体 Token 倍率投看涨票；`/down`、`down`：投看跌票。每个 QQ 每个上海自然日一票，可在当天改票。
+- `/radar`：读取 Codex Radar 公开摘要并发送模型 IQ 降智趋势图。
+- `/tibo`：读取 Tibo 最新公开 X 帖子和 `tibo_presence`，发送带中文翻译的白底雷达图。
 - `/cancel`：取消多轮对话。
 
 除 `/cancel` 外，上述命令都必须支持 WebUI 命令开关；关闭后命令返回“该命令已关闭。”。
@@ -93,6 +96,7 @@ POST {BaseURL}/chat/completions
 ```
 
 - 请求体使用 `hi` 用户消息。
+- 探测请求体不要携带 `max_tokens`、`max_output_tokens` 等输出长度限制参数，避免 OpenAI 兼容网关返回 `Unsupported parameter`。
 - 判定可用必须满足 HTTP 2xx、响应 JSON 可解析、存在 assistant 内容。
 - `verify_ssl` 必须保持 `false`，用于兼容上游证书链不完整。
 - 401、403、429、5xx、404、JSON 异常、空 assistant 内容都视为不可用。
@@ -104,7 +108,9 @@ POST {BaseURL}/chat/completions
 
 - 默认每 1 分钟巡检所有启用配置。
 - 夜间省流默认启用：00:00 到 08:00 改为每 10 分钟实际探测一次。
+- WebUI 的“巡检与冷却”面板允许按分钟修改夜间省流时间范围、夜间巡检间隔和普通用户命令冷却时间；配置保存到 SQLite 并覆盖 `.env` 默认值，保存后立即生效。命令冷却设为 0 表示关闭普通用户冷却。
 - 首次失败后立即二次确认；二次仍失败才进入不可用状态。
+- 如果二次确认结果是 `400`、`404`、`429` 或 `EMPTY_ASSISTANT_CONTENT`，先尝试模型自动回退：优先把当前模型名中的 `5.5` 替换为 `5.4`，再按 `API_PROBE_FALLBACK_MODELS` 候选列表探测；如果回退模型探测成功，立即把该配置的模型名保存为成功模型，本轮记录为可用且不发送通报。
 - 首次确认不可用，立即发送“当前出现业务中断”。
 - 10 分钟内不重复发送不可用通知。
 - 10 次巡检后仍未恢复，发送“10分钟仍未恢复业务”，之后保持静默。
@@ -142,8 +148,10 @@ WebUI 和 `/status` 都要使用一致的状态聚合逻辑。
 
 - 登录接口：`POST {BaseURL}/api/v1/auth/login`，请求体为 `{"email":"...","password":"..."}`。
 - 渠道接口：`GET {BaseURL}/api/v1/groups/available`，使用 `Authorization: Bearer <access_token>`。
+- `/price` 定价接口：`GET {BaseURL}/api/v1/channels/available`，从嵌套的 `groups[]` 读取 `rate_multiplier`，从 `supported_models[].pricing` 读取每 Token 的 `input_price`、`output_price`、`cache_write_price`、`cache_read_price`。
+- Sub2API 按 `1 CNY = 1 USD` 计价单位换算，不使用外汇汇率；每 MTok 人民币价公式为 `每 Token 单价 × 1,000,000 × rate_multiplier`。
 - 需要记录返回 `data[]` 中每个分组的 `platform`、`name` 和 `rate_multiplier`。
-- 首次看到分组和后续每次倍率变化都要追加倍率历史记录，用于 WebUI 和 `/price` 折线图。
+- 首次看到分组、每天首次成功巡检和后续每次倍率变化都要追加倍率历史记录，用于 WebUI 和 `/price` 折线图及最近 30 天日 K。
 - token 和密码都要加密存储；token 未过期时复用，失效后重新登录。
 - 每分钟检测一次启用的 Sub2API 配置，不受 API 夜间省流跳过影响。
 - 首次添加只保存当前倍率，不通知。
@@ -154,6 +162,9 @@ WebUI 和 `/status` 都要使用一致的状态聚合逻辑。
   - 发生价格变动的分组高亮。
   - 顶部列出 `旧倍率 -> 新倍率`；分组删除时显示“已删除”和最后倍率。
   - 每个分组展示当前倍率大字、涨跌百分比和按日期为 x 轴的历史折线。
+  - 同时展示按 `Asia/Shanghai` 自然日聚合的倍率开、高、低、收 K 线；缺失日期留空，不推测数据。
+  - 图片顶部显示全 Bot 当日看涨/看跌比例，红色看涨、绿色看跌、零票灰色。
+  - `/price` 的模型价格只能来自 `/api/v1/channels/available`，不得使用内置静态模型价目表。
   - 上涨使用红色，下跌使用绿色。
   - `/price` 图片必须完整展开，不使用 WebUI 的收起状态。
 - `/price` 检索当前通知对象存在的价格表：
@@ -181,9 +192,12 @@ WebUI 是运维后台，不是营销页。
   - 最近发送失败原因。
   - API 名称、模型名称编辑按钮。
   - 状态条图。
-  - Sub2API 渠道倍率面板，默认收起，点击展开；展开后展示当前倍率、涨跌百分比和历史折线。
-  - 命令开关，位于 Sub2API 渠道倍率面板下方，允许开启或关闭 `/addapi`、`/addsub2`、`/list`、`/remove`、`/check`、`/status`、`/stat`、`/price`。
+  - Sub2API 渠道倍率面板，默认收起，点击展开；展开后展示当前倍率、涨跌百分比、历史折线、30 日日 K 和全局投票比例。
+  - 命令开关，位于 Sub2API 渠道倍率面板下方，允许开启或关闭 `/addapi`、`/addsub2`、`/list`、`/remove`、`/check`、`/status`、`/stat`、`/price`、`/up`、`/down`、`/radar`、`/tibo`。
   - 管理员管理。
+  - 版本升级面板，支持拖拽上传受信任的升级包、安装并自动重启，以及生成升级包。
+  - 默认收起的“巡检与冷却”面板，支持修改夜间省流范围、夜间巡检间隔和普通用户命令冷却时间。
+  - 右上角提供 `https://github.com/mcyh234/APIMonitorBot` 的 GitHub 图标入口；添加 API、管理员和版本升级面板默认收起，并持久化用户后续的折叠状态。
 
 ## 数据和安全
 
@@ -191,6 +205,7 @@ WebUI 是运维后台，不是营销页。
 - `SECRET_MASTER_KEY` 只存在 `.env`，不可提交。
 - `.env`、`data/`、`.venv/`、`frontend/node_modules/`、`frontend/dist/`、`release/` 必须忽略。
 - 打包 GitHub zip 前必须检查压缩包不包含 `.env`、数据库、缓存和构建产物。
+- 升级包必须包含版本清单和 SHA-256，安装时限制到项目白名单路径，并在 `data/upgrades/backups/` 备份被覆盖文件；不得覆盖 `.env` 和 `data/`。
 
 ## 工程约束
 

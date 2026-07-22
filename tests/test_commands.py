@@ -6,6 +6,8 @@ from sqlalchemy.orm import sessionmaker
 
 from backend.app.availability import CheckResult
 from backend.app.api import list_sub2_prices
+from backend.app.codex_radar import parse_codex_radar_payload
+from backend.app.command_settings import set_command_aliases
 from backend.app.commands import CommandRouter, IncomingMessage
 from backend.app.crypto import SecretBox
 from backend.app.models import (
@@ -20,12 +22,18 @@ from backend.app.models import (
 )
 from backend.app.onebot import OneBotClient, OneBotSendResult
 from backend.app.settings import Settings
-from backend.app.sub2api import Sub2AuthTokens, Sub2ChannelRateSnapshot
+from backend.app.model_pricing import ModelTokenPrice
+from backend.app.sub2api import Sub2AuthTokens, Sub2AvailableCatalog, Sub2ChannelRateSnapshot
 from backend.app.time_utils import utc_now
+from backend.app.tibo_radar import TiboPost, TiboPresence, TiboRadarReport
 
 
 class FakeProbe:
+    def __init__(self):
+        self.calls: list[tuple[str, str, str]] = []
+
     async def probe(self, base_url: str, api_key: str, model_name: str):
+        self.calls.append((base_url, api_key, model_name))
         return CheckResult(ok=True, code="200", latency_ms=12, response_preview="hi")
 
 
@@ -36,6 +44,70 @@ class FakeSnapshotter:
     async def capture(self) -> bytes:
         self.calls += 1
         return b"fake-png"
+
+
+class FakeRadarClient:
+    def __init__(self):
+        self.calls = 0
+
+    async def fetch(self):
+        self.calls += 1
+        point = {
+            "date": "2026-07-13-pm",
+            "score": 105,
+            "passed": 7,
+            "tasks": 10,
+            "cost_usd": 18.94,
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "max",
+        }
+        return parse_codex_radar_payload(
+            {
+                "monitored_at": "2026-07-13T22:08:07+08:00",
+                "timezone": "Asia/Shanghai",
+                "model_iq": {"latest": point, "recent_days": [point], "comparisons": {}},
+            },
+            source_url="https://codexradar.com/current.json",
+        )
+
+
+class FakeTiboClient:
+    def __init__(self):
+        self.calls = 0
+
+    async def fetch(self):
+        self.calls += 1
+        now = utc_now()
+        return TiboRadarReport(
+            monitored_at=now,
+            timezone="Asia/Shanghai",
+            presence=TiboPresence(
+                location_zh="旧金山湾区 / PT",
+                location_en="San Francisco Bay Area / PT",
+                probability=0.3,
+                confidence="low",
+                evidence_zh="公开帖子与 PT 时区大致相符。",
+                evidence_en="Public posts align with PT.",
+                safety_note_zh="仅展示公开粗粒度信息。",
+                observations=40,
+                observed_at=now,
+                updated_at=now,
+            ),
+            post=TiboPost(
+                source_url="https://x.com/thsottiaux/status/123",
+                author_name="Tibo",
+                username="thsottiaux",
+                text="Morning. Three updates.",
+                translated_zh="早上好。三项更新。",
+                translation_label="中文翻译 · 机器翻译",
+                created_at=now,
+                replies=1,
+                reposts=2,
+                likes=3,
+                views=4,
+                avatar=None,
+            ),
+        )
 
 
 class FakeSub2Client:
@@ -58,6 +130,22 @@ class FakeSub2Client:
     async def fetch_rates_with_cached_token(self, session, config, secret_box):
         self.fetch_calls += 1
         return list(self.rates)
+
+    async def fetch_available_catalog_with_cached_token(self, session, config, secret_box):
+        self.fetch_calls += 1
+        return Sub2AvailableCatalog(
+            rates=tuple(self.rates),
+            model_prices=(
+                ModelTokenPrice(
+                    model_name="gpt-5.6-sol",
+                    platform="openai",
+                    input_price=0.0000025,
+                    output_price=0.000015,
+                    cache_write_price=0,
+                    cache_read_price=0.00000025,
+                ),
+            ),
+        )
 
 
 class FakeOneBot(OneBotClient):
@@ -171,7 +259,7 @@ async def test_addapi_conversation_creates_config():
 
     steps = [
         ("cfg-one", "请输入报告群号/私聊QQ号"),
-        ("G123456", "请输入BaseURL"),
+        ("G1112222333&amp;G1122334455", "请输入BaseURL"),
         ("https://example.com/v1", "请输入APIKey"),
         ("sk-test", "请输入监听模型名称"),
         ("gpt-test", "添加成功"),
@@ -183,8 +271,8 @@ async def test_addapi_conversation_creates_config():
 
     config = session.scalar(select(APIConfig).where(APIConfig.name == "cfg-one"))
     assert config is not None
-    assert config.target_type == "group"
-    assert config.target_id == "123456"
+    assert config.target_type == "multi"
+    assert config.target_id == "G1112222333&G1122334455"
 
 
 @pytest.mark.asyncio
@@ -245,6 +333,25 @@ async def test_handle_event_logs_triggered_message():
 
 
 @pytest.mark.asyncio
+async def test_handle_event_logs_alias_as_command():
+    session = make_session()
+    set_command_aliases(session, "/list", ["列表"])
+    router = CommandRouter(Settings(), FakeOneBot(), SecretBox("test-key"), probe=FakeProbe())
+    await router.handle_event(
+        session,
+        {
+            "post_type": "message",
+            "message_type": "private",
+            "user_id": 2087900785,
+            "raw_message": "列表",
+        },
+    )
+    row = session.scalar(select(ReceivedMessage).where(ReceivedMessage.user_id == "2087900785"))
+    assert row is not None
+    assert row.triggered is True
+    assert row.trigger_type == "command:/list"
+
+@pytest.mark.asyncio
 async def test_handle_event_records_send_failure_reason():
     session = make_session()
     onebot = FakeOneBot(ok=False, error="HTTP 403", status_code=403)
@@ -302,6 +409,98 @@ async def test_group_commands_match_multi_target_configs():
     assert onebot.sent == [("group", "123456", "[image:status.png]")]
 
 @pytest.mark.asyncio
+async def test_check_without_args_checks_all_group_bound_configs():
+    session = make_session()
+    secret_box = SecretBox("test-key")
+    session.add_all(
+        [
+            APIConfig(
+                name="cfg-a",
+                target_type="group",
+                target_id="123456",
+                base_url="https://example.com/a/v1",
+                api_key_encrypted=secret_box.encrypt("sk-test"),
+                model_name="gpt-test",
+                enabled=True,
+            ),
+            APIConfig(
+                name="cfg-b",
+                target_type="multi",
+                target_id="G123456&P2087900785",
+                base_url="https://example.com/b/v1",
+                api_key_encrypted=secret_box.encrypt("sk-test"),
+                model_name="gpt-test",
+                enabled=True,
+            ),
+            APIConfig(
+                name="cfg-other",
+                target_type="group",
+                target_id="999999",
+                base_url="https://example.com/other/v1",
+                api_key_encrypted=secret_box.encrypt("sk-test"),
+                model_name="gpt-test",
+                enabled=True,
+            ),
+        ]
+    )
+    session.commit()
+    onebot = FakeOneBot()
+    probe = FakeProbe()
+    router = CommandRouter(Settings(), onebot, secret_box, probe=probe)
+
+    reply = await router.handle_message(
+        session,
+        IncomingMessage(user_id="2087900785", message="/check", message_type="group", group_id="123456"),
+    )
+
+    assert reply == ""
+    assert onebot.sent == [("group", "123456", "[image:api-check.png]")]
+    assert [call[0] for call in probe.calls] == [
+        "https://example.com/a/v1",
+        "https://example.com/b/v1",
+    ]
+    send_row = session.scalar(select(SendRecord).where(SendRecord.message_preview == "[image:api-check.png]"))
+    assert send_row is not None
+
+
+@pytest.mark.asyncio
+async def test_check_without_args_uses_image_even_for_one_group_config():
+    session = make_session()
+    secret_box = SecretBox("test-key")
+    session.add(
+        APIConfig(
+            name="cfg-one",
+            target_type="group",
+            target_id="123456",
+            base_url="https://example.com/v1",
+            api_key_encrypted=secret_box.encrypt("sk-test"),
+            model_name="gpt-test",
+            enabled=True,
+        )
+    )
+    session.commit()
+    onebot = FakeOneBot()
+    router = CommandRouter(Settings(), onebot, secret_box, probe=FakeProbe())
+
+    reply = await router.handle_message(
+        session,
+        IncomingMessage(user_id="10001", message="/check", message_type="group", group_id="123456"),
+    )
+
+    assert reply == ""
+    assert onebot.sent == [("group", "123456", "[image:api-check.png]")]
+
+    text_reply = await router.handle_message(
+        session,
+        IncomingMessage(user_id="2087900785", message="/check cfg-one", message_type="group", group_id="123456"),
+    )
+
+    assert text_reply is not None
+    assert "\u3010cfg-one\u3011" in text_reply
+    assert "\u5f53\u524d\u670d\u52a1\u53ef\u7528: 200" in text_reply
+
+
+@pytest.mark.asyncio
 async def test_status_command_sends_group_status_image_and_uses_cooldown():
 
     session = make_session()
@@ -334,6 +533,34 @@ async def test_status_command_sends_group_status_image_and_uses_cooldown():
     assert "操作太频繁" in (reply or "")
     assert onebot.sent == [("group", "123456", "[image:status.png]")]
 
+
+@pytest.mark.asyncio
+async def test_status_command_alias_sends_group_status_image():
+    session = make_session()
+    secret_box = SecretBox("test-key")
+    session.add(
+        APIConfig(
+            name="cfg-one",
+            target_type="group",
+            target_id="123456",
+            base_url="https://example.com/v1",
+            api_key_encrypted=secret_box.encrypt("sk-test"),
+            model_name="gpt-test",
+            enabled=True,
+        )
+    )
+    session.commit()
+    set_command_aliases(session, "/status", ["状态"])
+    onebot = FakeOneBot()
+    router = CommandRouter(Settings(), onebot, secret_box, probe=FakeProbe())
+
+    reply = await router.handle_message(
+        session,
+        IncomingMessage(user_id="10001", message="状态", message_type="group", group_id="123456"),
+    )
+
+    assert reply == ""
+    assert onebot.sent == [("group", "123456", "[image:status.png]")]
 
 @pytest.mark.asyncio
 async def test_status_command_records_image_failure_without_followup_reply():
@@ -427,6 +654,66 @@ async def test_stat_command_sends_web_snapshot_to_notification_group_and_uses_co
 
 
 @pytest.mark.asyncio
+async def test_radar_command_sends_image_and_uses_cooldown():
+    session = make_session()
+    secret_box = SecretBox("test-key")
+    session.add(
+        APIConfig(
+            name="cfg-one",
+            target_type="group",
+            target_id="123456",
+            base_url="https://example.com/v1",
+            api_key_encrypted=secret_box.encrypt("sk-test"),
+            model_name="gpt-test",
+            enabled=True,
+        )
+    )
+    session.commit()
+    onebot = FakeOneBot()
+    radar = FakeRadarClient()
+    router = CommandRouter(Settings(), onebot, secret_box, probe=FakeProbe(), radar_client=radar)
+    incoming = IncomingMessage(user_id="10001", message="/radar", message_type="group", group_id="123456")
+
+    assert await router.handle_message(session, incoming) == ""
+    assert onebot.sent == [("group", "123456", "[image:codex-radar.png]")]
+    assert radar.calls == 1
+
+    reply = await router.handle_message(session, incoming)
+    assert "操作太频繁" in (reply or "")
+    assert radar.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_tibo_command_sends_image_and_uses_cooldown():
+    session = make_session()
+    secret_box = SecretBox("test-key")
+    session.add(
+        APIConfig(
+            name="cfg-one",
+            target_type="group",
+            target_id="123456",
+            base_url="https://example.com/v1",
+            api_key_encrypted=secret_box.encrypt("sk-test"),
+            model_name="gpt-test",
+            enabled=True,
+        )
+    )
+    session.commit()
+    onebot = FakeOneBot()
+    tibo = FakeTiboClient()
+    router = CommandRouter(Settings(), onebot, secret_box, probe=FakeProbe(), tibo_client=tibo)
+    incoming = IncomingMessage(user_id="10001", message="/tibo", message_type="group", group_id="123456")
+
+    assert await router.handle_message(session, incoming) == ""
+    assert onebot.sent == [("group", "123456", "[image:tibo-radar.png]")]
+    assert tibo.calls == 1
+
+    reply = await router.handle_message(session, incoming)
+    assert "操作太频繁" in (reply or "")
+    assert tibo.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_price_command_sends_sub2_price_image_and_uses_cooldown():
     session = make_session()
     secret_box = SecretBox("test-key")
@@ -444,6 +731,56 @@ async def test_price_command_sends_sub2_price_image_and_uses_cooldown():
 
     assert "操作太频繁" in (reply or "")
     assert onebot.sent == [("group", "123456", "[image:sub2-price.png]")]
+
+
+@pytest.mark.asyncio
+async def test_up_down_commands_vote_globally_and_bare_alias_works():
+    session = make_session()
+    secret_box = SecretBox("test-key")
+    add_sub2_config(session, secret_box)
+    router = CommandRouter(Settings(), FakeOneBot(), secret_box, probe=FakeProbe())
+
+    first = await router.handle_message(
+        session,
+        IncomingMessage(user_id="10001", message="up", message_type="group", group_id="123456"),
+    )
+    changed = await router.handle_message(
+        session,
+        IncomingMessage(user_id="10001", message="/down", message_type="group", group_id="123456"),
+    )
+    second_user = await router.handle_message(
+        session,
+        IncomingMessage(user_id="10002", message="/up", message_type="group", group_id="123456"),
+    )
+
+    assert "已记录今日看涨" in (first or "")
+    assert "改为看跌" in (changed or "")
+    assert "看涨 50.0% · 看跌 50.0% · 共 2 票" in (second_user or "")
+
+
+@pytest.mark.asyncio
+async def test_sentiment_vote_requires_bound_group_but_allows_admin_private():
+    session = make_session()
+    secret_box = SecretBox("test-key")
+    add_sub2_config(session, secret_box)
+    router = CommandRouter(Settings(), FakeOneBot(), secret_box, probe=FakeProbe())
+
+    denied = await router.handle_message(
+        session,
+        IncomingMessage(user_id="10001", message="up", message_type="group", group_id="999999"),
+    )
+    private_denied = await router.handle_message(
+        session,
+        IncomingMessage(user_id="10001", message="down", message_type="private"),
+    )
+    admin = await router.handle_message(
+        session,
+        IncomingMessage(user_id="2087900785", message="down", message_type="private"),
+    )
+
+    assert "不是 Sub2API 通知对象" in (denied or "")
+    assert "私聊投票仅限管理员" in (private_denied or "")
+    assert "已记录今日看跌" in (admin or "")
 
 
 def test_sub2_prices_api_returns_current_rates_and_history():

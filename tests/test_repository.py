@@ -27,6 +27,17 @@ def test_parse_targets_supports_multiple_targets_and_deduplicates():
     assert target_contains("multi", "G123&P456", "group", "999") is False
 
 
+def test_parse_targets_supports_onebot_escaped_ampersand():
+    assert parse_targets("G1112222333&amp;G1122334455") == [
+        ("group", "1112222333"),
+        ("group", "1122334455"),
+    ]
+    assert storage_target("G1112222333&#38;G1122334455") == (
+        "multi",
+        "G1112222333&G1122334455",
+    )
+
+
 def test_parse_target_rejects_multiple_targets_when_single_required():
     try:
         parse_target("G123&P456")
@@ -42,4 +53,3 @@ def test_rate_limit_consumes_then_blocks():
     allowed, remaining = consume_rate_limit(session, "10001", "check", 300)
     assert allowed is False
     assert remaining > 0
-
