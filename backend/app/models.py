@@ -32,6 +32,8 @@ class APIConfig(TimestampMixin, Base):
     base_url: Mapped[str] = mapped_column(String(512))
     api_key_encrypted: Mapped[str] = mapped_column(Text)
     model_name: Mapped[str] = mapped_column(String(160))
+    protocol: Mapped[str] = mapped_column(String(16), default="auto")
+    verify_tls: Mapped[bool] = mapped_column(Boolean, default=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
 
     status: Mapped[str] = mapped_column(String(24), default="unknown", index=True)
@@ -67,8 +69,50 @@ class CheckRecord(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     scheduled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    model_switched: Mapped[bool] = mapped_column(Boolean, default=False)
 
     api_config: Mapped[APIConfig] = relationship(back_populates="records")
+
+
+class ProbeObservation(Base):
+    __tablename__ = "probe_observations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    api_config_id: Mapped[int] = mapped_column(ForeignKey("api_configs.id", ondelete="CASCADE"), index=True)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    code: Mapped[str] = mapped_column(String(64), default="TIMEOUT")
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class IntelMessage(Base):
+    __tablename__ = "intel_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    message_id: Mapped[str] = mapped_column(String(160), unique=True)
+    group_id: Mapped[str] = mapped_column(String(64), index=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    payload_cipher: Mapped[str] = mapped_column(Text)
+
+
+class IntelFinding(Base):
+    __tablename__ = "intel_findings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    group_id: Mapped[str] = mapped_column(String(64), index=True)
+    message_id: Mapped[str] = mapped_column(String(160))
+    dedupe_key: Mapped[str] = mapped_column(String(64), index=True)
+    score: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(32), default="held")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    payload_cipher: Mapped[str] = mapped_column(Text)
+
+
+class PublicPriceSnapshot(Base):
+    __tablename__ = "public_price_snapshots"
+
+    config_id: Mapped[int] = mapped_column(ForeignKey("sub2_configs.id", ondelete="CASCADE"), primary_key=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    prices: Mapped[list] = mapped_column(JSON, default=list)
 
 
 class Sub2Config(TimestampMixin, Base):

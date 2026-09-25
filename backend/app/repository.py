@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
+from dataclasses import dataclass
+import json
 from html import unescape as html_unescape
 from unicodedata import normalize as unicode_normalize
 
@@ -8,12 +10,21 @@ from sqlalchemy import case, delete, func, select
 from sqlalchemy.orm import Session
 
 from backend.app.crypto import SecretBox
-from backend.app.models import APIConfig, BotAdmin, CheckRecord, CommandRateLimit, ConversationState
+from backend.app.models import APIConfig, BotAdmin, CheckRecord, CommandRateLimit, ConversationState, ProbeObservation
 from backend.app.schemas import APIConfigCreate, APIConfigOut
 from backend.app.time_utils import api_datetime, coerce_aware_utc, local_day_start_utc, utc_now
 
 
 TargetTuple = tuple[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationData:
+    id: int
+    user_id: str
+    step: str
+    payload: dict
+    expires_at: datetime | None
 
 
 def parse_target(value: str) -> TargetTuple:
@@ -83,7 +94,7 @@ def is_admin(session: Session, qq: str) -> bool:
 
 
 def today_availability(session: Session, config_id: int, timezone_name: str) -> float:
-    start = local_day_start_utc(timezone_name)
+    start = utc_now() - timedelta(hours=24)
     rows = session.execute(
         select(
             func.count(CheckRecord.id),
@@ -110,6 +121,8 @@ def config_to_out(session: Session, config: APIConfig, timezone_name: str) -> AP
         base_url=config.base_url,
         model_name=config.model_name,
         enabled=config.enabled,
+        protocol=config.protocol,
+        verify_tls=config.verify_tls,
         status=config.status,
         last_code=config.last_code,
         last_error=config.last_error,
@@ -131,6 +144,8 @@ def create_api_config(session: Session, secret_box: SecretBox, data: APIConfigCr
         api_key_encrypted=secret_box.encrypt(data.api_key.strip()),
         model_name=data.model_name.strip(),
         enabled=data.enabled,
+        protocol=data.protocol,
+        verify_tls=data.verify_tls,
     )
     session.add(config)
     session.commit()
@@ -143,12 +158,31 @@ def clear_conversation(session: Session, user_id: str) -> None:
     session.commit()
 
 
-def get_conversation(session: Session, user_id: str) -> ConversationState | None:
+def delete_api_config(session: Session, name: str) -> int:
+    ids = list(session.scalars(select(APIConfig.id).where(APIConfig.name == name)))
+    if not ids:
+        return 0
+    session.execute(delete(ProbeObservation).where(ProbeObservation.api_config_id.in_(ids)))
+    session.execute(delete(CheckRecord).where(CheckRecord.api_config_id.in_(ids)))
+    deleted = session.execute(delete(APIConfig).where(APIConfig.id.in_(ids))).rowcount
+    session.commit()
+    return deleted
+
+
+def get_conversation(session: Session, user_id: str) -> ConversationData | None:
     state = session.scalar(select(ConversationState).where(ConversationState.user_id == str(user_id)))
     if state and state.expires_at and coerce_aware_utc(state.expires_at) < utc_now():
         clear_conversation(session, user_id)
         return None
-    return state
+    if state is None:
+        return None
+    payload = state.payload or {}
+    if "_cipher" in payload:
+        box = session.info.get("conversation_secret_box")
+        if box is None:
+            return None
+        payload = json.loads(box.decrypt(payload["_cipher"]))
+    return ConversationData(state.id, state.user_id, state.step, payload, state.expires_at)
 
 
 def upsert_conversation(
@@ -158,6 +192,9 @@ def upsert_conversation(
     payload: dict,
     ttl_minutes: int = 15,
 ) -> ConversationState:
+    box = session.info.get("conversation_secret_box")
+    if box is not None:
+        payload = {"_cipher": box.encrypt(json.dumps(payload, ensure_ascii=False))}
     state = session.scalar(select(ConversationState).where(ConversationState.user_id == str(user_id)))
     expires_at = utc_now() + timedelta(minutes=ttl_minutes)
     if state is None:

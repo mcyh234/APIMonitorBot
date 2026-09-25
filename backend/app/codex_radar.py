@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
 import math
-from pathlib import Path
 from statistics import median
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -12,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from PIL import Image, ImageDraw, ImageFont
+from backend.app.material_theme import material_canvas, load_font as _font
 
 
 class CodexRadarError(RuntimeError):
@@ -170,10 +170,9 @@ def _parse_point(raw: dict[str, Any]) -> RadarPoint | None:
     )
 
 
-def render_codex_radar_image(report: CodexRadarReport) -> bytes:
+def render_codex_radar_image(report: CodexRadarReport, *, generated_at: datetime | None = None) -> bytes:
     width, height = 1800, 1120
-    image = Image.new("RGB", (width, height), "#f3f6f9")
-    draw = ImageDraw.Draw(image)
+    image, draw = material_canvas((width, height), generated_at)
     title_font = _font(56, bold=True)
     heading_font = _font(28, bold=True)
     body_font = _font(18)
@@ -254,9 +253,9 @@ def _draw_plot(draw, series, batches, plot, body_font, small_font, body_bold) ->
 
 def _draw_ranking(draw, series, box, heading_font, body_font, body_bold, small_font, score_font) -> None:
     left, top, right, bottom = box
-    draw.rounded_rectangle(box, radius=10, fill="#172229")
+    draw.rounded_rectangle(box, radius=10, fill=draw.theme.container)
     draw.text((left + 30, top + 30), "最新一轮", fill="#9cabb5", font=small_font)
-    draw.text((left + 30, top + 66), "配置排名", fill="#f7f8f9", font=heading_font)
+    draw.text((left + 30, top + 66), "配置排名", fill="#0f172a", font=heading_font)
     rows = sorted(series, key=lambda item: (-item.latest.score, item.label.casefold()))
     row_y = top + 132
     row_height = 57
@@ -397,15 +396,3 @@ def _safe_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
-
-
-def _font(size: int, *, bold: bool = False) -> ImageFont.ImageFont:
-    candidates = (
-        Path("C:/Windows/Fonts/msyhbd.ttc" if bold else "C:/Windows/Fonts/msyh.ttc"),
-        Path("C:/Windows/Fonts/simhei.ttf"),
-        Path("C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf"),
-    )
-    for path in candidates:
-        if path.exists():
-            return ImageFont.truetype(str(path), size=size)
-    return ImageFont.load_default()

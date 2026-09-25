@@ -1,5 +1,19 @@
 # Agent 开发指南
 
+## 2026-09-25 移植后的约束
+
+以下要求优先于本文旧版描述中的冲突条目：
+
+- 仅维护独立 APIMonitorBot，不引入 upstream-ops 网关观测/调度或 GPT-5.6 掺水检测。
+- `auto/openai/anthropic` 协议均需维护。OpenAI 请求不得带输出 token 上限；Anthropic Messages 使用其必需的 `max_tokens`。
+- TLS 保留旧配置关闭校验的默认值，但允许按配置主动开启，不得强制切换旧配置。
+- 成功率为滚动 24 小时，保留旧 `today_availability` 字段名以兼容客户端。
+- 定时超时只写独立 `probe_observations`，不影响成功率和业务通知。分钟级显示超时，聚合窗口在超时占比严格大于 40% 时显示。
+- 所有自产 PNG 使用 `material_theme.py`：逐次改变主题色，北京时间 07:00–19:00 浅色，其余深色。状态/涨跌语义固定，`/stat` 网页快照保持真实。
+- 群聊情报仅按群白名单采集，默认关闭，私聊及凭据输入步骤不得采集。上下文、详情和多轮会话必须加密；发送审计不得保存情报明文。
+- 公开状态页默认关闭，逐分组选择可见性，仅匿名开放 `/api/public-status`；其余新增 API 继续要求 WebUI 鉴权。
+- 新增回归测试在 `tests/test_monitor_port.py`。离线图片验收使用 `scripts/render_theme_samples.py`；UI 验收使用 `scripts/preview_monitor.py` 与 `scripts/smoke_monitor_ui.cjs`，不得连接真实 OneBot 或生产探测配置。
+
 这份文档面向后续接手 APIMonitorBot 的 Agent 或开发者。目标是把本项目已经确定的产品要求、交互风格、工程约束、测试方式和已调用的 skill 固化下来，避免后续改动偏离当前方向。
 
 ## 协作风格

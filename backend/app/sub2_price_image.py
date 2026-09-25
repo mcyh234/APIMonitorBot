@@ -4,10 +4,10 @@ import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from io import BytesIO
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageDraw, ImageFont
+from backend.app.material_theme import material_canvas, load_font as _load_font
 
 from backend.app.model_pricing import ModelTokenPrice, model_prices_for_group, token_price_to_cny_per_mtok
 from backend.app.sub2_rates import SUB2_CANDLE_DAYS, Sub2RateChange, Sub2StoredRate, best_subscription_groups, daily_rate_candles
@@ -30,13 +30,13 @@ def render_sub2_price_image(
     title: str = "Sub2API 渠道倍率",
     timezone_name: str = "Asia/Shanghai",
     sentiment: Sub2SentimentSummary | None = None,
+    generated_at: datetime | None = None,
 ) -> bytes:
     width = 1240
     header_height = 148 if sentiment is not None else 100
     board_heights = [_measure_board_height(board) for board in boards] or [116]
     height = header_height + sum(board_heights) + 36
-    image = Image.new("RGB", (width, height), "#f8fafc")
-    draw = ImageDraw.Draw(image)
+    image, draw = material_canvas((width, height), generated_at)
     font_title = _load_font(34, bold=True)
     font_heading = _load_font(24, bold=True)
     font_regular = _load_font(17)
@@ -45,11 +45,11 @@ def render_sub2_price_image(
     font_tiny = _load_font(12)
 
     draw.rectangle((0, 0, width, 126 if sentiment is not None else 78), fill="#111827")
-    draw.text((30, 22), title, fill="#f8fafc", font=font_title)
+    draw.text((30, 22), title, fill=draw.theme.on_primary_container, font=font_title)
     draw.text(
         (30, 62),
         "接口每 Token 单价 × 1,000,000 × 分组倍率 · 1 CNY = 1 USD 计价单位",
-        fill="#cbd5e1",
+        fill=draw.theme.on_primary_container,
         font=font_tiny,
     )
     _draw_legend(draw, width - 366, 26, font_small)
@@ -104,11 +104,11 @@ def _draw_board(
     font_small: ImageFont.ImageFont,
     font_tiny: ImageFont.ImageFont,
 ) -> None:
-    draw.rounded_rectangle((x, y, x + width, y + height), radius=12, fill="#ffffff", outline="#e2e8f0", width=1)
+    draw.line((x, y + height, x + width, y + height), fill=draw.theme.outline, width=1)
     heading = f"【{board.name}】"
     if board.changes:
         heading += " 出现价格变动"
-    draw.text((x + 22, y + 18), heading, fill="#0f172a", font=font_heading)
+    draw.text((x + 22, y + 18), _fit_text(heading, font_heading, width - 44), fill="#0f172a", font=font_heading)
 
     cursor_y = y + 58
     change_keys = {change.identity for change in board.changes}
@@ -147,10 +147,11 @@ def _draw_board(
         draw.rounded_rectangle((x + 22, cursor_y + 2, x + 138, cursor_y + 30), radius=14, fill=color)
         draw.text((x + 44, cursor_y + 7), label, fill="#ffffff", font=font_small)
         cursor_y += 42
-        column_width = (width - 58) // 2
+        columns = min(2, len(rates))
+        column_width = (width - 44) // columns
         for index, rate in enumerate(rates):
-            col = index % 2
-            row = index // 2
+            col = index % columns
+            row = index // columns
             card_x = x + 22 + col * column_width
             card_y = cursor_y + row * 350
             _draw_rate_card(
@@ -246,7 +247,8 @@ def _draw_model_price_table(
         group_key=rate.group_key,
     )
     columns = ["模型", "输入", "输出", "缓存写", "缓存读"]
-    positions = [x, x + 145, x + 238, x + 331, x + 424]
+    widths = [int(width * .28)] + [int(width * .18)] * 4
+    positions = [x + sum(widths[:index]) for index in range(5)]
     draw.text((x, y), "接口模型结算价（CNY / MTok，已乘当前倍率）", fill="#475569", font=font)
     y += 20
     draw.rectangle((x, y, x + width, y + 18), fill="#e2e8f0")
@@ -267,8 +269,8 @@ def _draw_model_price_table(
             _format_cny(cny.cache_write),
             _format_cny(cny.cache_read),
         ]
-        for text, position in zip(values, positions):
-            draw.text((position + 4, row_y + 3), _fit_text(text, font, 132 if position == x else 84), fill="#0f172a", font=font)
+        for text, position, column_width in zip(values, positions, widths):
+            draw.text((position + 4, row_y + 3), _fit_text(text, font, column_width - 8), fill="#0f172a", font=font)
 
 
 def _format_cny(value: float) -> str:
@@ -401,7 +403,7 @@ def _draw_sentiment_bar(
             f"看涨 {sentiment.up_percent:.1f}% · 看跌 {sentiment.down_percent:.1f}%"
             f" · 共 {sentiment.total_count} 票"
         )
-    draw.text((x, line_y + 16), label, fill="#e2e8f0", font=font_small)
+    draw.text((x, line_y + 16), label, fill=draw.theme.on_primary_container, font=font_small)
     day_text = sentiment.date.strftime("%Y-%m-%d · 全 Bot")
     day_width = _text_width(day_text, font_tiny)
     draw.text((x + width - day_width, line_y + 19), day_text, fill="#94a3b8", font=font_tiny)
@@ -412,7 +414,7 @@ def _draw_legend(draw: ImageDraw.ImageDraw, x: int, y: int, font: ImageFont.Imag
     cursor = x
     for color, label in items:
         draw.rounded_rectangle((cursor, y + 4, cursor + 18, y + 18), radius=4, fill=color)
-        draw.text((cursor + 24, y), label, fill="#e2e8f0", font=font)
+        draw.text((cursor + 24, y), label, fill=draw.theme.on_primary_container, font=font)
         cursor += 106
 
 
@@ -482,18 +484,6 @@ def _downsample_points(points: list, limit: int) -> list:
         return points
     step = (len(points) - 1) / (limit - 1)
     return [points[round(index * step)] for index in range(limit)]
-
-
-def _load_font(size: int, *, bold: bool = False) -> ImageFont.ImageFont:
-    candidates = [
-        Path("C:/Windows/Fonts/msyhbd.ttc" if bold else "C:/Windows/Fonts/msyh.ttc"),
-        Path("C:/Windows/Fonts/simhei.ttf"),
-        Path("C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf"),
-    ]
-    for path in candidates:
-        if path.exists():
-            return ImageFont.truetype(str(path), size=size)
-    return ImageFont.load_default()
 
 
 def _fit_text(text: str, font: ImageFont.ImageFont, max_width: int) -> str:

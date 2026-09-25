@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -32,6 +32,15 @@ class OneBotNotifier(Notifier):
         if self.session_factory is not None:
             with self.session_factory() as session:
                 record_send_result(session, result)
+        return result
+
+    async def send_sensitive(self, target: NotifyTarget, message: str):
+        result = await self.client.send_message(target.target_type, target.target_id, message)
+        if self.session_factory is not None:
+            with self.session_factory() as session:
+                record_send_result(session, replace(result, message="[群聊情报：内容已加密保存]",
+                    error=None if result.ok else "DELIVERY_FAILED", payload=None))
+        return result
 
     async def send_image(self, target: NotifyTarget, image_bytes: bytes, filename: str) -> None:
         result = await self.client.send_image_message(
@@ -43,6 +52,7 @@ class OneBotNotifier(Notifier):
         if self.session_factory is not None:
             with self.session_factory() as session:
                 record_send_result(session, result)
+        return result
 
 
 def record_send_result(session: Session, result: OneBotSendResult) -> None:

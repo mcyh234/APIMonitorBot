@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import json
 
 from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
@@ -19,6 +20,7 @@ from backend.app.repository import (
     clear_conversation,
     consume_rate_limit,
     create_api_config,
+    delete_api_config,
     format_target,
     get_conversation,
     is_admin,
@@ -81,13 +83,24 @@ class CommandRouter:
             settings.tibo_radar_source_url,
             timeout_seconds=settings.tibo_radar_timeout_seconds,
         )
+        from backend.app.monitor import MonitorService
+        from backend.app.notifier import OneBotNotifier
+        self.monitor = MonitorService(settings, secret_box, OneBotNotifier(onebot), probe=self.probe)
 
     async def handle_event(self, session: Session, event: dict) -> None:
         message = parse_onebot_message(event)
         if message is None:
             return
+        session.info["conversation_secret_box"] = self.secret_box
+        state = get_conversation(session, message.user_id)
+        sensitive = state is not None and state.step in {"api_key", "sub2_password", "sub2_email"}
+        intel_private = False
+        if message.message_type == "group":
+            from backend.app.intelligence import settings_for
+            intel_settings = settings_for(session)
+            intel_private = intel_settings.enabled and message.group_id in intel_settings.group_ids
         reply = await self.handle_message(session, message)
-        log_incoming_message(session, message, reply)
+        log_incoming_message(session, message, reply, sensitive=sensitive or intel_private)
         if reply:
             await self.reply(session, message, reply)
 
@@ -99,9 +112,13 @@ class CommandRouter:
         record_send_result(session, result)
 
     async def handle_message(self, session: Session, incoming: IncomingMessage) -> str | None:
+        session.info["conversation_secret_box"] = self.secret_box
         text = incoming.message.strip()
         state = get_conversation(session, incoming.user_id)
         if state is not None and not text.startswith("/cancel"):
+            if not is_admin(session, incoming.user_id):
+                clear_conversation(session, incoming.user_id)
+                return "权限不足，当前对话已取消。"
             payload = dict(state.payload or {})
             if state.step.startswith("sub2_"):
                 return await self._continue_addsub2(session, incoming, state.step, payload, text)
@@ -135,13 +152,15 @@ class CommandRouter:
                 return "权限不足。"
             if not arg:
                 return "用法：/remove <apiname>"
-            deleted = session.execute(delete(APIConfig).where(APIConfig.name == arg)).rowcount
-            session.commit()
+            deleted = delete_api_config(session, arg)
             return f"已删除配置：{arg}" if deleted else f"没有找到配置：{arg}"
         if command == "/addapi":
             if not is_admin(session, incoming.user_id):
                 return "权限不足。"
-            upsert_conversation(session, incoming.user_id, "name", {})
+            protocol = arg.strip().lower() or "auto"
+            if protocol not in {"auto", "openai", "anthropic"}:
+                return "用法：/addapi [auto|openai|anthropic]"
+            upsert_conversation(session, incoming.user_id, "name", {"protocol": protocol})
             return "请输入api配置名称"
         if command == "/addsub2":
             if not is_admin(session, incoming.user_id):
@@ -229,8 +248,7 @@ class CommandRouter:
         ]
 
     async def _manual_check_config(self, session: Session, config: APIConfig) -> ManualCheckResult:
-        api_key = self.secret_box.decrypt(config.api_key_encrypted)
-        result = await self.probe.probe(config.base_url, api_key, config.model_name)
+        result = await self.monitor.check_config(session, config, scheduled=False, notify=False)
         availability = today_availability(session, config.id, self.settings.app_timezone)
         state = "\u670d\u52a1\u53ef\u7528" if result.ok else "\u670d\u52a1\u4e0d\u53ef\u7528"
         text = f"\u3010{config.name}\u3011\n\u5f53\u524d{state}: {result.code}\n\u6700\u8fd1\u8bf7\u6c42\u6210\u529f\u7387: {availability:.1f}%"
@@ -258,7 +276,7 @@ class CommandRouter:
             return f"操作太频繁，请 {remaining} 秒后再试。"
 
         bars = build_status_bars(session, configs, self.settings.app_timezone)
-        image = render_status_image(bars, timezone_name=self.settings.app_timezone)
+        image = render_status_image(bars, timezone_name=self.settings.app_timezone, hide_targets=self.settings.hide_status_targets)
         if incoming.message_type == "group" and incoming.group_id:
             target_type = "group"
             target_id = incoming.group_id
@@ -573,6 +591,8 @@ class CommandRouter:
             return "请输入密码"
 
         if step == "sub2_password":
+            if incoming.message_type != "private":
+                return "请在私聊中输入密码。"
             password = text.strip()
             if not password:
                 return "密码不能为空，请重新输入。"
@@ -694,7 +714,8 @@ class CommandRouter:
             if not model_name:
                 return "模型名称不能为空，请重新输入。"
             payload["model_name"] = model_name
-            check = await self.probe.probe(payload["base_url"], payload["api_key"], model_name)
+            kwargs = {"protocol": payload.get("protocol", "auto")} if isinstance(self.probe, ApiProbe) else {}
+            check = await self.probe.probe(payload["base_url"], payload["api_key"], model_name, **kwargs)
             if not check.ok:
                 return f"验证失败：{check.code} {check.error or ''}\n请重新输入监听模型名称，或发送 /cancel 取消。"
             try:
@@ -707,6 +728,7 @@ class CommandRouter:
                         base_url=payload["base_url"],
                         api_key=payload["api_key"],
                         model_name=model_name,
+                        protocol=payload.get("protocol", "auto"),
                     ),
                 )
             except IntegrityError:
@@ -725,16 +747,19 @@ def parse_onebot_message(event: dict) -> IncomingMessage | None:
     message_type = str(event.get("message_type") or "")
     if message_type not in {"private", "group"}:
         return None
-    raw = event.get("raw_message")
-    if raw is None:
-        raw = event.get("message")
+    raw = event.get("message")
+    if not isinstance(raw, list):
+        raw = event.get("raw_message", raw)
     if isinstance(raw, list):
         parts: list[str] = []
         for item in raw:
-            if isinstance(item, dict) and item.get("type") == "text":
+            if isinstance(item, dict):
                 data = item.get("data")
-                if isinstance(data, dict):
+                if isinstance(data, dict) and item.get("type") == "text":
                     parts.append(str(data.get("text") or ""))
+                elif isinstance(data, dict) and item.get("type") in {"json", "xml"}:
+                    payload = data.get("data", "")
+                    parts.append(json.dumps(payload, ensure_ascii=False)[:4000] if isinstance(payload, dict) else str(payload)[:4000])
         raw = "".join(parts)
     user_id = event.get("user_id")
     if user_id is None:
@@ -757,15 +782,15 @@ def trigger_type_for_message(session: Session, message: IncomingMessage, reply: 
     return "conversation"
 
 
-def log_incoming_message(session: Session, message: IncomingMessage, reply: str | None) -> None:
+def log_incoming_message(session: Session, message: IncomingMessage, reply: str | None, *, sensitive: bool = False) -> None:
     row = ReceivedMessage(
         message_type=message.message_type,
         user_id=message.user_id,
         group_id=message.group_id,
-        message=message.message[:2000],
+        message="[敏感信息已隐藏]" if sensitive else message.message[:2000],
         triggered=reply is not None,
         trigger_type=trigger_type_for_message(session, message, reply),
-        reply_preview=reply[:500] if reply else None,
+        reply_preview="[敏感步骤回复已隐藏]" if sensitive else reply[:500] if reply else None,
     )
     session.add(row)
     session.commit()

@@ -1,364 +1,235 @@
 # APIMonitorBot
 
-APIMonitorBot 是一个本机运行的 OpenAI 兼容 API 可用性监视器。它会定时探测多个 `BaseURL + APIKey + 模型` 配置，在服务中断、持续未恢复、恢复可用时，通过 OneBot v11 向 QQ 群聊或私聊推送通知。
+面向 OpenAI / Anthropic 兼容接口的 API 可用性监控与 QQ 通知机器人。
 
-GitHub 项目地址：[mcyh234/APIMonitorBot](https://github.com/mcyh234/APIMonitorBot)
+在一个 WebUI 中管理多个 API、查看状态和延迟、跟踪渠道倍率，并通过 OneBot v11 将故障、恢复和价格变化发送到指定群聊或私聊。适合本机或自托管部署，不包含网关观测、请求转发或 GPT-5.6 掺水检测。
 
-项目包含 FastAPI 后端、React WebUI、SQLite 数据库、OneBot WebSocket 接入、管理员命令系统、多轮添加配置、密钥加密存储、状态图、网页快照、Sub2API/NewAPI 倍率监控和本地升级管理。
+## 效果预览
 
-所有项目文件均按 UTF-8 维护。
+以下图片由项目真实渲染器使用**离线演示数据**生成，不代表实际服务可用性、模型表现或报价。图片随仓库保存，无需运行服务即可查看。
 
-## 功能概览
+### API 状态与延迟
 
-- 监控 OpenAI 兼容 `POST {BaseURL}/chat/completions` 接口。
-- 支持多个 API 配置，每个配置可绑定一个或多个 QQ 群/私聊通知对象，例如 `G123456789&P1122334455`。
-- OneBot v11 WebSocket 收发消息，支持 token header，也可兼容 query token。
-- SQLite 持久化，APIKey 使用 `SECRET_MASTER_KEY` 加密后入库。
-- 默认管理员 QQ：`2087900785`，WebUI 可维护多个管理员。
-- 完整命令开关与别名系统，管理员命令、普通查询命令和投票命令分别执行权限校验。
-- `/addapi` 支持多轮对话添加 API，APIKey 强制在私聊内收集。
-- `/addsub2` 支持多轮对话添加 Sub2API 渠道倍率监控。
-- `/price` 输出当前通知对象绑定的 Sub2API 价格表图片。
-- `/up`、`/down` 或裸词 `up`、`down` 参与全 Bot 当日整体 Token 倍率看涨/看跌投票。
-- `/radar` 读取 Codex Radar 公开摘要，输出模型 IQ 降智趋势和最新配置排名图片。
-- `/tibo` 读取 Tibo 最新公开 X 帖子和 presence 摘要，输出原文、中文翻译及粗粒度动态雷达图。
-- 定时巡检失败会二次确认，减少偶发波动误报。
-- Sub2API 每分钟检测渠道分组 `rate_multiplier`，倍率变化或分组被删除时发送高亮图片，并追加文字通报说明变化分组。
-- Sub2API 登录 token 加密长效存储，token 失效后才重新登录。
-- 同一通知对象同一轮多 API 状态变化会合并报告，防止刷屏。
-- `TIMEOUT` 和 `NETWORK_ERROR` 不计入业务中断通知。
-- Timeout 时会额外检查 Google 连通性，如果国际网络也断开，会私聊通知默认管理员。
-- WebUI 支持配置 CRUD、启停、手动检查、巡检历史、最近接收消息、发送失败原因、管理员管理。
-- WebUI 首次进入设置访问密钥，后续所有业务 API 均要求登录 token。
-- WebUI 状态条图展示最近 30 分钟、5 小时、24 小时接口状态。
-- WebUI 支持拖拽上传升级包、一键安装并自动重启，也可以直接生成当前版本的升级包。
-- `/status` 生成 API 状态条 PNG 并发送到群聊/私聊。
-- `/stat` 抓取 `https://status.gptstore.club/` 全页快照，切到 1 小时视图后发送图片。
+状态条和延迟曲线分别展示最近 30 分钟、5 小时及 24 小时的数据。
 
-## 技术栈
+| 北京时间白天 · 浅色 | 北京时间夜间 · 深色 |
+| --- | --- |
+| ![浅色 API 状态图](docs/images/status-light.png) | ![深色 API 状态图](docs/images/status-dark.png) |
 
-- 后端：FastAPI、Uvicorn、SQLAlchemy、SQLite、APScheduler、httpx、websockets、cryptography、Pillow。
-- 前端：React、Vite、TypeScript、lucide-react。
-- 运行环境：Python 3.11+，Node.js 20+ 推荐。
+### 即时检查与渠道价格
 
-## 快速上手
+| 多接口检查结果 | 渠道倍率、历史走势与模型价格 |
+| --- | --- |
+| ![即时检查结果](docs/images/check-light.png) | ![深色渠道价格图](docs/images/price-dark.png) |
 
-### 1. 克隆或解压项目
+<details>
+<summary>更多图片：Radar 与 Tibo</summary>
+
+![Radar 趋势图](docs/images/radar-light.png)
+
+![Tibo 双语摘要](docs/images/tibo-dark.png)
+
+</details>
+
+自产报告图片共用 Material 3 风格的色彩角色、字体和布局。每次渲染重新选择主题色，北京时间 **07:00 至 19:00 为浅色，其余时间为深色**；成功、失败、涨跌等语义色保持一致。`/stat` 是真实网页截图，不参与重绘。
+
+## 主要功能
+
+| 模块 | 能力 |
+| --- | --- |
+| API 监控 | 多配置、协议选择、定时巡检、失败复核、模型回退、故障与恢复通知 |
+| 状态分析 | 滚动 24 小时成功率、三档时间窗口、独立超时展示、延迟曲线及异常标记 |
+| QQ 机器人 | OneBot v11 WebSocket 收发、群聊与私聊通知、多目标绑定、管理员权限、命令开关与别名 |
+| 渠道价格 | Sub2API 倍率监控、模型价格表、历史折线、30 日日 K、看涨/看跌投票、Sub2API/NewAPI 地址导入 |
+| 管理后台 | 登录鉴权、配置管理、巡检历史、消息记录、巡检参数、管理员管理、本地升级 |
+| 公开状态 | 默认关闭的 `/status` 页面，按分组开放，只读取本地快照 |
+| 群聊情报 | 默认关闭、群白名单、上下文采集、规则筛选、可选 LLM 分析、管理员报告 |
+| 扩展报告 | Codex Radar 公开趋势摘要、Tibo 公开动态与中文翻译、外部状态页截图 |
+
+后端使用 **FastAPI + SQLAlchemy + SQLite + APScheduler**，前端使用 **React + TypeScript + Vite**，图片使用 **Pillow + Noto Sans SC**。
+
+## 快速部署
+
+下面以 Windows PowerShell 为例。需要 Python 3.11+、Node.js 20+ 和兼容 OneBot v11 的机器人服务；推荐使用 NapCat 的 WebSocket Server。
+
+### 1. 获取代码和安装依赖
 
 ```powershell
-cd C:\Users\HelloWorld\Documents
 git clone https://github.com/mcyh234/APIMonitorBot.git
 cd APIMonitorBot
-```
-
-如果你使用的是本项目提供的 zip，直接解压后进入目录即可。
-
-### 2. 创建 Python 虚拟环境
-
-```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-```
-
-如果本机 pip 证书链异常，可临时使用：
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org -r requirements-dev.txt
-```
-
-### 3. 生成本地配置
-
-```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 Copy-Item .env.example .env
-.\.venv\Scripts\python.exe scripts\generate_secret_key.py
+.\.venv\Scripts\python.exe scripts/generate_secret_key.py
 ```
 
-把生成的密钥填入 `.env`：
+将生成的密钥填入 `.env` 的 `SECRET_MASTER_KEY`。这是数据库敏感字段的加密主密钥，**不是 WebUI 登录密钥**；请妥善备份，不要在升级时重新生成。
 
-```env
-SECRET_MASTER_KEY=粘贴生成的密钥
-```
+同时将 `.env` 中的 `DEFAULT_ADMIN_QQ` 改为自己的 QQ 号。模板包含默认管理员，部署后请在 WebUI 核对管理员列表，删除不属于自己的账号。
 
-OneBot 可以稍后在 WebUI 的“快速上手”里配置；推荐 NapCat 只开启 WebSocket Server。
-
-### 4. 构建 WebUI
+### 2. 构建并启动
 
 ```powershell
 cd frontend
-npm install
+npm ci
+npm run build
+cd ..
+.\.venv\Scripts\python.exe run.py
+```
+
+打开 <http://127.0.0.1:8000>，首次访问设置 WebUI 进入密钥，然后配置管理员、OneBot 连接和 API。
+
+Linux/macOS 对应使用 `.venv/bin/python` 和 `cp .env.example .env`；其余构建步骤相同。网页截图功能还需要本机安装可用的 Edge/Chrome。
+
+### 3. 连接 QQ 机器人
+
+1. 在 NapCat 中开启 **WebSocket Server**，设置访问 token。
+2. 在 WebUI 中填写服务器地址，例如 `ws://127.0.0.1:3001`，以及相同 token。
+3. 按适配器需要启用 query token 兼容选项，保存并确认连接成功。
+4. 添加 API，设置通知目标，例如 `G123456789`、`P1122334455`，多个目标使用 `&` 连接。
+
+消息接收与发送均通过 WebSocket 完成。新部署不需要配置 OneBot HTTP 发送或 HTTP webhook。
+
+## 探测与通知
+
+### 协议和 TLS
+
+- `auto`：根据配置推断协议；自动推断 Claude 协议后遇到 404/405，可回退 OpenAI 兼容端点。
+- `openai`：使用 Chat Completions 探测，不发送输出 token 上限参数。
+- `anthropic`：使用 Messages 探测，携带协议必需的 `max_tokens`。
+- 显式指定的协议不会自动切换。探测发送 `hi`，需要 HTTP 成功、JSON 可解析且有 assistant 内容。
+- **TLS 保留旧配置兼容性**：默认不强制验证证书，可在每个 API 的连接设置中主动开启。关闭验证存在中间人攻击风险，证书正常的服务建议开启。
+
+### 巡检规则
+
+默认每 60 秒巡检，夜间省流默认在北京时间 00:00 至 08:00 调整为每 10 分钟探测一次。巡检参数可在 WebUI 修改，Sub2API 倍率检测独立按分钟执行。
+
+首次失败会复核，符合条件时尝试模型回退；确认业务中断后通知，持续故障按策略提醒，连续恢复成功后发送恢复通知。同一轮发往同一对象的多个状态变化合并报告。
+
+### 如何理解图表
+
+- 最近请求成功率采用**滚动 24 小时**口径。兼容 API 字段 `today_availability` 保留原名。
+- 状态条仅使用定时巡检数据，手动检查不改变状态条。
+- 绿色表示可用，黄色表示部分可用，红色表示不可用，灰色表示无检查数据。
+- `TIMEOUT` 单独写入观察数据，不计入可用性分母，不触发业务中断通知；`NETWORK_ERROR` 同样不计入业务可用性。
+- 分钟级视图显示超时标记；5 小时和 24 小时聚合视图仅在整个窗口超时观察占比**严格大于 40%**时显示。
+- 延迟按时间桶中位数聚合，异常高延迟及模型切换以红点标记。
+- 超时时可额外检测国际网络连通性，断网提醒发往默认管理员。
+
+## 机器人命令
+
+| 命令 | 用途 |
+| --- | --- |
+| `/addapi [auto\|openai\|anthropic]` | 管理员多轮添加 API，密钥必须私聊输入 |
+| `/addsub2` | 管理员多轮添加 Sub2API，密码必须私聊输入 |
+| `/list` | 管理员查看全部 API 配置 |
+| `/remove <名称>` | 管理员删除配置 |
+| `/check [名称]` | 即时检查，不带名称时汇总当前通知对象绑定的 API |
+| `/status [名称]` | 生成状态条及延迟图片 |
+| `/price` | 生成绑定渠道的倍率、历史和模型价格图片 |
+| `/up`、`up` / `/down`、`down` | 看涨/看跌投票，每个 QQ 每个北京时间自然日一票，当天可改票 |
+| `/radar` | 生成 Codex Radar 公开趋势报告 |
+| `/tibo` | 生成 Tibo 公开动态与双语摘要 |
+| `/stat` | 截取配置的外部状态页，默认 GPTStore 状态页 |
+| `/cancel` | 取消当前多轮对话 |
+
+普通用户的查询命令默认冷却 5 分钟，管理员不受此限制。群聊普通用户只能查询本群绑定配置，私聊命令默认仅管理员可用。WebUI 可维护命令开关与别名，`/cancel` 始终保留。
+
+## 渠道倍率与价格
+
+Sub2API 首次采样保存基线，不发送变动通知；后续倍率变化或分组删除会发送图片和文字说明。价格来自上游 `/api/v1/channels/available`，不使用内置静态价目表。
+
+每百万 Token 展示价按 `每 Token 单价 × 1,000,000 × 分组倍率` 计算。项目沿用 Sub2API 的 `1 CNY = 1 USD` 计价单位约定，**不是实时外汇换算**，具体结算以上游为准。
+
+历史走势和日 K 按北京时间自然日聚合，没有采样的日期留空。涨为红色，跌为绿色；顶部显示全 Bot 当日投票比例。
+
+## 公开状态与群聊情报
+
+**公开状态页默认关闭。** 启用后访问 `/status`，并逐个勾选公开分组。匿名接口仅开放 `/api/public-status`，只读本地快照，不实时请求上游，不返回上游地址、账号凭据、QQ 通知对象或原始错误。其他管理 API 仍需鉴权。
+
+**群聊情报默认关闭。** 仅采集白名单群聊，不采集私聊或凭据输入步骤。候选经规则筛选、限流、去重，可选调用管理员配置的 LLM；报告只发送管理员。
+
+启用前请向群成员说明采集用途并取得必要授权。启用 LLM 意味着脱敏后的上下文会发送至所配置的模型服务。自动脱敏不能代替人工管理，避免在群聊中发送凭据。
+
+上下文、情报详情和多轮会话加密保存；列表仅展示元数据，详情需登录查看。上下文保留 2 天、发现记录保留 30 天，在收到后续允许采集的消息时清理；关闭采集不会立即删除历史。
+
+## 配置与运维
+
+完整环境变量见 [`.env.example`](.env.example)，常用项：
+
+| 配置 | 说明 |
+| --- | --- |
+| `APP_HOST` / `APP_PORT` | 默认 `127.0.0.1:8000`，优先保持本地监听 |
+| `SECRET_MASTER_KEY` | 敏感数据加密主密钥，必须持续保留 |
+| `DATABASE_URL` | 默认 SQLite：`data/apimonitor.sqlite3` |
+| `DEFAULT_ADMIN_QQ` | 默认管理员和部分网络告警接收者 |
+| `ONEBOT_WS_URL` / `ONEBOT_ACCESS_TOKEN` | OneBot WebSocket 地址及 token |
+| `CHECK_INTERVAL_SECONDS` / `REQUEST_TIMEOUT_SECONDS` | 默认巡检间隔和请求超时 |
+| `NIGHT_SAVER_*` | 夜间省流默认参数 |
+| `STATUS_SNAPSHOT_BROWSER_PATH` | 可选指定网页截图所用浏览器 |
+
+部分运行参数在 WebUI 保存到 SQLite 后优先于环境变量默认值。需要远程访问时，请自行配置 HTTPS、反向代理与访问控制，不要直接暴露本地演示服务。
+
+### 备份和升级
+
+升级前停服备份 `.env` 和 SQLite 数据库。启动会执行兼容性的新增字段与表迁移，继续沿用原 `SECRET_MASTER_KEY`。新增群聊情报和公开状态功能不会自动启用。
+
+WebUI 支持上传可信升级包、校验、备份和安装。也可生成升级包：
+
+```powershell
+.\.venv\Scripts\python.exe scripts/build_upgrade_package.py --version 1.1.0
+```
+
+版本号仅为示例。产物位于 `release/`，被覆盖文件的备份位于 `data/upgrades/backups/`。哈希校验不等于发布者身份认证，只安装可信来源的包。
+
+忘记 WebUI 进入密钥时：
+
+```powershell
+.\.venv\Scripts\python.exe scripts/reset_webui_secret.py
+```
+
+此操作重置 WebUI 访问密钥，不会替换数据加密主密钥。
+
+## 开发与离线验收
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m compileall -q backend run.py scripts tests
+cd frontend
+npx tsc --noEmit
 npm run build
 cd ..
 ```
 
-### 5. 启动服务
+生成浅色与深色样品：
 
 ```powershell
-.\.venv\Scripts\python.exe run.py
+.\.venv\Scripts\python.exe scripts/render_theme_samples.py
 ```
 
-浏览器打开：
+默认输出至 `data/theme-preview/`。README 中的图片是选取的固定样品；重新渲染时主题色可能不同。
+
+启动隔离的本地演示：
+
+```powershell
+.\.venv\Scripts\python.exe scripts/preview_monitor.py --port 8766
+```
+
+演示监听 `127.0.0.1:8766`，使用独立的 `data/offline-preview/` 数据库，登录密钥为 `preview-monitor-2026`，不启动 OneBot 接收器或定时巡检。**仅用于本地验收，不能作为生产入口。**
+
+目录说明：
 
 ```text
-http://127.0.0.1:8000
+backend/app/       后端、监控、通知与图片渲染
+frontend/src/      WebUI 与公开状态页面
+scripts/           密钥管理、打包、离线渲染与界面验收
+tests/             回归测试
+docs/images/       README 演示效果图
 ```
 
-首次进入 WebUI 会要求设置一个“进入密钥”，可以点击“自动生成”。保存后进入快速上手面板，按提示完成 NapCat WebSocket、管理员和 API 配置。全部完成后快速上手面板会自动隐藏。
-
-如果忘记 WebUI 进入密钥，可以在项目根目录运行脚本重置：
-
-```powershell
-.\.venv\Scripts\python.exe scripts\reset_webui_secret.py
-```
-
-默认会清除当前密钥，刷新 WebUI 后回到首次设置页面。也可以直接设置新密钥：
-
-```powershell
-.\.venv\Scripts\python.exe scripts\reset_webui_secret.py --secret "new-webui-secret"
-```
-
-或者自动生成并保存一个新密钥：
-
-```powershell
-.\.venv\Scripts\python.exe scripts\reset_webui_secret.py --generate
-```
-
-## 常用配置
-
-`.env.example` 已包含完整示例。常用项如下：
-
-```env
-APP_HOST=127.0.0.1
-APP_PORT=8000
-APP_TIMEZONE=Asia/Shanghai
-DATABASE_URL=sqlite:///./data/apimonitor.sqlite3
-
-ONEBOT_WS_URL=ws://127.0.0.1:3001
-ONEBOT_ACCESS_TOKEN=
-ONEBOT_WS_TOKEN_IN_QUERY=true
-
-DEFAULT_ADMIN_QQ=2087900785
-CHECK_INTERVAL_SECONDS=60
-NIGHT_SAVER_ENABLED=true
-NIGHT_SAVER_START_HOUR=0
-NIGHT_SAVER_START_MINUTE=0
-NIGHT_SAVER_END_HOUR=8
-NIGHT_SAVER_END_MINUTE=0
-NIGHT_SAVER_INTERVAL_SECONDS=600
-COMMAND_CHECK_COOLDOWN_SECONDS=300
-
-INTERNET_CHECK_URL=https://www.google.com/generate_204
-INTERNET_CHECK_TIMEOUT_SECONDS=8
-INTERNET_DISCONNECT_NOTIFY_COOLDOWN_SECONDS=600
-
-STATUS_SNAPSHOT_URL=https://status.gptstore.club/
-STATUS_SNAPSHOT_BROWSER_PATH=
-STATUS_SNAPSHOT_TIMEOUT_SECONDS=45
-STATUS_SNAPSHOT_VIEWPORT_WIDTH=1920
-```
-
-上游 API 探测默认 `verify_ssl=false`，用于兼容部分上游证书链不完整的 OpenAI 兼容网关。
-
-## OneBot 接入说明
-
-推荐使用 NapCat WebSocket Server：
-
-1. 在 NapCat 的网络配置里开启 WebSocket Server。
-2. 监听地址建议 `127.0.0.1`，端口建议 `3001`。
-3. 在 NapCat 上设置 token。
-4. 在 APIMonitorBot WebUI 的“快速上手”中填写 `ws://127.0.0.1:3001`，复制 NapCat 上配置好的 token，并勾选 query token。
-5. 保存后 WebUI 会自动重连。
-
-APIMonitorBot 只通过 WebSocket 连接收发 OneBot 事件和 action，例如 `send_group_msg`、`send_private_msg`、`get_group_list`。旧版 OneBot HTTP 路径已弃用，新部署只需要配置 WebSocket Server 和 NapCat token，避免重复触发命令或重复发送。
-
-## 机器人命令
-
-- `/addapi`：管理员专用，开始多轮对话添加 API。
-- `/addsub2`：管理员专用，开始多轮对话添加 Sub2API 渠道倍率监控。
-- `/list`：管理员专用，列出所有配置。
-- `/remove <apiname>`：管理员专用，删除指定配置。
-- `/check [apiname]`：立即检查指定配置；不带参数时检查当前通知对象绑定的全部 API，并用图片汇总结果。群聊只能查绑定本群的配置，私聊仅管理员可用。
-- `/status [apiname]`：发送 API 状态条 PNG。群聊无参数时显示本群绑定的所有配置，私聊管理员可看全部。
-- `/stat`：抓取 GPTStore 状态页全页快照，切到 1 小时请求成功率视图后发送图片。
-- `/price`：发送当前群聊或私聊通知对象绑定的 Sub2API 渠道倍率图片；配置可用 `&` 同时绑定多个通知对象。
-- `/up`、`up`：看涨整体 Token 倍率；`/down`、`down`：看跌。每个 QQ 每个上海自然日一票，当天可以改票。
-- `/radar`：读取 `codexradar.com/current.json` 公开摘要，发送最近 7 个测试批次的模型 IQ 趋势图。
-- `/tibo`：从 `tibo_presence.source_urls` 获取最新公开 X 帖子，生成白底 X 风格中英双语图片。
-- `/cancel`：取消当前多轮对话。
-
-普通用户调用 `/check`、`/status`、`/stat`、`/price`、`/radar`、`/tibo` 有 5 分钟冷却；管理员不受冷却限制。
-
-`up/down` 投票不使用 5 分钟命令冷却。每个 QQ 在每个上海自然日只有一条有效投票记录，重复同方向保持不变，发送相反方向会修改当天投票。
-
-WebUI 的“命令开关”可以开启或关闭 `/addapi`、`/addsub2`、`/list`、`/remove`、`/check`、`/status`、`/stat`、`/price`、`/up`、`/down`、`/radar`、`/tibo`。`up`、`down` 是对应投票命令的永久默认别名，`/cancel` 始终保留。
-
-## 监控与通知规则
-
-探测请求：
-
-```text
-POST {BaseURL}/chat/completions
-```
-
-请求体会发送一条 `hi` 用户消息。判定为可用必须同时满足：
-
-- HTTP 状态码为 2xx。
-- 返回 JSON 能解析。
-- `choices[0].message.content` 中存在 assistant 内容。
-
-不可用通知策略：
-
-- 首次失败后立即二次确认。
-- 二次仍失败才进入不可用状态并发送“当前出现业务中断”。
-- 10 分钟内不重复发送同类不可用通知。
-- 10 次巡检后仍未恢复，发送“10分钟仍未恢复业务”。
-- 此后保持静默。
-- 故障后连续 2 次恢复成功，发送“当前服务恢复可用”。
-
-特殊网络错误：
-
-- `TIMEOUT`：不写入 API 巡检记录，不触发业务群中断通知；会检查 Google 连通性。
-- `NETWORK_ERROR`：不写入 API 巡检记录，不触发业务群中断通知，静默忽略。
-
-状态条颜色：
-
-- 灰色：未检查。
-- 绿色：该时间桶全部可用。
-- 黄色：该时间桶部分可用。
-- 红色：该时间桶全部不可用。
-
-Sub2API 渠道倍率监控：
-
-- 登录接口：`POST {BaseURL}/api/v1/auth/login`。
-- 渠道接口：`GET {BaseURL}/api/v1/groups/available`。
-- `/price` 额外读取 `GET {BaseURL}/api/v1/channels/available`，使用接口返回的分组倍率和模型 Token 单价。
-- 模型单价字段是每 Token 价格：`input_price`、`output_price`、`cache_write_price`、`cache_read_price`。
-- Sub2API 按 `1 CNY = 1 USD` 计价单位处理，每 MTok 人民币价格为 `每 Token 单价 × 1,000,000 × rate_multiplier`。
-- 记录返回 `data[]` 中每个分组的 `platform`、`name` 和 `rate_multiplier`。
-- 首次看到分组、每天首次成功巡检和后续每次倍率变化都会写入倍率历史，用于按上海自然日聚合开盘、最高、最低、收盘。
-- 首次添加只保存当前倍率，不发送变动通知。
-- 后续定时检测发现倍率变化或分组被删除时，先发送价格变动图片，再追加文字通报说明具体分组。
-- 图片中 Anthropic 渠道使用橙色，OpenAI 渠道使用绿色，发生变化的分组高亮。
-- `/price` 图片会展开显示所有分组，包含当前倍率、历史折线、最近 30 天倍率日 K，以及从 `/channels/available` 实时计算的输入、输出、缓存写入、缓存读取 CNY/MTok 价格；上涨为红色，下跌为绿色。
-- WebUI、`/price` 和自动价格变动图顶部显示全 Bot 当日看涨/看跌比例；无投票时使用灰色状态条。
-- token 会加密存储，未过期时复用；失效后自动重新登录。
-- WebUI 支持批量导入多个 Sub2API/NewAPI URL，可以先导入地址，再逐项补充账号、密码或 access token。
-
-## WebUI
-
-WebUI 首屏就是监控后台，不做营销页。主要区域：
-
-- 系统概览指标。
-- API 配置表。
-- Sub2API 渠道倍率面板，默认收起，点击后展开查看当前倍率、历史折线、最近 30 天日 K 和全局投票比例。
-- 命令开关，位于 Sub2API 渠道倍率面板下方。
-- 新增 API 表单。
-- 管理员 QQ 列表。
-- 最近发送失败原因。
-- 最近接收到的 OneBot 消息。
-- 状态条图。
-- 单配置巡检历史。
-- 版本升级面板：校验升级包、备份旧文件、安装并自动重启，以及生成升级包。
-- “添加 API”“管理员”“版本升级”侧栏面板默认收起，可按需展开，折叠状态会保存在当前浏览器。
-- WebUI 右上角提供 GitHub 图标入口，可直接打开项目仓库。
-- “巡检与冷却”面板可修改夜间省流开关、分钟级开始/结束时间、夜间巡检间隔和普通用户命令冷却时间；保存后立即生效并持久化到 SQLite。
-
-倍率面板中的日 K 线以分组 `rate_multiplier` 为价格口径，按 `Asia/Shanghai` 自然日聚合开盘、最高、最低和收盘。没有采样记录的日期会留空，不会使用前一日价格伪造数据。
-
-## 一键升级与升级包生成
-
-WebUI 右侧“版本升级”面板提供两种操作：
-
-- 将 `APIMonitorBot-upgrade-<版本>.zip` 拖入上传区，校验通过后点击“安装并重启”。
-- 输入版本号并点击“生成升级包”，后端会先执行 WebUI 构建，再下载可直接安装的升级包。
-
-安装升级包时会校验应用标识、升级包格式、必要文件、文件大小和 SHA-256。写入前会把被覆盖的旧文件备份到 `data/upgrades/backups/`；如果 `requirements.txt` 发生变化，会自动使用当前 Python 环境安装新版依赖。`.env`、数据库、`data/`、虚拟环境、日志、缓存和本地压缩包不会进入升级包，也不会被覆盖。
-
-安装完成后服务会自动退出并通过 `run.py` 重新启动。重启记录保存在：
-
-```text
-data/upgrades/restart.log
-```
-
-只安装可信来源的升级包。清单哈希用于发现文件损坏或篡改，不代表发布者身份认证。
-
-也可以在项目根目录通过命令行生成升级包：
-
-```powershell
-.\.venv\Scripts\python.exe scripts\build_upgrade_package.py --version 1.1.0
-```
-
-输出文件默认位于 `release/APIMonitorBot-upgrade-1.1.0.zip`。如已经手动执行过 `npm run build`，可以跳过重复构建：
-
-```powershell
-.\.venv\Scripts\python.exe scripts\build_upgrade_package.py --version 1.1.0 --skip-frontend-build
-```
-
-## 开发与测试
-
-后续 Agent 或开发者接手前，请先阅读 [AGENTS.md](AGENTS.md)，其中记录了本项目的产品约束、交互风格、命令规则、UI 要求和打包注意事项。
-
-后端测试：
-
-```powershell
-.\.venv\Scripts\python.exe -m pytest
-.\.venv\Scripts\python.exe -m compileall -q backend run.py scripts tests
-```
-
-前端构建：
-
-```powershell
-cd frontend
-npm run build
-```
-
-前端开发模式：
-
-```powershell
-cd frontend
-npm run dev
-```
-
-当前完整后端测试为 `91 passed`。涉及图片或响应式页面的改动还应实际渲染 PNG，并在桌面和移动 viewport 检查文字、图表和容器边界。
-
-## 打包发布
-
-提交 GitHub 前不要提交这些本地文件：
-
-- `.env`
-- `data/`
-- `.venv/`
-- `frontend/node_modules/`
-- `frontend/dist/`
-- `release/`
-- `__pycache__/`
-- `.pytest_cache/`
-
-本仓库的 `.gitignore` 已默认排除这些路径。
-
-项目根目录的 `Prompt.txt` 是本项目需求提示词归档，建议随源码一起提交，方便后续 Agent 或开发者追溯原始需求。
-
-生成包含完整源码、测试、Agent 指南和技术交接文档的迁移包：
-
-```powershell
-.\.venv\Scripts\python.exe scripts\build_source_package.py
-```
-
-输出位于 `release/APIMonitorBot-migration-source-<版本>.zip`，ZIP 本身保持忽略，不提交到 Git。
-
-## 待实现功能
-
-- Telegram Bot 通知适配。
-- WebUI 多用户账号和细粒度 RBAC。
-- WebUI 完整编辑 Sub2API/NewAPI 地址、凭据和通知目标。
-- WebUI 导出巡检历史 CSV。
-- 支持更多探测方式，例如 `/models`、Responses API 或自定义请求体。
-- 支持按配置自定义巡检间隔、超时时间、恢复阈值。
-- 支持通知模板自定义。
-- 支持 Docker Compose 一键部署。
-- 建立正式 Alembic migration 版本链，替代当前 `create_all + SQLite ALTER TABLE` 兼容迁移。
-- 支持 Prometheus 指标暴露。
-- 支持更多 OneBot 适配器的图片发送兼容模式。
+开发约束见 [AGENTS.md](AGENTS.md)。不要提交 `.env`、数据库、`data/`、虚拟环境、日志、构建产物或本地升级包。
 
 ## 许可证
 
-本项目使用 MIT License，详见 [LICENSE](LICENSE)。
+项目采用 [MIT License](LICENSE)。随仓库分发的 Noto Sans SC 字体遵循 [SIL Open Font License](backend/app/assets/OFL.txt)。

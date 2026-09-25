@@ -13,7 +13,12 @@ from fastapi.staticfiles import StaticFiles
 
 from backend.app.api import api_router, mount_spa_routes, onebot_router
 from backend.app.availability import ApiProbe
-from backend.app.commands import CommandRouter
+from backend.app.commands import CommandRouter, parse_onebot_message
+from backend.app.intelligence import IntelPipeline, router as intel_router
+from backend.app.monitor_extensions import apply_advanced_settings, router as extensions_router
+from backend.app.models import ConversationState
+from sqlalchemy import select
+import json
 from backend.app.crypto import get_secret_box
 from backend.app.db import SessionLocal, init_db
 from backend.app.monitor import MonitorService
@@ -35,6 +40,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         secret_box = get_secret_box()
         with SessionLocal() as session:
             apply_runtime_settings(session, app_settings, secret_box)
+            apply_advanced_settings(session, app_settings)
+            for conversation in session.scalars(select(ConversationState)):
+                if "_cipher" not in (conversation.payload or {}):
+                    conversation.payload = {"_cipher": secret_box.encrypt(json.dumps(conversation.payload or {}, ensure_ascii=False))}
+            session.commit()
         onebot_client = OneBotClient(app_settings)
         notifier = OneBotNotifier(onebot_client, SessionLocal)
         monitor = MonitorService(
@@ -44,6 +54,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             probe=ApiProbe(timeout_seconds=app_settings.request_timeout_seconds),
         )
         command_router = CommandRouter(app_settings, onebot_client, secret_box)
+        command_router.monitor = monitor
+        intel = IntelPipeline(SessionLocal, secret_box, notifier)
+        command_router.intel = intel
         ws_receiver = OneBotWebSocketReceiver(
             app_settings,
             lambda event: _handle_ws_event(command_router, event),
@@ -58,22 +71,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.onebot_ws_receiver = ws_receiver
         app.state.scheduler = scheduler
 
-        if app_settings.checker_enabled:
-            scheduler.add_job(
-                monitor.run_all_scheduled,
-                "interval",
-                args=[SessionLocal],
-                seconds=app_settings.check_interval_seconds,
-                id="api-availability-check",
-                replace_existing=True,
-                max_instances=1,
-            )
-            scheduler.start()
+        scheduler.add_job(
+            monitor.run_all_scheduled, "interval", args=[SessionLocal], seconds=10,
+            id="api-availability-check", replace_existing=True, max_instances=1,
+        )
+        scheduler.start()
         ws_receiver.start()
         try:
             yield
         finally:
             await ws_receiver.stop()
+            await intel.close()
             if scheduler.running:
                 scheduler.shutdown(wait=False)
 
@@ -88,6 +96,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     add_webui_auth_middleware(app)
     app.include_router(api_router)
     app.include_router(onebot_router)
+    app.include_router(extensions_router)
+    app.include_router(intel_router)
 
     root = Path(__file__).resolve().parents[2]
     frontend_dist = root / "frontend" / "dist"
@@ -103,6 +113,7 @@ def add_webui_auth_middleware(app: FastAPI) -> None:
         "/api/webui/auth-status",
         "/api/webui/setup",
         "/api/webui/login",
+        "/api/public-status",
     }
 
     @app.middleware("http")
@@ -129,6 +140,12 @@ def add_webui_auth_middleware(app: FastAPI) -> None:
 
 
 async def _handle_ws_event(command_router: CommandRouter, event: dict) -> None:
+    intel = getattr(command_router, "intel", None)
+    if intel is not None:
+        try:
+            intel.observe(event, parse_onebot_message(event))
+        except Exception:
+            logger.warning("Intel listener skipped event")
     with SessionLocal() as session:
         await command_router.handle_event(session, event)
 

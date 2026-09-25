@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime
 from io import BytesIO
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageDraw, ImageFont
 
-from backend.app.status_bars import ConfigStatusBarsData
+from backend.app.status_bars import ConfigStatusBarsData, should_render_timeout
+from backend.app.material_theme import material_canvas, load_font as _load_font
+from statistics import median
 from backend.app.time_utils import coerce_aware_utc, utc_now
 
 
@@ -37,16 +38,16 @@ def render_status_image(
     *,
     timezone_name: str,
     generated_at: datetime | None = None,
+    hide_targets: bool = True,
 ) -> bytes:
     now = coerce_aware_utc(generated_at or utc_now()).astimezone(ZoneInfo(timezone_name))
     width = 1120
     header_height = 112
-    config_height = 164
+    config_height = 276
     footer_height = 34
     height = header_height + max(1, len(configs)) * config_height + footer_height
 
-    image = Image.new("RGB", (width, height), "#f8fafc")
-    draw = ImageDraw.Draw(image)
+    image, draw = material_canvas((width, height), generated_at)
     font_title = _load_font(34, bold=True)
     font_heading = _load_font(22, bold=True)
     font_regular = _load_font(17)
@@ -54,11 +55,11 @@ def render_status_image(
     font_tiny = _load_font(12)
 
     draw.rectangle((0, 0, width, 88), fill="#0f172a")
-    draw.text((32, 22), "APIMonitorBot 状态图", fill="#f8fafc", font=font_title)
+    draw.text((32, 22), "APIMonitorBot 状态图", fill=draw.theme.on_primary_container, font=font_title)
     draw.text(
         (32, 64),
         f"生成时间 {now:%Y-%m-%d %H:%M:%S} {timezone_name}",
-        fill="#cbd5e1",
+        fill=draw.theme.on_primary_container,
         font=font_tiny,
     )
     _draw_legend(draw, width - 424, 28, font_small)
@@ -67,10 +68,10 @@ def render_status_image(
     if not configs:
         draw.text((32, y + 30), "没有可显示的 API 配置", fill="#475569", font=font_heading)
     for config in configs:
-        _draw_config_block(draw, config, 32, y, width - 64, font_heading, font_regular, font_small, font_tiny)
+        _draw_config_block(draw, config, 32, y, width - 64, font_heading, font_regular, font_small, font_tiny, hide_targets=hide_targets)
         y += config_height
 
-    draw.text((32, height - 26), "灰色=未检查  绿色=可用  黄色=部分时间可用  红色=不可用", fill="#64748b", font=font_tiny)
+    draw.text((32, height - 26), "灰色 未检查   绿色 可用   红色 不可用   ? 超时（不计成功率）   曲线红点 异常延迟 / 模型切换", fill="#64748b", font=font_tiny)
     buffer = BytesIO()
     image.save(buffer, format="PNG", optimize=True)
     return buffer.getvalue()
@@ -80,7 +81,7 @@ def _draw_legend(draw: ImageDraw.ImageDraw, x: int, y: int, font: ImageFont.Imag
     cursor = x
     for key in ("unknown", "ok", "partial", "down"):
         draw.rounded_rectangle((cursor, y + 4, cursor + 18, y + 18), radius=4, fill=STATE_COLORS[key])
-        draw.text((cursor + 24, y), STATE_LABELS[key], fill="#e2e8f0", font=font)
+        draw.text((cursor + 24, y), STATE_LABELS[key], fill=draw.theme.on_primary_container, font=font)
         cursor += 98
 
 
@@ -94,8 +95,10 @@ def _draw_config_block(
     font_regular: ImageFont.ImageFont,
     font_small: ImageFont.ImageFont,
     font_tiny: ImageFont.ImageFont,
+    *,
+    hide_targets: bool = True,
 ) -> None:
-    card_height = 144
+    card_height = 256
     draw.rounded_rectangle((x, y, x + width, y + card_height), radius=12, fill="#ffffff", outline="#e2e8f0", width=1)
     title = _fit_text(config.config_name, font_heading, 420)
     draw.text((x + 22, y + 18), title, fill="#0f172a", font=font_heading)
@@ -112,6 +115,8 @@ def _draw_config_block(
     )
 
     meta = config.model_name
+    if not hide_targets:
+        meta += f" · {config.target}"
     if config.last_code:
         meta += f" · {config.last_code}"
     draw.text((x + 22, y + 52), _fit_text(meta, font_small, 520), fill="#64748b", font=font_small)
@@ -122,7 +127,8 @@ def _draw_config_block(
         bucket_height = 14
         center_y = row_y + bucket_height / 2
         _draw_text_centered_y(draw, (x + 22, center_y), window.label, font_small, fill="#334155")
-        _draw_buckets(draw, window.buckets, x + 132, row_y, 700)
+        _draw_buckets(draw, window.buckets, x + 132, row_y, 700, show_timeout=should_render_timeout(window))
+        _draw_latency(draw, window, x + 132, row_y + 20, 700, 28)
         _draw_text_centered_y(
             draw,
             (x + 850, center_y),
@@ -130,7 +136,7 @@ def _draw_config_block(
             font_tiny,
             fill="#94a3b8",
         )
-        row_y += 24
+        row_y += 56
 
 
 def _draw_text_centered_y(
@@ -147,31 +153,65 @@ def _draw_text_centered_y(
     draw.text((int(x), int(round(text_y))), text, fill=fill, font=font)
 
 
-def _draw_buckets(draw: ImageDraw.ImageDraw, buckets, x: int, y: int, max_width: int) -> None:
+def _draw_buckets(draw: ImageDraw.ImageDraw, buckets, x: int, y: int, max_width: int, *, show_timeout: bool = True) -> None:
     if not buckets:
         return
     gap = 3
-    bar_width = max(7, min(22, (max_width - gap * (len(buckets) - 1)) // len(buckets)))
+    bar_width = max(2, (max_width - gap * (len(buckets) - 1)) // len(buckets))
     cursor = x
     for bucket in buckets:
         draw.rounded_rectangle(
             (cursor, y, cursor + bar_width, y + 14),
             radius=3,
-            fill=STATE_COLORS.get(bucket.state, STATE_COLORS["unknown"]),
+            fill="#facc15" if bucket.timeout and show_timeout else STATE_COLORS.get(bucket.state, STATE_COLORS["unknown"]),
         )
+        if bucket.timeout and show_timeout:
+            draw.raw.text((cursor + bar_width / 2, y + 7), "?", font=_load_font(12, bold=True), anchor="mm", fill="#ffffff", stroke_width=1, stroke_fill="#e87e20")
         cursor += bar_width + gap
 
 
-def _load_font(size: int, *, bold: bool = False) -> ImageFont.ImageFont:
-    candidates = [
-        Path("C:/Windows/Fonts/msyhbd.ttc" if bold else "C:/Windows/Fonts/msyh.ttc"),
-        Path("C:/Windows/Fonts/simhei.ttf"),
-        Path("C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf"),
-    ]
-    for path in candidates:
-        if path.exists():
-            return ImageFont.truetype(str(path), size=size)
-    return ImageFont.load_default()
+def latency_curve(window):
+    points = window.latency_points
+    if window.bucket_minutes <= 1:
+        return points
+    result = []
+    for bucket in window.buckets:
+        values = [p for p in points if bucket.start_at <= p["at"] < bucket.end_at]
+        if values:
+            result.append({"at": bucket.start_at + (bucket.end_at - bucket.start_at) / 2, "latency_ms": median(p["latency_ms"] for p in values),
+                           "model_switched": any(p["model_switched"] for p in values)})
+    return result
+
+
+def latency_outlier_indexes(points):
+    if len(points) < 5:
+        return set()
+    baseline = median(max(0, p["latency_ms"]) for p in points)
+    mad = median(abs(p["latency_ms"] - baseline) for p in points)
+    threshold = max(baseline * 1.8, baseline + 4 * mad)
+    return {i for i, point in enumerate(points) if point["latency_ms"] > threshold}
+
+
+def _draw_latency(draw, window, x, y, width, height):
+    points = latency_curve(window)
+    if not points or not window.buckets:
+        return
+    start, end = window.buckets[0].start_at, window.buckets[-1].end_at
+    raw = window.latency_points
+    outliers = latency_outlier_indexes(raw)
+    normal = [point for i, point in enumerate(raw) if i not in outliers] or raw
+    maximum = max(1, max(p["latency_ms"] for p in normal)) * 1.1
+    def position(point):
+        return (x + (point["at"] - start).total_seconds() / (end - start).total_seconds() * width,
+                y + height - min(max(0, point["latency_ms"]), maximum) / maximum * height)
+    coords = [position(point) for point in points]
+    if len(coords) > 1:
+        draw.line(coords, fill=draw.theme.primary, width=2)
+    for i, point in enumerate(raw):
+        if point["model_switched"] or i in outliers or len(raw) == 1:
+            px, py = position(point)
+            draw.ellipse((px - 2, py - 2, px + 2, py + 2), fill="#ef4444" if point["model_switched"] or i in outliers else draw.theme.primary)
+    draw.text((x + width + 18, y + 6), f"{maximum / 1000:.1f}s", font=_load_font(12), fill="#64748b")
 
 
 def _fit_text(text: str, font: ImageFont.ImageFont, max_width: int) -> str:

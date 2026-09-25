@@ -43,7 +43,8 @@ class CapturePostClient:
     def __init__(self):
         self.payload = None
 
-    async def post(self, url: str, json: dict, headers: dict):
+    async def post(self, url: str, json: dict, headers: dict, *, follow_redirects=False):
+        assert follow_redirects is False
         self.payload = json
         return httpx.Response(200, json={"choices": [{"message": {"content": "hi"}}]})
 

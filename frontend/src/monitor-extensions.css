@@ -1,0 +1,53 @@
+.monitor-extensions { margin: 24px 0; border-top: 1px solid var(--border, #39414c); padding-top: 20px; }
+.workspace > * { min-width: 0; }
+.extension-heading, .extension-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.extension-heading { justify-content: space-between; }
+.monitor-extensions details { padding: 16px 0; border-bottom: 1px solid var(--border, #39414c); }
+.monitor-extensions summary { cursor: pointer; font-weight: 600; }
+.monitor-extensions form { margin: 18px 0; }
+.extension-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 16px 0; }
+.extension-grid label { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.extension-grid input, .extension-grid textarea, .extension-grid select { width: 100%; min-width: 0; padding: 9px 12px; background: var(--bg, #171c23); color: inherit; border: 1px solid #505964; border-radius: 6px; }
+.extension-grid textarea { min-height: 72px; resize: vertical; }
+.extension-grid .extension-toggle, .extension-toggle { display: flex; flex-direction: row; align-items: center; gap: 8px; overflow-wrap: anywhere; }
+.extension-toggle input { width: 18px; height: 18px; flex-shrink: 0; }
+.monitor-extensions button, .extension-actions a { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 36px; padding: 7px 12px; }
+.extension-message { padding: 12px; border-left: 3px solid #71c4a1; overflow-wrap: anywhere; }
+.public-rules { display: grid; gap: 10px; margin: 18px 0; }
+.extension-table { overflow-x: auto; width: 100%; }
+.extension-table table { width: 100%; border-collapse: collapse; }
+.extension-table td, .extension-table th { text-align: left; padding: 12px; border-bottom: 1px solid #515861; font-size: 13px; }
+.extension-overlay { position: fixed; inset: 0; z-index: 100; background: #0009; display: grid; place-items: center; padding: 20px; }
+.extension-detail { background: #1c232b; color: #f0f3f5; width: min(780px, 100%); max-height: 85vh; overflow: auto; padding: 24px; border-radius: 8px; overflow-wrap: anywhere; }
+.extension-detail > button { float: right; }
+.extension-detail p { white-space: pre-wrap; }
+.public-monitor { max-width: 1440px; margin: 0 auto; padding: 32px 24px; }
+.public-monitor h1 { font-size: 28px; }
+.public-monitor section { padding: 24px 0; }
+.public-state.normal { color: #65d4a5; }
+.public-state.error { color: #ff8b91; }
+.public-state.stale { color: #ebc977; }
+.public-state.paused { color: #b1bac5; }
+.monitor-latency { grid-column: 2; width: 100%; height: 44px; color: #65bca9; overflow: visible; }
+.status-segment.timeout { background: #facc15 !important; color: white; font-size: 10px; font-weight: 700; text-align: center; line-height: 14px; text-shadow: -1px 0 #e87e20, 0 1px #e87e20, 1px 0 #e87e20, 0 -1px #e87e20; }
+.probe-settings { margin-top: 8px; min-width: 160px; font-size: 12px; }
+.probe-settings summary { cursor: pointer; }
+.probe-settings form { display: grid; gap: 10px; padding-top: 10px; max-width: 230px; white-space: normal; }
+.probe-settings label { display: grid; gap: 5px; }
+.probe-settings input, .probe-settings select { min-width: 0; width: 100%; }
+.probe-settings .extension-toggle { display: flex; }
+.probe-settings .extension-toggle input { width: 18px; }
+@media (max-width: 680px) {
+  .extension-grid { grid-template-columns: minmax(0, 1fr); }
+  .public-monitor { padding: 20px 12px; }
+  .extension-detail { padding: 16px; }
+  .monitor-latency { grid-column: 1 / -1; }
+  .status-window-row .status-strip { grid-auto-columns: minmax(2px, 1fr); gap: 2px; }
+  .public-monitor .extension-table table { min-width: 0; display: block; }
+  .public-monitor thead { display: none; }
+  .public-monitor tbody { display: block; }
+  .public-monitor tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); padding-bottom: 16px; }
+  .public-monitor td { display: block; min-width: 0; overflow-wrap: anywhere; }
+  .public-monitor td:nth-child(1), .public-monitor td:nth-child(4), .public-monitor td:nth-child(5) { grid-column: 1 / -1; }
+  .public-monitor td[data-label]::before { content: attr(data-label); display: block; margin-bottom: 6px; color: #a7b4c8; font-size: 12px; }
+}

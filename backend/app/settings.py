@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     recovery_confirm_checks: int = 2
     command_check_cooldown_seconds: int = 300
     checker_enabled: bool = True
+    hide_status_targets: bool = True
 
     status_snapshot_url: str = "https://status.gptstore.club/"
     status_snapshot_browser_path: str = ""

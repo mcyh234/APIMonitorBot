@@ -3,12 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageDraw, ImageFont
 
 from backend.app.time_utils import coerce_aware_utc, utc_now
+from backend.app.material_theme import material_canvas, load_font as _load_font
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,8 +33,7 @@ def render_check_result_image(
     footer_height = 34
     height = header_height + max(1, len(rows)) * row_height + footer_height
 
-    image = Image.new("RGB", (width, height), "#f8fafc")
-    draw = ImageDraw.Draw(image)
+    image, draw = material_canvas((width, height), generated_at)
     font_title = _load_font(32, bold=True)
     font_heading = _load_font(21, bold=True)
     font_regular = _load_font(17)
@@ -45,15 +44,15 @@ def render_check_result_image(
     down_count = len(rows) - ok_count
 
     draw.rectangle((0, 0, width, 94), fill="#0f172a")
-    draw.text((30, 20), "APIMonitorBot API 检查结果", fill="#f8fafc", font=font_title)
+    draw.text((30, 20), "APIMonitorBot API 检查结果", fill=draw.theme.on_primary_container, font=font_title)
     draw.text(
         (30, 64),
         f"生成时间 {now:%Y-%m-%d %H:%M:%S} {timezone_name}",
-        fill="#cbd5e1",
+        fill=draw.theme.on_primary_container,
         font=font_tiny,
     )
     summary = f"共 {len(rows)} 个 · 可用 {ok_count} 个 · 不可用 {down_count} 个"
-    draw.text((width - _text_width(summary, font_regular) - 30, 36), summary, fill="#e2e8f0", font=font_regular)
+    draw.text((width - _text_width(summary, font_small) - 30, 68), summary, fill=draw.theme.on_primary_container, font=font_small)
 
     y = header_height
     if not rows:
@@ -96,15 +95,15 @@ def _draw_row(
     draw.rounded_rectangle((pill_x, y + 18, pill_x + 116, y + 48), radius=15, fill=soft_color)
     _draw_text_centered(draw, (pill_x, y + 18, pill_x + 116, y + 48), status_text, font_small, fill=text_color)
 
-    code_text = f"状态码 {row.code or 'UNKNOWN'}"
-    draw.text((x + 550, y + 22), code_text, fill="#334155", font=font_regular)
+    code_text = _fit_text(f"状态码 {row.code or 'UNKNOWN'}", font_small, 180)
+    draw.text((x + 22, y + 43), code_text, fill="#334155", font=font_small)
 
     rate_text = f"最近请求成功率 {row.success_rate:.1f}%"
     draw.text((x + width - _text_width(rate_text, font_regular) - 22, y + 22), rate_text, fill="#0f172a", font=font_regular)
 
     if row.latency_ms is not None:
         latency_text = f"{row.latency_ms} ms"
-        draw.text((x + 22, y + 45), latency_text, fill="#94a3b8", font=font_small)
+        draw.text((x + 225, y + 43), latency_text, fill="#94a3b8", font=font_small)
 
 
 def _draw_text_centered(
@@ -122,18 +121,6 @@ def _draw_text_centered(
     x = left + (right - left - text_width) / 2 - bbox[0]
     y = top + (bottom - top - text_height) / 2 - bbox[1]
     draw.text((int(round(x)), int(round(y))), text, fill=fill, font=font)
-
-
-def _load_font(size: int, *, bold: bool = False) -> ImageFont.ImageFont:
-    candidates = [
-        Path("C:/Windows/Fonts/msyhbd.ttc" if bold else "C:/Windows/Fonts/msyh.ttc"),
-        Path("C:/Windows/Fonts/simhei.ttf"),
-        Path("C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf"),
-    ]
-    for path in candidates:
-        if path.exists():
-            return ImageFont.truetype(str(path), size=size)
-    return ImageFont.load_default()
 
 
 def _fit_text(text: str, font: ImageFont.ImageFont, max_width: int) -> str:

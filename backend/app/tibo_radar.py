@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from datetime import datetime
 import html
 from io import BytesIO
-from pathlib import Path
 import re
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -12,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+from backend.app.material_theme import material_canvas, load_font as _font
 
 
 class TiboRadarError(RuntimeError):
@@ -282,7 +282,7 @@ def parse_tibo_presence(raw: dict[str, Any]) -> TiboPresence:
     )
 
 
-def render_tibo_radar_image(report: TiboRadarReport) -> bytes:
+def render_tibo_radar_image(report: TiboRadarReport, *, generated_at: datetime | None = None) -> bytes:
     width = 1600
     left, right = 84, 1516
     main_width = 950
@@ -319,8 +319,7 @@ def render_tibo_radar_image(report: TiboRadarReport) -> bytes:
         content_bottom += 34 + _comments_block_height(comment_lines)
     height = max(1080, content_bottom + 150)
 
-    image = Image.new("RGB", (width, height), "#ffffff")
-    draw = ImageDraw.Draw(image)
+    image, draw = material_canvas((width, height), generated_at)
     _dashed_rectangle(draw, (left, 42, right, height - 42), fill="#94a3b8", width=2, dash=14, gap=10)
     draw.text((main_x, 76), "TIBO RADAR  /  X POST", fill="#0f172a", font=title_font)
     draw.text((main_x, 132), "最新公开帖子与粗粒度动态雷达", fill="#64748b", font=body_font)
@@ -492,7 +491,7 @@ def _draw_avatar(image, draw, avatar, x, y, size, font) -> None:
         except Exception:
             pass
     draw.ellipse((x, y, x + size, y + size), fill="#0f172a")
-    draw.text((x + size // 2, y + size // 2), "T", fill="#ffffff", font=font, anchor="mm")
+    draw.text((x + size // 2, y + size // 2), "T", fill=draw.theme.on_primary_container, font=font, anchor="mm")
 
 
 _SENSITIVE_COMMENT_TERMS = (
@@ -636,18 +635,6 @@ def _integer(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-def _font(size: int, *, bold: bool = False) -> ImageFont.ImageFont:
-    candidates = (
-        Path("C:/Windows/Fonts/msyhbd.ttc" if bold else "C:/Windows/Fonts/msyh.ttc"),
-        Path("C:/Windows/Fonts/simhei.ttf"),
-        Path("C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf"),
-    )
-    for path in candidates:
-        if path.exists():
-            return ImageFont.truetype(str(path), size=size)
-    return ImageFont.load_default()
 
 
 def _text_width(text: str, font: ImageFont.ImageFont) -> int:

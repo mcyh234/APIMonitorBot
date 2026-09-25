@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -84,9 +85,40 @@ class ApiProbe:
         self.verify_ssl = False
         self._client = client
 
-    async def probe(self, base_url: str, api_key: str, model_name: str) -> CheckResult:
+    async def probe(self, base_url: str, api_key: str, model_name: str, *, protocol: str = "auto", verify_tls: bool = False) -> CheckResult:
+        if protocol not in {"auto", "openai", "anthropic"}:
+            return CheckResult(ok=False, code="INVALID_PROTOCOL")
+        try:
+            parsed = urlsplit(base_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise ValueError("Invalid BaseURL")
+            path = parsed.path.rstrip("/").lower()
+        except ValueError as exc:
+            return CheckResult(ok=False, code="INVALID_BASE_URL", error=str(exc))
+        inferred = protocol == "auto" and not path.endswith(("/messages", "/chat/completions"))
+        if protocol == "auto":
+            if path.endswith("/messages"):
+                protocol = "anthropic"
+            elif path.endswith("/chat/completions"):
+                protocol = "openai"
+            else:
+                protocol = "anthropic" if any(part in model_name.lower() for part in ("claude", "sonnet", "opus", "haiku", "anthropic")) or urlsplit(base_url).hostname == "api.anthropic.com" else "openai"
+        result = await self._probe_protocol(base_url, api_key, model_name, protocol, verify_tls)
+        if inferred and protocol == "anthropic" and result.code in {"404", "405"}:
+            return await self._probe_protocol(base_url, api_key, model_name, "openai", verify_tls)
+        return result
+
+    async def _probe_protocol(self, base_url: str, api_key: str, model_name: str, protocol: str, verify_tls: bool) -> CheckResult:
         try:
             url = normalize_chat_completions_url(base_url)
+            if protocol == "anthropic":
+                parts = urlsplit(base_url.strip())
+                path = parts.path.rstrip("/")
+                if not path.endswith("/messages"):
+                    path += "/messages" if path.endswith("/v1") else "/v1/messages"
+                url = urlunsplit(parts._replace(path=path))
+            if urlsplit(url).scheme not in {"http", "https"} or not urlsplit(url).hostname:
+                raise ValueError("Invalid BaseURL")
         except ValueError as exc:
             return CheckResult(ok=False, code="INVALID_BASE_URL", error=str(exc))
 
@@ -99,15 +131,22 @@ class ApiProbe:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
+        if protocol == "anthropic":
+            payload.pop("temperature")
+            payload.update(max_tokens=1, stream=False)
+            headers.pop("Authorization")
+            headers.update({"x-api-key": api_key, "anthropic-version": "2023-06-01"})
         start = time.perf_counter()
         try:
             if self._client is not None:
-                response = await self._client.post(url, json=payload, headers=headers)
+                response = await self._client.post(url, json=payload, headers=headers, follow_redirects=False)
             else:
-                async with httpx.AsyncClient(timeout=self.timeout_seconds, verify=self.verify_ssl) as client:
+                async with httpx.AsyncClient(timeout=self.timeout_seconds, verify=verify_tls, follow_redirects=False) as client:
                     response = await client.post(url, json=payload, headers=headers)
         except httpx.TimeoutException as exc:
-            return CheckResult(ok=False, code="TIMEOUT", error=str(exc) or "Request timed out.")
+            return CheckResult(ok=False, code="TIMEOUT", error=str(exc) or "Request timed out.", latency_ms=int((time.perf_counter() - start) * 1000))
+        except httpx.InvalidURL as exc:
+            return CheckResult(ok=False, code="INVALID_BASE_URL", error=str(exc))
         except httpx.RequestError as exc:
             return CheckResult(ok=False, code="NETWORK_ERROR", error=str(exc))
 
@@ -126,6 +165,9 @@ class ApiProbe:
             return CheckResult(ok=False, code="INVALID_JSON", error="Response is not JSON.", latency_ms=latency_ms)
 
         content = assistant_content_from_response(data)
+        if protocol == "anthropic":
+            blocks = data.get("content", [])
+            content = "".join(part.get("text", "") for part in blocks if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)).strip() if isinstance(blocks, list) else ""
         if not content:
             return CheckResult(
                 ok=False,

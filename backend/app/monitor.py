@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.availability import ApiProbe, CheckResult, InternetConnectivityProbe
 from backend.app.crypto import SecretBox
-from backend.app.models import APIConfig, CheckRecord, Sub2Config
+from backend.app.models import APIConfig, CheckRecord, Sub2Config, ProbeObservation
 from backend.app.notifier import Notifier, NotifyTarget
 from backend.app.repository import target_entries, today_availability
 from backend.app.settings import Settings
@@ -21,6 +21,7 @@ from backend.app.sub2_rates import Sub2RateChange, stored_sub2_rate_views, sync_
 from backend.app.sub2_sentiment import sentiment_summary
 from backend.app.sub2api import Sub2ApiClient, Sub2ApiError, format_rate, platform_label
 from backend.app.time_utils import coerce_aware_utc, utc_now
+from backend.app.app_settings import get_app_setting, set_app_setting
 
 logger = logging.getLogger(__name__)
 IGNORED_SCHEDULED_CODES = {"TIMEOUT", "NETWORK_ERROR"}
@@ -105,6 +106,14 @@ class MonitorService:
         self._lock = asyncio.Lock()
         self._last_scheduled_run_at: datetime | None = None
         self._last_internet_disconnect_notified_at: datetime | None = None
+        self._config_locks: dict[int, asyncio.Lock] = {}
+        self._last_sub2_run_at: datetime | None = None
+
+    async def _probe_config(self, config: APIConfig, api_key: str, model: str) -> CheckResult:
+        if isinstance(self.probe, ApiProbe):
+            self.probe.timeout_seconds = self.settings.request_timeout_seconds
+            return await self.probe.probe(config.base_url, api_key, model, protocol=config.protocol or "auto", verify_tls=bool(config.verify_tls))
+        return await self.probe.probe(config.base_url, api_key, model)
 
     def should_run_scheduled(self, at: datetime | None = None) -> bool:
         now = at or utc_now()
@@ -155,12 +164,15 @@ class MonitorService:
         config: APIConfig,
         api_key: str,
         failed_result: CheckResult,
+        timeout_results: list[CheckResult] | None = None,
     ) -> CheckResult | None:
         if not self._should_try_model_fallback(failed_result):
             return None
         old_model = config.model_name
         for candidate in self._fallback_model_candidates(old_model):
-            result = await self.probe.probe(config.base_url, api_key, candidate)
+            result = await self._probe_config(config, api_key, candidate)
+            if result.code == "TIMEOUT" and timeout_results is not None:
+                timeout_results.append(result)
             if not result.ok:
                 continue
             config.model_name = candidate
@@ -181,6 +193,17 @@ class MonitorService:
         return None
 
     async def check_config(
+        self, session: Session, config: APIConfig, scheduled: bool, notify: bool,
+        *, notify_timeouts: bool | None = None,
+    ) -> CheckResult:
+        lock = self._config_locks.setdefault(config.id, asyncio.Lock())
+        if lock.locked():
+            return CheckResult(ok=False, code="CHECK_IN_PROGRESS", error="该配置正在检查中。")
+        async with lock:
+            session.refresh(config)
+            return await self._check_config(session, config, scheduled, notify, notify_timeouts=notify_timeouts)
+
+    async def _check_config(
         self,
         session: Session,
         config: APIConfig,
@@ -192,20 +215,26 @@ class MonitorService:
         if notify_timeouts is None:
             notify_timeouts = notify
         api_key = self.secret_box.decrypt(config.api_key_encrypted)
-        result = await self.probe.probe(config.base_url, api_key, config.model_name)
+        result = await self._probe_config(config, api_key, config.model_name)
+        timeout_results = [result] if result.code == "TIMEOUT" else []
         if scheduled and not result.ok:
             await asyncio.sleep(self.settings.check_retry_delay_seconds)
-            retry = await self.probe.probe(config.base_url, api_key, config.model_name)
+            retry = await self._probe_config(config, api_key, config.model_name)
+            if retry.code == "TIMEOUT":
+                timeout_results.append(retry)
             if retry.ok:
                 result = retry
             else:
                 result = retry
 
         if scheduled and not result.ok:
-            fallback = await self._try_model_fallback(session, config, api_key, result)
+            fallback = await self._try_model_fallback(session, config, api_key, result, timeout_results)
             if fallback is not None:
                 result = fallback
 
+        if scheduled and timeout_results:
+            session.add(ProbeObservation(api_config_id=config.id, latency_ms=timeout_results[0].latency_ms))
+            session.commit()
         if scheduled and result.code in IGNORED_SCHEDULED_CODES:
             await self._handle_ignored_scheduled_result(config, result, notify_timeouts)
             return result
@@ -220,14 +249,25 @@ class MonitorService:
         if self._lock.locked():
             return
         async with self._lock:
-            with session_factory() as session:
-                await self._run_sub2_scheduled(session)
+            if self._last_scheduled_run_at is None:
+                with session_factory() as session:
+                    previous = get_app_setting(session, "monitor.last_scheduled_run_at")
+                    if previous:
+                        try:
+                            self._last_scheduled_run_at = coerce_aware_utc(datetime.fromisoformat(previous))
+                        except ValueError:
+                            pass
+            if self._last_sub2_run_at is None or (now - self._last_sub2_run_at).total_seconds() >= 60:
+                self._last_sub2_run_at = now
+                with session_factory() as session:
+                    await self._run_sub2_scheduled(session)
 
             now = utc_now()
-            if not self.should_run_scheduled(now):
+            if not self.settings.checker_enabled or not self.should_run_scheduled(now):
                 return
             self._last_scheduled_run_at = now
             with session_factory() as session:
+                set_app_setting(session, "monitor.last_scheduled_run_at", now.isoformat())
                 configs = list(session.scalars(select(APIConfig).where(APIConfig.enabled.is_(True))).all())
                 events: list[NotificationEvent] = []
                 for config in configs:
@@ -239,7 +279,7 @@ class MonitorService:
                             notify=False,
                             notify_timeouts=True,
                         )
-                        if result.code not in IGNORED_SCHEDULED_CODES and not result.model_switched:
+                        if result.code not in IGNORED_SCHEDULED_CODES | {"CHECK_IN_PROGRESS"} and not result.model_switched:
                             event = self._notification_event(session, config, result)
                             if event is not None:
                                 events.extend(self._expand_event_targets(config, event))
@@ -260,6 +300,14 @@ class MonitorService:
                 config.last_checked_at = utc_now()
                 config.last_error = None
                 session.commit()
+                from backend.app.monitor_extensions import read_public_settings, save_public_catalog
+                public = read_public_settings(session)
+                if public.enabled and any(rule.config_id == config.id and rule.visible for rule in public.rules) and config.upstream_type != "newapi":
+                    try:
+                        catalog = await self.sub2_client.fetch_available_catalog_with_cached_token(session, config, self.secret_box)
+                        save_public_catalog(session, config.id, catalog)
+                    except Sub2ApiError:
+                        pass
                 if changes:
                     rate_views = stored_sub2_rate_views(session, config)
                     image = render_sub2_price_image(
@@ -306,6 +354,7 @@ class MonitorService:
             error=result.error,
             latency_ms=result.latency_ms,
             scheduled=scheduled,
+            model_switched=result.model_switched,
         )
         session.add(record)
         config.status = status

@@ -19,6 +19,7 @@ from backend.app.monitor import MonitorService
 from backend.app.repository import (
     config_to_out,
     create_api_config,
+    delete_api_config,
     format_target,
     storage_target,
     today_availability,
@@ -299,7 +300,7 @@ async def add_config(
     secret_box: SecretBox = Depends(get_secret_box),
 ) -> APIConfigOut:
     probe = ApiProbe(timeout_seconds=settings.request_timeout_seconds)
-    result = await probe.probe(data.base_url, data.api_key, data.model_name)
+    result = await probe.probe(data.base_url, data.api_key, data.model_name, protocol=data.protocol, verify_tls=data.verify_tls)
     if not result.ok:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -341,6 +342,10 @@ def update_config(
         config.model_name = data.model_name.strip()
     if data.enabled is not None:
         config.enabled = data.enabled
+    if data.protocol is not None:
+        config.protocol = data.protocol
+    if data.verify_tls is not None:
+        config.verify_tls = data.verify_tls
     try:
         session.commit()
     except IntegrityError as exc:
@@ -352,8 +357,7 @@ def update_config(
 
 @api_router.delete("/configs/{name}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_config(name: str, session: Session = Depends(get_session)) -> Response:
-    deleted = session.execute(delete(APIConfig).where(APIConfig.name == name)).rowcount
-    session.commit()
+    deleted = delete_api_config(session, name)
     if not deleted:
         raise HTTPException(status_code=404, detail="配置不存在。")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -430,6 +434,7 @@ def status_bars_to_out(item: ConfigStatusBarsData) -> ConfigStatusBarsOut:
                 key=window.key,
                 label=window.label,
                 bucket_minutes=window.bucket_minutes,
+                latency_points=window.latency_points,
                 buckets=[
                     StatusBucketOut(
                         start_at=api_datetime(bucket.start_at),
@@ -438,6 +443,8 @@ def status_bars_to_out(item: ConfigStatusBarsData) -> ConfigStatusBarsOut:
                         ok_count=bucket.ok_count,
                         down_count=bucket.down_count,
                         total_count=bucket.total_count,
+                        timeout=bucket.timeout,
+                        timeout_count=bucket.timeout_count,
                     )
                     for bucket in window.buckets
                 ],

@@ -51,6 +51,15 @@ def _ensure_schema_compatibility() -> None:
         return
     inspector = inspect(engine)
     with engine.begin() as connection:
+        for table, additions in {
+            "api_configs": {"protocol": "VARCHAR(16) NOT NULL DEFAULT 'auto'", "verify_tls": "BOOLEAN NOT NULL DEFAULT 0"},
+            "check_records": {"model_switched": "BOOLEAN NOT NULL DEFAULT 0"},
+        }.items():
+            if table in inspector.get_table_names():
+                columns = {column["name"] for column in inspector.get_columns(table)}
+                for name, definition in additions.items():
+                    if name not in columns:
+                        connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {definition}"))
         if "bot_command_settings" in inspector.get_table_names():
             columns = {column["name"] for column in inspector.get_columns("bot_command_settings")}
             if "aliases" not in columns:

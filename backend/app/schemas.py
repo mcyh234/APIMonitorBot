@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -12,6 +13,8 @@ class APIConfigCreate(BaseModel):
     api_key: str = Field(min_length=1)
     model_name: str = Field(min_length=1, max_length=160)
     enabled: bool = True
+    protocol: Literal["auto", "openai", "anthropic"] = "auto"
+    verify_tls: bool = False
 
 
 class APIConfigUpdate(BaseModel):
@@ -21,6 +24,8 @@ class APIConfigUpdate(BaseModel):
     api_key: str | None = Field(default=None, min_length=1)
     model_name: str | None = Field(default=None, min_length=1, max_length=160)
     enabled: bool | None = None
+    protocol: Literal["auto", "openai", "anthropic"] | None = None
+    verify_tls: bool | None = None
 
 
 class APIConfigOut(BaseModel):
@@ -32,6 +37,8 @@ class APIConfigOut(BaseModel):
     base_url: str
     model_name: str
     enabled: bool
+    protocol: str = "auto"
+    verify_tls: bool = False
     status: str
     last_code: str | None
     last_error: str | None
@@ -59,6 +66,15 @@ class StatusBucketOut(BaseModel):
     ok_count: int
     down_count: int
     total_count: int
+    timeout: bool = False
+    timeout_count: int = 0
+
+
+class LatencyPointOut(BaseModel):
+    at: datetime
+    latency_ms: int
+    model_switched: bool = False
+    code: str | None = None
 
 
 class StatusWindowOut(BaseModel):
@@ -66,6 +82,7 @@ class StatusWindowOut(BaseModel):
     label: str
     bucket_minutes: int
     buckets: list[StatusBucketOut]
+    latency_points: list[LatencyPointOut] = Field(default_factory=list)
 
 
 class ConfigStatusBarsOut(BaseModel):

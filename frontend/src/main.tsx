@@ -1,5 +1,6 @@
 import React, { FormEvent, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { MonitorExtensions, PublicStatusPage, ProbeSettings, LatencyChart, showTimeout, type LatencyPoint } from "./monitor-extensions";
 import {
   Activity,
   BarChart3,
@@ -46,6 +47,8 @@ type ApiConfig = {
   target: string;
   base_url: string;
   model_name: string;
+  protocol?: string;
+  verify_tls?: boolean;
   enabled: boolean;
   status: string;
   last_code: string | null;
@@ -170,6 +173,8 @@ type StatusBucket = {
   ok_count: number;
   down_count: number;
   total_count: number;
+  timeout?: boolean;
+  timeout_count?: number;
 };
 
 type StatusWindow = {
@@ -177,6 +182,7 @@ type StatusWindow = {
   label: string;
   bucket_minutes: number;
   buckets: StatusBucket[];
+  latency_points?: LatencyPoint[];
 };
 
 type ConfigStatusBars = {
@@ -262,6 +268,8 @@ type ConfigForm = {
   base_url: string;
   api_key: string;
   model_name: string;
+  protocol: string;
+  verify_tls: boolean;
 };
 
 const emptyForm: ConfigForm = {
@@ -269,7 +277,9 @@ const emptyForm: ConfigForm = {
   target: "",
   base_url: "",
   api_key: "",
-  model_name: ""
+  model_name: "",
+  protocol: "auto",
+  verify_tls: false
 };
 
 const HISTORY_LIMIT = 60;
@@ -1199,6 +1209,7 @@ function App() {
                             <Pencil size={14} />
                           </button>
                         </div>
+                        <ProbeSettings config={config} request={requestJson} onSaved={loadAll} />
                       </td>
                       <td>
                         <span className={statusClass(config.status)}>{statusLabel(config.status)}</span>
@@ -1249,6 +1260,8 @@ function App() {
                 <Field label="BaseURL" value={form.base_url} placeholder="https://example.com/v1" onChange={(base_url) => setForm({ ...form, base_url })} required />
                 <Field label="APIKey" value={form.api_key} type="password" onChange={(api_key) => setForm({ ...form, api_key })} required />
                 <Field label="模型名称" value={form.model_name} placeholder="gpt-4.1-mini" onChange={(model_name) => setForm({ ...form, model_name })} required />
+                <label className="field">探测协议<select value={form.protocol} onChange={e => setForm({ ...form, protocol: e.target.value })}><option value="auto">自动识别</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic / Claude</option></select></label>
+                <label><input type="checkbox" checked={form.verify_tls} onChange={e => setForm({ ...form, verify_tls: e.target.checked })} />校验 TLS 证书</label>
                 <button className="primary" disabled={busy === "add-config"} type="submit">
                   <KeyRound size={16} />
                   验证并添加
@@ -1340,13 +1353,14 @@ function App() {
                     <div className="status-strip" aria-label={`${item.config_name} ${windowItem.label} 状态条`}>
                       {windowItem.buckets.map((bucket, index) => (
                         <span
-                          className={`status-segment ${bucket.state}`}
+                          className={`status-segment ${bucket.timeout && showTimeout(windowItem) ? "timeout" : bucket.state}`}
                           key={`${windowItem.key}-${index}`}
-                          title={`${formatTime(bucket.start_at, displayTimeZone)} - ${formatTime(bucket.end_at, displayTimeZone)} · ${statusBucketLabel(bucket.state)} · ${bucket.total_count} 次`}
-                        />
+                          title={`${formatTime(bucket.start_at, displayTimeZone)} - ${formatTime(bucket.end_at, displayTimeZone)} · ${statusBucketLabel(bucket.state)} · ${bucket.total_count} 次 · 超时 ${bucket.timeout_count || 0} 次`}
+                        >{bucket.timeout && showTimeout(windowItem) ? "?" : null}</span>
                       ))}
                     </div>
                     <span className="status-window-meta">{windowItem.bucket_minutes} 分/格</span>
+                    <LatencyChart window={windowItem} />
                   </div>
                 ))}
               </div>
@@ -1360,6 +1374,8 @@ function App() {
           <span><i className="status-dot down" />不可用</span>
         </div>
       </section>
+
+      <MonitorExtensions request={requestJson} />
 
       <Sub2PriceSection
         boards={sub2Prices}
@@ -2372,6 +2388,6 @@ function Field({
 
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <App />
+    {window.location.pathname === "/status" ? <PublicStatusPage /> : <App />}
   </React.StrictMode>
 );
