@@ -156,7 +156,7 @@ def parse_timeline_posts(content: bytes, username: str = "thsottiaux") -> list[d
             continue
         posts.append({"id": match.group(2), "text": plain_html(body),
                       "created_at": item.findtext("pubDate") or item.findtext(f"{atom}published") or item.findtext(f"{atom}updated"),
-                      "author": {"screen_name": match.group(1), "name": "Tibo"}})
+                      "author": {"screen_name": match.group(1), "name": "Tibo" if username.casefold() == "thsottiaux" else username}})
     return posts_from_json(posts, username)
 
 

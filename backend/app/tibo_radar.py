@@ -14,6 +14,7 @@ import httpx
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from backend.app.material_theme import material_canvas, load_font as _font
 from backend.app.time_utils import utc_now
+from backend.app.news_accounts import account_name, normalize_username
 from backend.app.x_timeline import TimelineError, posts_from_json, parse_timeline_posts, post_datetime
 
 
@@ -79,19 +80,31 @@ class TiboRadarClient:
         *,
         bearer_token: str = "",
         timezone_name: str = "Asia/Shanghai",
+        username: str = TIBO_USERNAME,
     ) -> None:
         # Old installations used the regional summary URL as the source.
         # Migrate that default without reading its contents or old post links.
         source_url = source_url.strip()
         if source_url.rstrip("/") == "https://codexradar.com/current.json":
             source_url = ""
-        self.source_url = source_url.strip() or DEFAULT_TIMELINE_URL
-        self._source_urls = (source_url.strip(),) if source_url.strip() else (DEFAULT_TIMELINE_URL, FALLBACK_TIMELINE_URL)
+        self.username = normalize_username(username)
+        self._configured_source = source_url
+        defaults = tuple(f"https://{host}/{self.username}/feed.xml?count=30&with_replies=1" for host in ("fxtwitter.com", "fixupx.com"))
+        self.source_url = source_url.replace("{username}", self.username) if source_url else defaults[0]
+        self._source_urls = (self.source_url,) if source_url else defaults
         self.timeout_seconds = timeout_seconds
         self._client = client
         self._bearer_token = bearer_token.strip()
         self.timezone = timezone_name
         self._x_user: dict | None = None
+
+    def for_account(self, username: str) -> TiboRadarClient:
+        username = normalize_username(username)
+        source = self._configured_source if username == self.username else ""
+        if "{username}" in self._configured_source:
+            source = self._configured_source.replace("{username}", username)
+        return TiboRadarClient(source, self.timeout_seconds, self._client, bearer_token=self._bearer_token,
+                               timezone_name=self.timezone, username=username)
 
     async def fetch(self) -> TiboRadarReport:
         posts = await self.fetch_posts()
@@ -116,7 +129,7 @@ class TiboRadarClient:
                     response = await self._get(source_url, accept="application/rss+xml, application/atom+xml, application/json, text/html")
                     if response.status_code >= 400:
                         raise TiboRadarError(f"X 时间线请求失败：HTTP {response.status_code}")
-                    latest = parse_timeline_posts(response.content, TIBO_USERNAME)
+                    latest = parse_timeline_posts(response.content, self.username)
                     break
                 except (httpx.RequestError, TimelineError, TiboRadarError) as exc:
                     failure = exc
@@ -127,9 +140,9 @@ class TiboRadarClient:
 
     async def _fetch_api_timeline(self) -> list[dict]:
         if self._x_user is None:
-            payload = await self._json(f"https://api.x.com/2/users/by/username/{TIBO_USERNAME}?user.fields=profile_image_url", "X 用户", authenticated=True)
+            payload = await self._json(f"https://api.x.com/2/users/by/username/{self.username}?user.fields=profile_image_url", "X 用户", authenticated=True)
             user = payload.get("data") if isinstance(payload, dict) else None
-            if not isinstance(user, dict) or not str(user.get("id", "")).isdigit() or str(user.get("username", "")).casefold() != TIBO_USERNAME:
+            if not isinstance(user, dict) or not str(user.get("id", "")).isdigit() or str(user.get("username", "")).casefold() != self.username:
                 raise TiboRadarError("X 用户响应无效。")
             self._x_user = user
         query = urlencode({"max_results": 10, "exclude": "retweets",
@@ -146,7 +159,7 @@ class TiboRadarClient:
             raise TiboRadarError("X API 时间线用户信息无效。")
         includes.setdefault("users", []).append(self._x_user)
         try:
-            latest = posts_from_json(payload, TIBO_USERNAME)
+            latest = posts_from_json(payload, self.username)
         except (TimelineError, TypeError, AttributeError) as exc:
             raise TiboRadarError("X API 时间线中没有可读取的最新帖子。") from exc
         for post in latest:
@@ -176,7 +189,7 @@ class TiboRadarClient:
         comments = await self._extract_comments(raw)
         return TiboPost(
             source_url=source_url,
-            author_name=str(author.get("name") or "Tibo"),
+            author_name=account_name(username) if not author.get("name") or str(author["name"]).casefold() == username.casefold() else str(author["name"]),
             username=username,
             text=text,
             translated_zh=translated,
@@ -383,28 +396,14 @@ def render_tibo_radar_image(report: TiboRadarReport, *, generated_at: datetime |
 
     image, draw = material_canvas((width, height), generated_at)
     _dashed_rectangle(draw, (left, 42, right, height - 42), fill="#94a3b8", width=2, dash=14, gap=10)
-    draw.text((main_x, 76), "TIBO RADAR  /  X POST", fill="#0f172a", font=title_font)
-    draw.text((main_x, 132), "@thsottiaux 最新公开帖子 · 原文与中文翻译", fill="#64748b", font=body_font)
+    title = "TIBO RADAR" if report.post.username.casefold() == TIBO_USERNAME else "AI NEWS"
+    draw.text((main_x, 76), f"{title}  /  X POST", fill="#0f172a", font=title_font)
+    draw.text((main_x, 132), f"@{report.post.username} 公开帖子 · 原文与中文翻译", fill="#64748b", font=body_font)
     draw.line((main_x, 184, right - 42, 184), fill="#e2e8f0", width=2)
 
     avatar_x, avatar_y = main_x, 220
-    _draw_avatar(image, draw, report.post.avatar, avatar_x, avatar_y, 72, body_bold)
+    _draw_avatar(image, draw, report.post.avatar, avatar_x, avatar_y, 72, body_bold, report.post.author_name[:1])
     draw.text((avatar_x + 92, avatar_y + 4), report.post.author_name, fill="#0f172a", font=body_bold)
-    verified_x = avatar_x + 92 + _text_width(report.post.author_name, body_bold) + 12
-    draw.ellipse((verified_x, avatar_y + 8, verified_x + 22, avatar_y + 30), fill="#1d9bf0")
-    draw.line(
-        (
-            verified_x + 5,
-            avatar_y + 19,
-            verified_x + 9,
-            avatar_y + 23,
-            verified_x + 17,
-            avatar_y + 14,
-        ),
-        fill="#ffffff",
-        width=2,
-        joint="curve",
-    )
     draw.text((avatar_x + 92, avatar_y + 40), f"@{report.post.username}", fill="#536471", font=small_font)
     date_text = _display_time(report.post.created_at, report.timezone)
     if date_text:
@@ -450,7 +449,7 @@ def render_tibo_radar_image(report: TiboRadarReport, *, generated_at: datetime |
         )
 
     draw.text((main_x, height - 94), f"原帖：{report.post.source_url}", fill="#64748b", font=small_font)
-    draw.text((main_x, height - 66), f"数据来源：X / @{TIBO_USERNAME} · 抓取时间：{_display_time(report.monitored_at, report.timezone)}", fill="#94a3b8", font=tiny_font)
+    draw.text((main_x, height - 66), f"数据来源：X / @{report.post.username} · 抓取时间：{_display_time(report.monitored_at, report.timezone)}", fill="#94a3b8", font=tiny_font)
 
     buffer = BytesIO()
     image.save(buffer, format="PNG", optimize=True)
@@ -518,7 +517,7 @@ def _comments_block_height(comments: list[tuple[TiboComment, list[str], list[str
     )
 
 
-def _draw_avatar(image, draw, avatar, x, y, size, font) -> None:
+def _draw_avatar(image, draw, avatar, x, y, size, font, initial="T") -> None:
     if avatar:
         try:
             source = Image.open(BytesIO(avatar)).convert("RGB")
@@ -530,7 +529,7 @@ def _draw_avatar(image, draw, avatar, x, y, size, font) -> None:
         except Exception:
             pass
     draw.ellipse((x, y, x + size, y + size), fill="#0f172a")
-    draw.text((x + size // 2, y + size // 2), "T", fill=draw.theme.on_primary_container, font=font, anchor="mm")
+    draw.text((x + size // 2, y + size // 2), initial, fill=draw.theme.on_primary_container, font=font, anchor="mm")
 
 
 _SENSITIVE_COMMENT_TERMS = (

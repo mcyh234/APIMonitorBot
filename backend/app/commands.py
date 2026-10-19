@@ -182,8 +182,8 @@ class CommandRouter:
             return await self._radar(session, incoming)
         if command == "/tibo":
             return await self._tibo(session, incoming)
-        if command == "/tibowatch":
-            return self._tibo_watch(session, incoming, arg)
+        if command in {"/tibowatch", "/newswatch"}:
+            return self._tibo_watch(session, incoming, arg, command)
         return None
 
     async def _manual_check(self, session: Session, incoming: IncomingMessage, name: str) -> str:
@@ -436,34 +436,49 @@ class CommandRouter:
         record_send_result(session, result)
         return ""
 
-    def _tibo_watch(self, session: Session, incoming: IncomingMessage, arg: str) -> str:
+    def _tibo_watch(self, session: Session, incoming: IncomingMessage, arg: str, command: str = "/tibowatch") -> str:
         if not is_admin(session, incoming.user_id):
-            return "权限不足，Tibo 监听仅限 Bot 管理员配置。"
+            return "权限不足，消息监听仅限 Bot 管理员配置。"
         from backend.app.tibo_watch import TiboWatchSettings, read_watch_settings, save_watch_settings, watch_view
+        from backend.app.news_accounts import NEWS_ACCOUNTS, normalize_username, recommended_accounts
         settings = read_watch_settings(session)
         option = arg.strip()
         if option.casefold() in {"", "status"}:
             state = watch_view(session)["status"]
-            return (f"Tibo 监听：{'已启用' if settings.enabled else '已停用'}\n"
+            return (f"AI 消息监听：{'已启用' if settings.enabled else '已停用'}\n"
                     f"通知对象：{settings.targets or '未配置'}\n检查间隔：{settings.interval_seconds} 秒\n"
+                    f"订阅账号：{len(settings.accounts)} 个\n"
                     f"待推送：{state['pending_count']} 条\n"
-                    "用法：/tibowatch G群号&PQQ号；/tibowatch on 或 off。")
+                    f"{state['last_error'] or ''}\n"
+                    "用法：/newswatch G群号&PQQ号；on/off/status；accounts 查看订阅；recommend 推荐组合；all 全部；add/remove @账号。")
+        if option.casefold() == "accounts":
+            return "已订阅账号：\n" + ("、".join(f"@{name}" for name in settings.accounts) or "暂无")
         try:
             values = settings.model_dump()
+            parts = option.split(maxsplit=1)
             if option.casefold() == "off":
                 values["enabled"] = False
             elif option.casefold() == "on":
                 if not settings.targets:
-                    return "请先配置通知对象，例如 /tibowatch G123456&P112233。"
+                    return f"请先配置通知对象，例如 {command} G123456&P112233。"
                 values["enabled"] = True
+            elif option.casefold() in {"all", "recommend"}:
+                selected = [item.username.casefold() for item in NEWS_ACCOUNTS] if option.casefold() == "all" else recommended_accounts()
+                values["accounts"] = list(dict.fromkeys([*settings.accounts, *selected]))
+            elif parts[0].casefold() in {"add", "remove"}:
+                if len(parts) != 2:
+                    return "请填写 X 账号，例如 /newswatch add @OpenAI。"
+                username = normalize_username(parts[1])
+                values["accounts"] = list(dict.fromkeys([*settings.accounts, username])) if parts[0].casefold() == "add" else [name for name in settings.accounts if name != username]
             else:
                 values.update(targets=option, enabled=True)
             updated = TiboWatchSettings(**values)
             save_watch_settings(session, updated)
         except ValueError:
-            return "通知对象格式错误，请使用 /tibowatch G群号&PQQ号。"
-        return (f"Tibo 监听{'已启用' if updated.enabled else '已停用'}。\n"
+            return f"配置格式错误：通知对象使用 {command} G群号&PQQ号；账号只填 @用户名，启用时至少保留一个账号。"
+        return (f"AI 消息监听{'已启用' if updated.enabled else '已停用'}。\n"
                 f"通知对象：{updated.targets or '未配置'}\n"
+                f"订阅账号：{len(updated.accounts)} 个（/newswatch accounts 查看）\n"
                 "首次检查只建立基线，之后发现新帖会自动生成翻译图片并推送。")
 
     async def _tibo(self, session: Session, incoming: IncomingMessage) -> str:

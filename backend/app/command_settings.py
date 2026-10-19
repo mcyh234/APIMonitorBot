@@ -36,6 +36,7 @@ COMMAND_DEFINITIONS: tuple[CommandDefinition, ...] = (
     CommandDefinition("/radar", "降智雷达", "读取 Codex Radar 公开摘要并发送模型 IQ 趋势图。"),
     CommandDefinition("/tibo", "Tibo 雷达", "自动读取 X @thsottiaux 最新公开帖子，发送原文与中文翻译图片。"),
     CommandDefinition("/tibowatch", "Tibo 消息监听", "管理员设置 Tibo 新帖自动推送：G群号、PQQ号，多个目标用 & 连接；支持 on/off/status。"),
+    CommandDefinition("/newswatch", "AI 消息监听", "管理员订阅 AI 公司、产品与人物账号；支持 all/recommend、add/remove @账号、G群号&PQQ号、on/off/status/accounts。"),
 )
 
 

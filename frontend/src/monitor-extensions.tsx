@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { Save, RefreshCw, ExternalLink, Eye, X, PlugZap } from "lucide-react";
 import "./monitor-extensions.css";
+import { NewsWatchPanel } from "./news-watch";
 
 type RequestJSON = <T>(url: string, init?: RequestInit) => Promise<T>;
 type IntelSettings = {
@@ -20,56 +21,6 @@ type Advanced = {
 
 const save = (data: unknown): RequestInit => ({ method: "PUT", body: JSON.stringify(data) });
 const list = (text: string) => text.split(/[,，\n]+/).map(v => v.trim()).filter(Boolean);
-
-type TiboWatchConfig = { enabled: boolean; targets: string; interval_seconds: number };
-type TiboWatchStatus = { initialized: boolean; last_post_id: string | null; last_checked_at: string | null; last_sent_at: string | null; pending_count: number; last_error: string | null };
-type TiboWatchView = { settings: TiboWatchConfig; status: TiboWatchStatus };
-
-function TiboWatchPanel({ request }: { request: RequestJSON }) {
-  const [config, setConfig] = useState<TiboWatchConfig | null>(null);
-  const [status, setStatus] = useState<TiboWatchStatus | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState("");
-  useEffect(() => {
-    let active = true;
-    void request<TiboWatchView>("/api/tibo-watch").then(view => {
-      if (active) { setConfig(view.settings); setStatus(view.status); }
-    }).catch(() => { if (active) setMessage("Tibo 监听设置加载失败，请刷新页面重试。"); });
-    const timer = window.setInterval(() => {
-      void request<TiboWatchView>("/api/tibo-watch").then(view => { if (active) setStatus(view.status); }).catch(() => {});
-    }, 30000);
-    return () => { active = false; window.clearInterval(timer); };
-  }, [request]);
-  const time = (value: string | null) => value ? new Date(value).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "暂无";
-  return <details>
-    <summary>Tibo 消息监听</summary>
-    <p>发现 @thsottiaux 新帖后，自动生成原文与中文翻译图片，推送到指定群聊或私聊。首次检查只建立基线。</p>
-    {config && <form onSubmit={event => { event.preventDefault(); setBusy(true); setMessage("");
-      void request<TiboWatchView>("/api/tibo-watch", save(config)).then(view => {
-        setConfig(view.settings); setStatus(view.status); setMessage("Tibo 监听设置已保存");
-      }).catch(error => setMessage(error instanceof Error ? error.message : "保存失败" )).finally(() => setBusy(false));
-    }}>
-      <div className="extension-grid">
-        <Toggle label="启用 Tibo 消息监听" value={config.enabled} onChange={enabled => setConfig({ ...config, enabled })} />
-        <NumberField label="Tibo 检查间隔（秒）" value={config.interval_seconds} min={60} max={3600} onChange={interval_seconds => setConfig({ ...config, interval_seconds })} />
-        <label>推送通知对象<input placeholder="G123456789&P1122334455" required={config.enabled} value={config.targets} onChange={event => setConfig({ ...config, targets: event.target.value })} /></label>
-      </div>
-      <p>G 后填群号，P 后填私聊 QQ 号，多个对象用 &amp; 连接。默认每 120 秒检查，实际更新受 RSS 缓存影响。</p>
-      <div className="extension-actions">
-        <button disabled={busy}><Save size={16} />保存 Tibo 监听</button>
-        <button type="button" disabled={busy} onClick={() => { setBusy(true); void request<TiboWatchView>("/api/tibo-watch").then(view => {
-          setConfig(view.settings); setStatus(view.status); setMessage("Tibo 监听状态已刷新");
-        }).catch(() => setMessage("刷新失败")).finally(() => setBusy(false)); }}><RefreshCw size={16} />刷新监听状态</button>
-      </div>
-    </form>}
-    {message && <p role="status" className="extension-message">{message}</p>}
-    {status && <div className="tibo-watch-status">
-      <p>监听进度：{status.initialized ? `已建立基线 · ${status.last_post_id}` : "等待首次检查"} · 待推送 {status.pending_count} 条</p>
-      <p>最近检查：{time(status.last_checked_at)} · 最近推送：{time(status.last_sent_at)}</p>
-      {status.last_error && <p role="alert">{status.last_error}</p>}
-    </div>}
-  </details>;
-}
 
 export function MonitorExtensions({ request }: { request: RequestJSON }) {
   const [intel, setIntel] = useState<IntelSettings | null>(null);
@@ -126,7 +77,7 @@ export function MonitorExtensions({ request }: { request: RequestJSON }) {
     <div className="extension-heading"><h2>监控管理</h2><button title="刷新" aria-label="刷新监控管理" disabled={busy} onClick={() => void action(load)}><RefreshCw size={17} /></button></div>
     {message && <p role="status" className="extension-message">{message}</p>}
     {!intel && <p>{busy ? "加载中…" : "监控管理暂不可用"}</p>}
-    <TiboWatchPanel request={request} />
+    <NewsWatchPanel request={request} />
     {advanced && <details>
       <summary>高级巡检设置</summary>
       <form onSubmit={event => { event.preventDefault(); void action(async () => { setAdvanced(await request("/api/monitoring/advanced", save(advanced))); setMessage("巡检设置已保存"); }); }}>

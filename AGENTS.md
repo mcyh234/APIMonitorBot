@@ -1,8 +1,16 @@
 # Agent 开发指南
 
+## AI 多账号消息推送
+
+- WebUI「监控管理 → AI 消息监听」在原 Tibo 监听上扩展，内置账号位于 `backend/app/news_accounts.py`，按公司、产品、负责人、创始人分类；自定义账号只接受 X 用户名，不接受任意 URL。
+- `/newswatch` 支持通知对象、`on/off/status/accounts`、`recommend/all`、`add/remove @账号`；`/tibowatch` 保留兼容并共用设置，两个命令分别受开关控制。
+- 新安装预选推荐组合但监听默认关闭；旧配置缺少 `accounts` 时保留 Tibo-only，不自动扩大已有实际推送范围。新增或移除后重加账号均首次建立基线；移除账号或目标要清理对应待发送项。
+- 游标、抓取错误与待发送进度按账号隔离；每轮最多抓取 12 个到期账号、并发 4 个，最多发送三条帖子。设置变化要使在途工作失效，避免重新写回已删除订阅。
+- 图片显示真实作者与来源，不将其他账号标成 Tibo，不凭空绘制认证徽章。账号推荐与来源维护在 `docs/ai-news-accounts.md`。
+
 ## Tibo 消息监听
 
-- 监听默认关闭，WebUI「监控管理 → Tibo 消息监听」及 Bot 管理员命令 `/tibowatch G群号&PQQ号` 共用 SQLite 设置；支持 `on/off/status`，命令本身受命令开关控制。
+- 监听默认关闭，WebUI「监控管理 → AI 消息监听」及 Bot 管理员命令 `/tibowatch G群号&PQQ号` 共用 SQLite 设置；支持 `on/off/status`，命令本身受命令开关控制。
 - 默认 120 秒检查，最小 60 秒；初次只建立基线，之后对订阅源中的多条新帖逐条翻译、渲染和推送。
 - 游标与加密待发送内容一起持久化，按帖子和通知对象分别确认、退避重试，重启后续传。每轮最多处理三条帖子。移除目标后停止向其投递，新增目标只接收此后发现的帖子。
 - UI 验收使用隔离预览和模拟发送；不得在测试中向真实群聊或私聊发送通知。
@@ -94,6 +102,7 @@ APIMonitorBot 是本机运行的 API 可用性监控服务：
 - `/radar`：读取 Codex Radar 公开摘要并发送模型 IQ 降智趋势图。
 - `/tibo`：读取 X `@thsottiaux` 最新公开帖子，发送带中文翻译的雷达图，使用统一日夜主题。
 - `/tibowatch [G群号&PQQ号|on|off|status]`：管理员配置 Tibo 新帖自动推送。
+- `/newswatch`：管理员配置 AI 多账号推送；支持 `all/recommend/accounts`、`add/remove @账号` 和通知对象、开关及状态查询。
 - `/cancel`：取消多轮对话。
 
 除 `/cancel` 外，上述命令都必须支持 WebUI 命令开关；关闭后命令返回“该命令已关闭。”。
@@ -215,7 +224,7 @@ WebUI 是运维后台，不是营销页。
   - API 名称、模型名称编辑按钮。
   - 状态条图。
   - Sub2API 渠道倍率面板，默认收起，点击展开；展开后展示当前倍率、涨跌百分比、历史折线、30 日日 K 和全局投票比例。
-  - 命令开关，位于 Sub2API 渠道倍率面板下方，允许开启或关闭 `/addapi`、`/addsub2`、`/list`、`/remove`、`/check`、`/status`、`/price`、`/up`、`/down`、`/radar`、`/tibo`、`/tibowatch`。
+  - 命令开关，位于 Sub2API 渠道倍率面板下方，允许开启或关闭 `/addapi`、`/addsub2`、`/list`、`/remove`、`/check`、`/status`、`/price`、`/up`、`/down`、`/radar`、`/tibo`、`/tibowatch`、`/newswatch`。
   - 管理员管理。
   - 版本升级面板，支持拖拽上传受信任的升级包、安装并自动重启，以及生成升级包。
   - 默认收起的“巡检与冷却”面板，支持修改夜间省流范围、夜间巡检间隔和普通用户命令冷却时间。

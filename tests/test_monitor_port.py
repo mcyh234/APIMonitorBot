@@ -885,6 +885,250 @@ def test_tibo_watch_configuration_validation_and_status_never_expose_payload(dat
         with pytest.raises(ValueError):
             TiboWatchSettings(**data)
     view = put_watch(TiboWatchSettings(enabled=True, targets="g123&p456"), session)
-    assert view["settings"] == {"enabled": True, "targets": "G123&P456", "interval_seconds": 120}
+    assert view["settings"] == {"enabled": True, "targets": "G123&P456", "interval_seconds": 120, "accounts": ["thsottiaux"]}
     assert not view["status"]["initialized"]
     assert "pending" not in watch_view(session)["status"]
+
+
+def test_news_accounts_validation_catalog_and_legacy_migration(database):
+    from backend.app.news_accounts import NEWS_ACCOUNTS, normalize_username, recommended_accounts
+    from backend.app.tibo_watch import SETTINGS_KEY, STATE_KEY, TiboWatchSettings, read_watch_settings, read_watch_state, watch_view
+    session, _ = database
+    handles = [normalize_username(item.username) for item in NEWS_ACCOUNTS]
+    assert len(handles) == len(set(handles)) and len(handles) >= 60
+    assert {item.category for item in NEWS_ACCOUNTS} == {"公司", "产品", "负责人", "创始人"}
+    assert not read_watch_settings(session).enabled
+    assert read_watch_settings(session).accounts == recommended_accounts()
+    assert TiboWatchSettings(accounts=["@OpenAI", "openai", " ClaudeAI "]).accounts == ["openai", "claudeai"]
+    for accounts in (["https://x.com/openai"], ["../secret"], ["a" * 16]):
+        with pytest.raises(ValueError):
+            TiboWatchSettings(accounts=accounts)
+    with pytest.raises(ValueError):
+        TiboWatchSettings(enabled=True, targets="G123", accounts=[])
+    set_app_setting(session, SETTINGS_KEY, '{"enabled":true,"targets":"G123","interval_seconds":120}')
+    set_app_setting(session, STATE_KEY, '{"cursor":"100","last_checked_at":"2026-10-19T04:00:00Z"}')
+    assert read_watch_settings(session).accounts == ["thsottiaux"]
+    assert read_watch_state(session).accounts["thsottiaux"].cursor == "100"
+    assert watch_view(session)["status"]["initialized"]
+
+
+@pytest.mark.asyncio
+async def test_news_client_uses_account_feed_and_custom_template_without_token_leak():
+    from backend.app.tibo_radar import TiboRadarClient
+    from backend.app.x_timeline import parse_timeline_posts
+    seen = []
+    async def handle(request):
+        seen.append(request)
+        assert "authorization" not in request.headers
+        body = '<rss><channel><item><link>https://x.com/OpenAI/status/200</link><description>Model announcement.</description></item><item><link>https://x.com/other/status/300</link><description>Not their post.</description></item></channel></rss>'
+        return httpx.Response(200, content=body.encode())
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+        root = TiboRadarClient("https://rss.example/{username}.xml", client=http)
+        client = root.for_account("@OpenAI")
+        posts = await client.fetch_posts()
+        assert posts[0]["url"] == "https://x.com/OpenAI/status/200" and len(posts) == 1
+        assert str(seen[0].url) == "https://rss.example/openai.xml"
+        assert root.source_url == "https://rss.example/thsottiaux.xml"
+        other = TiboRadarClient("https://rss.example/tibo-only.xml", client=http).for_account("ClaudeAI")
+        assert other.source_url.startswith("https://fxtwitter.com/claudeai/")
+    assert parse_timeline_posts(b'<rss><channel><item><link>https://x.com/OpenAI/status/1</link><title>News</title></item></channel></rss>', "openai")[0]["author"]["name"] != "Tibo"
+
+
+@pytest.mark.asyncio
+async def test_news_accounts_have_independent_cursors_and_failure_isolation(database, monkeypatch):
+    from backend.app.tibo_watch import TiboWatcher, TiboWatchSettings, read_watch_state, save_watch_settings
+    session, factory = database
+    clock = [datetime(2026, 10, 19, 5, tzinfo=timezone.utc)]
+    monkeypatch.setattr("backend.app.tibo_watch.utc_now", lambda: clock[0])
+    monkeypatch.setattr("backend.app.tibo_watch.render_tibo_radar_image", lambda raw: raw["text"].encode())
+    class Client:
+        def __init__(self, username):
+            self.username = username
+        def for_account(self, username):
+            return Client(username)
+        async def fetch_posts(self):
+            if self.username == "broken":
+                raise RuntimeError("Never include upstream errors or secrets in status")
+            return timelines[self.username]
+        async def report_for_post(self, raw):
+            return raw
+    class Delivery:
+        async def send_image(self, target, image_bytes, filename):
+            sent.append((target.target_id, image_bytes, filename))
+            return SimpleNamespace(ok=True)
+    timelines = {"thsottiaux": [tibo_timeline_post("900")], "openai": [tibo_timeline_post("100")]}
+    sent = []
+    save_watch_settings(session, TiboWatchSettings(enabled=True, targets="G123", accounts=["thsottiaux", "openai", "broken"]))
+    watcher = TiboWatcher(Client("thsottiaux"), Delivery(), SecretBox("test"))
+    await watcher.run_once(factory)
+    assert not sent
+    clock[0] += timedelta(seconds=120)
+    timelines["thsottiaux"] = [tibo_timeline_post("950", "Tibo update")]
+    timelines["openai"] = [tibo_timeline_post("150", "OpenAI update")]
+    await watcher.run_once(factory)
+    state = read_watch_state(session)
+    assert state.accounts["openai"].cursor == "150" and state.cursor == "950"
+    assert [item[1] for item in sent] == [b"OpenAI update", b"Tibo update"]
+    assert sent[0][2] == "ai-news-openai.png"
+    assert "broken" in state.accounts["broken"].last_error
+    assert not state.pending
+
+
+@pytest.mark.asyncio
+async def test_news_removed_subscription_discards_queue_and_readdition_baselines(database, monkeypatch):
+    from backend.app.tibo_watch import TiboWatcher, TiboWatchSettings, read_watch_state, save_watch_settings
+    session, factory = database
+    clock = [datetime(2026, 10, 19, 5, tzinfo=timezone.utc)]
+    monkeypatch.setattr("backend.app.tibo_watch.utc_now", lambda: clock[0])
+    monkeypatch.setattr("backend.app.tibo_watch.render_tibo_radar_image", lambda raw: b"png")
+    class Client:
+        posts = [tibo_timeline_post("100")]
+        def for_account(self, username):
+            return self
+        async def fetch_posts(self):
+            return self.posts
+        async def report_for_post(self, raw):
+            if remove_during_render[0]:
+                save_watch_settings(session, TiboWatchSettings(enabled=True, targets="G123", accounts=["openai"]))
+            return raw
+    class Delivery:
+        async def send_image(self, *args):
+            sent.append(args)
+            return SimpleNamespace(ok=False)
+    remove_during_render, sent = [False], []
+    client = Client()
+    save_watch_settings(session, TiboWatchSettings(enabled=True, targets="G123", accounts=["thsottiaux"]))
+    watcher = TiboWatcher(client, Delivery(), SecretBox("test"))
+    await watcher.run_once(factory)
+    clock[0] += timedelta(seconds=120)
+    client.posts = [tibo_timeline_post("200")]
+    await watcher.run_once(factory)
+    assert len(sent) == 1 and len(read_watch_state(session).pending) == 1
+    save_watch_settings(session, TiboWatchSettings(enabled=True, targets="G123", accounts=["openai"]))
+    assert not read_watch_state(session).pending and "thsottiaux" not in read_watch_state(session).accounts
+    save_watch_settings(session, TiboWatchSettings(enabled=True, targets="G123", accounts=["thsottiaux"]))
+    client.posts = [tibo_timeline_post("300")]
+    await watcher.run_once(factory)
+    assert len(sent) == 1 and read_watch_state(session).cursor == "300"
+    # Removal while rendering prevents in-flight work from resurrecting old state.
+    clock[0] += timedelta(seconds=120)
+    client.posts = [tibo_timeline_post("400")]
+    remove_during_render[0] = True
+    await watcher.run_once(factory)
+    assert len(sent) == 1 and not read_watch_state(session).pending
+
+
+@pytest.mark.asyncio
+async def test_newswatch_admin_account_management_and_command_switch(database):
+    from backend.app.commands import CommandRouter, IncomingMessage
+    from backend.app.command_settings import set_command_enabled
+    from backend.app.tibo_watch import read_watch_settings
+    from tests.test_commands import FakeOneBot, FakeProbe
+    session, _ = database
+    session.add(BotAdmin(qq="999")); session.commit()
+    router = CommandRouter(Settings(), FakeOneBot(), SecretBox("test"), probe=FakeProbe())
+    async def command(text, user="999"):
+        return await router.handle_message(session, IncomingMessage(user, text, "private"))
+    assert "权限不足" in await command("/newswatch all", "111")
+    assert "订阅账号" in await command("/newswatch all")
+    assert "elonmusk" in read_watch_settings(session).accounts
+    assert "已停用" in await command("/newswatch add @custom_lab")
+    assert "@custom_lab" in await command("/newswatch accounts")
+    await command("/newswatch remove @custom_lab")
+    assert "custom_lab" not in read_watch_settings(session).accounts
+    assert "格式错误" in await command("/newswatch add https://bad.example")
+    assert "已启用" in await command("/newswatch G123&P456")
+    assert "G123&P456" in await command("/newswatch status")
+    set_command_enabled(session, "/newswatch", False)
+    assert await command("/newswatch off") == "该命令已关闭。"
+
+
+@pytest.mark.asyncio
+async def test_news_polling_is_batched_and_delivery_work_is_bounded(database, monkeypatch):
+    from backend.app.tibo_watch import TiboWatcher, TiboWatchSettings, read_watch_state, save_watch_settings
+    session, factory = database
+    clock = [datetime(2026, 10, 19, 5, tzinfo=timezone.utc)]
+    monkeypatch.setattr("backend.app.tibo_watch.utc_now", lambda: clock[0])
+    monkeypatch.setattr("backend.app.tibo_watch.render_tibo_radar_image", lambda raw: raw["id"].encode())
+    accounts = [f"source_{index}" for index in range(13)]
+    active, peak, fetched, sent = [0], [0], [], []
+    class Client:
+        def __init__(self, username="thsottiaux"):
+            self.username = username
+        def for_account(self, username):
+            return Client(username)
+        async def fetch_posts(self):
+            active[0] += 1; peak[0] = max(peak[0], active[0]); fetched.append(self.username)
+            await asyncio.sleep(0)
+            active[0] -= 1
+            return [tibo_timeline_post(str(100 + round_number[0]))]
+        async def report_for_post(self, raw):
+            return raw
+    class Delivery:
+        async def send_image(self, *args):
+            sent.append(args)
+            return SimpleNamespace(ok=True)
+    round_number = [0]
+    save_watch_settings(session, TiboWatchSettings(enabled=True, targets="G123", accounts=accounts))
+    watcher = TiboWatcher(Client(), Delivery(), SecretBox("test"))
+    await watcher.run_once(factory)
+    assert len(fetched) == 12 and peak[0] <= 4
+    await watcher.run_once(factory)
+    assert len(fetched) == 13 and set(fetched) == set(accounts) and not sent
+    clock[0] += timedelta(seconds=120); round_number[0] = 1
+    await watcher.run_once(factory)
+    assert len(sent) == 3 and len(read_watch_state(session).pending) == 9
+    # Same numeric IDs in separate accounts remain independent posts.
+    assert len({item.account for item in read_watch_state(session).pending}) == 9
+
+
+def test_news_image_labels_actual_account_without_tibo_brand(monkeypatch):
+    from backend.app.material_theme import MaterialDraw
+    from backend.app.tibo_radar import TiboPost, TiboRadarReport, render_tibo_radar_image
+    texts = []
+    original = MaterialDraw.__getattr__
+    def tracked(self, name):
+        function = original(self, name)
+        if name != "text":
+            return function
+        def draw_text(position, value, **kwargs):
+            texts.append(value)
+            return function(position, value, **kwargs)
+        return draw_text
+    monkeypatch.setattr(MaterialDraw, "__getattr__", tracked)
+    post = TiboPost("https://x.com/OpenAI/status/200", "OpenAI", "OpenAI", "New feature.", "新功能。",
+                    "中文翻译 · 机器翻译", utc_now(), 0, 0, 0, None, None)
+    image = Image.open(BytesIO(render_tibo_radar_image(TiboRadarReport(utc_now(), "Asia/Shanghai", post))))
+    assert image.width == 1600 and "AI NEWS  /  X POST" in texts
+    assert any("@OpenAI" in value for value in texts)
+    assert all("TIBO" not in value and "thsottiaux" not in value for value in texts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api_unavailable", [False, True])
+async def test_news_account_api_identity_cache_and_bearer_boundary(api_unavailable):
+    from backend.app.tibo_radar import TiboRadarClient
+    lookups, external = [], []
+    async def handle(request):
+        if request.url.host == "api.x.com":
+            assert request.headers["authorization"] == "Bearer local-only-secret"
+            if api_unavailable:
+                return httpx.Response(429)
+            if "/by/username/" in request.url.path:
+                username = request.url.path.rsplit("/", 1)[1]; lookups.append(username)
+                return httpx.Response(200, json={"data": {"id": "1" if username == "openai" else "2", "username": username}})
+            author_id = request.url.path.split("/")[-2]
+            return httpx.Response(200, json={"data": [{"id": "200", "author_id": author_id, "text": "Update"}]})
+        external.append(request)
+        assert "authorization" not in request.headers
+        username = request.url.path.split("/")[1]
+        return httpx.Response(200, content=f'<rss><channel><item><link>https://x.com/{username}/status/200</link><title>Update</title></item></channel></rss>'.encode())
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+        root = TiboRadarClient(client=http, bearer_token="local-only-secret")
+        for username in ("openai", "claudeai"):
+            client = root.for_account(username)
+            for _ in range(2):
+                posts = await client.fetch_posts()
+                assert posts[0]["author"]["screen_name"] == username
+    assert len(external) == (4 if api_unavailable else 0)
+    assert lookups == ([] if api_unavailable else ["openai", "claudeai"])

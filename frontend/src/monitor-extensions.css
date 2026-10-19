@@ -14,6 +14,21 @@
 .monitor-extensions button, .extension-actions a { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 36px; padding: 7px 12px; }
 .extension-message { padding: 12px; border-left: 3px solid #71c4a1; overflow-wrap: anywhere; }
 .tibo-watch-status { font-size: 13px; color: var(--text-muted, #a7b4c8); overflow-wrap: anywhere; }
+.news-accounts { min-width: 0; margin: 18px 0; padding: 16px; border: 1px solid var(--border, #39414c); border-radius: 8px; }
+.news-accounts legend { font-weight: 600; padding: 0 8px; }
+.news-account-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
+.news-account { display: flex; align-items: flex-start; gap: 8px; padding: 12px; border: 1px solid var(--border, #39414c); border-radius: 6px; min-width: 0; }
+.news-account label { flex: 1; align-items: flex-start; min-width: 0; cursor: pointer; }
+.news-account input { margin-top: 3px; }
+.news-account span { display: grid; gap: 5px; min-width: 0; }
+.news-account small { color: var(--text-muted, #a7b4c8); line-height: 1.5; }
+.news-account a { display: inline-flex; padding: 6px; flex-shrink: 0; color: var(--text-muted, #a7b4c8); }
+.news-custom-input { display: flex; gap: 8px; min-width: 0; }
+.news-custom-field { display: grid; align-content: start; gap: 8px; min-width: 0; }
+.news-custom-input input { flex: 1; }
+.news-custom-input button { flex-shrink: 0; }
+.news-group-actions, .news-custom-accounts { margin-top: 12px; }
+.news-account-state { display: grid; gap: 5px; padding: 10px; border-bottom: 1px solid var(--border, #39414c); min-width: 0; }
 .public-rules { display: grid; gap: 10px; margin: 18px 0; }
 .extension-table { overflow-x: auto; width: 100%; }
 .extension-table table { width: 100%; border-collapse: collapse; }
@@ -39,6 +54,8 @@
 .probe-settings .extension-toggle { display: flex; }
 .probe-settings .extension-toggle input { width: 18px; }
 @media (max-width: 680px) {
+  .news-account-grid { grid-template-columns: minmax(0, 1fr); }
+  .news-accounts { padding: 12px; }
   .extension-grid { grid-template-columns: minmax(0, 1fr); }
   .public-monitor { padding: 20px 12px; }
   .extension-detail { padding: 16px; }
