@@ -13,6 +13,7 @@
 .extension-toggle input { width: 18px; height: 18px; flex-shrink: 0; }
 .monitor-extensions button, .extension-actions a { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 36px; padding: 7px 12px; }
 .extension-message { padding: 12px; border-left: 3px solid #71c4a1; overflow-wrap: anywhere; }
+.tibo-watch-status { font-size: 13px; color: var(--text-muted, #a7b4c8); overflow-wrap: anywhere; }
 .public-rules { display: grid; gap: 10px; margin: 18px 0; }
 .extension-table { overflow-x: auto; width: 100%; }
 .extension-table table { width: 100%; border-collapse: collapse; }

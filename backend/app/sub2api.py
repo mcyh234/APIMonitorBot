@@ -72,6 +72,8 @@ def platform_label(platform: str) -> str:
         return "OpenAI"
     if clean == "anthropic":
         return "Anthropic"
+    if clean == "newapi":
+        return "New API"
     return platform.strip() or "Unknown"
 
 
@@ -177,7 +179,7 @@ class Sub2ApiClient:
         secret_box: SecretBox,
     ) -> Sub2AvailableCatalog:
         if config.upstream_type == "newapi":
-            raise Sub2ApiError("NewAPI 不提供 Sub2API 可用渠道定价接口。")
+            return await self._fetch_newapi_catalog_cached(session, config, secret_box)
         access_token = _cached_access_token(config, secret_box)
         if access_token:
             try:
@@ -205,7 +207,8 @@ class Sub2ApiClient:
         return await self.fetch_available_catalog(config.base_url, tokens.access_token)
 
     async def login_newapi(self, base_url: str, username: str, password: str) -> NewApiSession:
-        url = normalize_sub2_url(base_url, "/api/user/login")
+        from backend.app.newapi_pricing import normalize_newapi_url
+        url = normalize_newapi_url(base_url, "/api/user/login")
         try:
             response = await self._post(url, {"username": username, "password": password})
         except httpx.RequestError as exc:
@@ -239,7 +242,8 @@ class Sub2ApiClient:
             headers["Cookie"] = session_cookie
         if access_token:
             headers["Authorization"] = access_token
-        url = normalize_sub2_url(base_url, "/api/user/self/groups")
+        from backend.app.newapi_pricing import normalize_newapi_url
+        url = normalize_newapi_url(base_url, "/api/user/self/groups")
         try:
             response = await self._get(url, headers)
         except httpx.RequestError as exc:
@@ -253,6 +257,52 @@ class Sub2ApiClient:
         if not isinstance(groups, dict):
             raise Sub2ApiError("NewAPI 分组响应不是对象。")
         return flatten_newapi_group_rates(groups)
+
+    async def fetch_newapi_catalog(self, base_url: str, headers: dict[str, str] | None = None) -> Sub2AvailableCatalog:
+        from backend.app.newapi_pricing import flatten_newapi_catalog, normalize_newapi_url
+        try:
+            response = await self._get(normalize_newapi_url(base_url, "/api/pricing"), headers or {})
+        except httpx.RequestError as exc:
+            raise Sub2ApiError(_request_error_message(exc, "New API 模型广场请求失败")) from exc
+        if response.status_code in {401, 403}:
+            raise Sub2AuthError("New API 模型广场登录已失效。")
+        data = _response_json(response)
+        if response.status_code >= 400 or not isinstance(data, dict) or data.get("success") is not True:
+            raise Sub2ApiError(_api_message(data) or f"New API 模型广场请求失败：HTTP {response.status_code}")
+        status = {}
+        try:
+            status_response = await self._get(normalize_newapi_url(base_url, "/api/status"), {})
+            body = _response_json(status_response)
+            if status_response.status_code < 400 and isinstance(body, dict) and body.get("success") is True and isinstance(body.get("data"), dict):
+                status = body["data"]
+        except (httpx.RequestError, Sub2ApiError):
+            # Prices are defined in USD; an unavailable display setting must not
+            # turn them into a guessed CNY price or hide an otherwise valid list.
+            pass
+        return flatten_newapi_catalog(data, status)
+
+    async def _fetch_newapi_catalog_cached(self, session: Session, config: Sub2Config, secret_box: SecretBox) -> Sub2AvailableCatalog:
+        headers = {}
+        cookie = _encrypted_value(config.session_cookie_encrypted, secret_box)
+        token = _encrypted_value(config.access_token_encrypted, secret_box)
+        if config.newapi_user_id and (cookie or token):
+            headers["New-Api-User"] = config.newapi_user_id
+            if cookie:
+                headers["Cookie"] = cookie
+            if token:
+                headers["Authorization"] = token
+        try:
+            return await self.fetch_newapi_catalog(config.base_url, headers)
+        except Sub2AuthError:
+            if not config.email or not config.password_encrypted:
+                raise
+        login = await self.login_newapi(config.base_url, config.email, secret_box.decrypt(config.password_encrypted))
+        config.newapi_user_id = login.user_id
+        config.session_cookie_encrypted = secret_box.encrypt(login.cookie)
+        config.access_token_encrypted = None
+        config.credential_mode = "password"
+        session.commit()
+        return await self.fetch_newapi_catalog(config.base_url, {"New-Api-User": login.user_id, "Cookie": login.cookie})
 
     async def fetch_rates_with_cached_token(
         self,

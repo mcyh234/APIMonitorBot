@@ -1613,7 +1613,7 @@ function MonitoringSettingsPanel({
               />
             </label>
           </div>
-          <p className="monitoring-settings-hint">命令冷却只限制普通用户的 /check、/status、/stat、/price、/radar、/tibo；设为 0 可关闭冷却。</p>
+          <p className="monitoring-settings-hint">命令冷却只限制普通用户的 /check、/status、/price、/radar、/tibo；设为 0 可关闭冷却。</p>
           <button className="primary no-margin" type="submit" disabled={busy || !settings}>
             <Save size={16} />
             {busy ? "正在保存" : "保存设置"}

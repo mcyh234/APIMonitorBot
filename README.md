@@ -4,6 +4,8 @@
 
 在一个 WebUI 中管理多个 API、查看状态和延迟、跟踪渠道倍率，并通过 OneBot v11 将故障、恢复和价格变化发送到指定群聊或私聊。项目可独立运行，适合本机或自托管部署。
 
+[快速部署](#快速部署) · [机器人命令](#机器人命令) · [渠道倍率与价格](#渠道倍率与价格) · [配置与运维](#配置与运维) · [开发与离线验收](#开发与离线验收)
+
 ## 效果预览
 
 以下图片由项目真实渲染器使用**离线演示数据**生成，不代表实际服务可用性、模型表现或报价。图片随仓库保存，无需运行服务即可查看。
@@ -23,6 +25,13 @@
 | ![即时检查结果](docs/images/check-light.png) | ![深色渠道价格图](docs/images/price-dark.png) |
 
 <details>
+<summary>New API 模型广场：分组模型、Token 价、计次价与动态计费</summary>
+
+![New API 模型广场离线价格图](docs/images/newapi-price-light.png)
+
+</details>
+
+<details>
 <summary>更多图片：Radar 与 Tibo</summary>
 
 ![Radar 趋势图](docs/images/radar-light.png)
@@ -31,7 +40,7 @@
 
 </details>
 
-自产报告图片共用 Material 3 风格的色彩角色、字体和布局。每次渲染重新选择主题色，北京时间 **07:00 至 19:00 为浅色，其余时间为深色**；成功、失败、涨跌等语义色保持一致。`/stat` 是真实网页截图，不参与重绘。
+自产报告图片共用 Material 3 风格的色彩角色、字体和布局。每次渲染重新选择主题色，北京时间 **07:00 至 19:00 为浅色，其余时间为深色**；成功、失败、涨跌等语义色保持一致。
 
 ## 主要功能
 
@@ -40,11 +49,11 @@
 | API 监控 | 多配置、协议选择、定时巡检、失败复核、模型回退、故障与恢复通知 |
 | 状态分析 | 滚动 24 小时成功率、三档时间窗口、独立超时展示、延迟曲线及异常标记 |
 | QQ 机器人 | OneBot v11 WebSocket 收发、群聊与私聊通知、多目标绑定、管理员权限、命令开关与别名 |
-| 渠道价格 | Sub2API 倍率监控、模型价格表、历史折线、30 日日 K、看涨/看跌投票、Sub2API/NewAPI 地址导入 |
+| 渠道价格 | Sub2API / New API 分组倍率、模型广场价格、历史折线、30 日日 K、看涨/看跌投票、地址导入 |
 | 管理后台 | 登录鉴权、配置管理、巡检历史、消息记录、巡检参数、管理员管理、本地升级 |
 | 公开状态 | 默认关闭的 `/status` 页面，按分组开放，只读取本地快照 |
 | 群聊情报 | 默认关闭、群白名单、上下文采集、规则筛选、可选 LLM 分析、管理员报告 |
-| 扩展报告 | Codex Radar 公开趋势摘要、Tibo 公开动态与中文翻译、外部状态页截图 |
+| 扩展报告 | Codex Radar 公开趋势摘要、Tibo 公开动态与中文翻译 |
 
 后端使用 **FastAPI + SQLAlchemy + SQLite + APScheduler**，前端使用 **React + TypeScript + Vite**，图片使用 **Pillow + Noto Sans SC**。
 
@@ -79,7 +88,7 @@ cd ..
 
 打开 <http://127.0.0.1:8000>，首次访问设置 WebUI 进入密钥，然后配置管理员、OneBot 连接和 API。
 
-Linux/macOS 对应使用 `.venv/bin/python` 和 `cp .env.example .env`；其余构建步骤相同。网页截图功能还需要本机安装可用的 Edge/Chrome。
+Linux/macOS 对应使用 `.venv/bin/python` 和 `cp .env.example .env`；其余构建步骤相同。
 
 ### 3. 连接 QQ 机器人
 
@@ -126,20 +135,71 @@ Linux/macOS 对应使用 `.venv/bin/python` 和 `cp .env.example .env`；其余�
 | `/remove <名称>` | 管理员删除配置 |
 | `/check [名称]` | 即时检查，不带名称时汇总当前通知对象绑定的 API |
 | `/status [名称]` | 生成状态条及延迟图片 |
-| `/price` | 生成绑定渠道的倍率、历史和模型价格图片 |
+| `/price` | 生成绑定的 Sub2API / New API 分组倍率、历史和模型价格图片 |
 | `/up`、`up` / `/down`、`down` | 看涨/看跌投票，每个 QQ 每个北京时间自然日一票，当天可改票 |
 | `/radar` | 生成 Codex Radar 公开趋势报告 |
-| `/tibo` | 生成 Tibo 公开动态与双语摘要 |
-| `/stat` | 截取配置的外部状态页，默认 GPTStore 状态页 |
+| `/tibo` | 自动读取 X @thsottiaux 最新公开帖子，发送原文与中文翻译 |
+| `/tibowatch [G群号&PQQ号\|on\|off\|status]` | 管理员配置 Tibo 新帖自动推送，支持群聊和私聊 |
 | `/cancel` | 取消当前多轮对话 |
 
 普通用户的查询命令默认冷却 5 分钟，管理员不受此限制。群聊普通用户只能查询本群绑定配置，私聊命令默认仅管理员可用。WebUI 可维护命令开关与别名，`/cancel` 始终保留。
 
+### Tibo 雷达
+
+每次调用 `/tibo` 都会从 `@thsottiaux` 的账号时间线选择最新公开帖子（包含回复、排除转帖），不会把旧置顶帖当作最新帖。图片展示原文、中文机器翻译、发布时间、原帖链接和可用的回复上下文；已移除区域判断、位置概率和相关摘要。
+
+默认读取 [FxTwitter RSS](https://fxtwitter.com/thsottiaux/feed.xml?count=30&with_replies=1)，失败时回退 FixupX 的同源 RSS，无需 X Token；[订阅格式说明](https://docs.fxembed.com/guide/advanced/rss-atom-feeds/)。也可将 `.env` 中的 `TIBO_RADAR_SOURCE_URL` 指向其他账号 RSS/Atom 或 JSON 时间线。只解析 `@thsottiaux` 本人发布的帖子，旧 Codex Radar 来源配置会自动使用新的默认 RSS。
+
+可选填写 `TIBO_X_BEARER_TOKEN`，优先使用 [X 官方账号时间线 API](https://docs.x.com/x-api/users/get-posts)，失败时仍可回退 RSS。默认两个 RSS 地址共享上游，不能保证彼此独立可用。
+
+中文翻译优先使用 Google Translate 公开接口，失败时通过 MyMemory 的英文转中文接口回退，长帖按服务限制分段翻译。两者均失败时保留完整原文并标注“翻译暂不可用”；时间线获取失败时明确报错，不用旧摘要替代最新帖子。X API Token 仅发送到 X 官方 API，不发送到翻译服务或自定义时间线。
+
+### Tibo 新帖自动推送
+
+监听默认关闭，可在 WebUI 的「监控管理 → Tibo 消息监听」中设置开关、通知对象和检查间隔。配置保存在 SQLite，重启后保留。默认每 120 秒检查一次，允许设置 60–3600 秒；实际推送延迟还受 RSS 缓存和翻译耗时影响。
+
+Bot 管理员也可通过命令配置同一份设置：
+
+```text
+/tibowatch G123456789&P1122334455
+/tibowatch status
+/tibowatch off
+/tibowatch on
+```
+
+填写通知对象会保存并启用监听；`G` 后填群号，`P` 后填私聊 QQ 号，多个对象用 `&` 连接。`off` 暂停监听和发送，`on` 使用已保存对象恢复。首次启用只建立基线，不推送订阅源已有的历史帖子。后续读取到的多条新帖按帖子 ID 排序，分别生成原文与翻译图片。
+
+发送进度按帖子和通知对象保存；发送成功的对象不会因其他对象失败而重复接收，失败会逐步延长重试间隔，最长一小时。每轮最多处理三条帖子的推送，重启后继续处理待发送记录。更换通知对象后，移除的对象停止投递，新对象只接收之后发现的新帖。待发送内容加密保存，发送审计只保留图片短预览。
+
+暂停期间的新帖会在恢复后按订阅源仍保留的数据补发；长时间停机超过订阅源保留范围时不能保证补齐。进程若恰好在 OneBot 已确认发送、SQLite 尚未保存结果之间退出，恢复后仍可能重复投递该条消息。
+
 ## 渠道倍率与价格
 
-Sub2API 首次采样保存基线，不发送变动通知；后续倍率变化或分组删除会发送图片和文字说明。价格来自上游 `/api/v1/channels/available`，不使用内置静态价目表。
+### 添加与查询
+
+1. Sub2API 可通过管理员命令 `/addsub2` 添加，或在 WebUI 批量导入上游地址。
+2. New API 在 WebUI 导入地址时选择 `newapi`，填写站点根地址或模型广场 `/pricing` 地址，再在价格面板补充登录信息。支持用户名与密码；管理 API 也支持访问令牌与用户 ID。导入后默认停用，登录并成功读取分组后启用。
+3. 在绑定的群聊发送 `/price`；私聊仅管理员可查询绑定自己 QQ 的价格配置。多个通知对象使用 `&` 连接。命令开关与普通用户冷却规则同时适用。
+
+首次采样保存倍率基线，不发送变动通知；后续倍率变化或分组删除会发送图片和文字说明。图片展示倍率、历史折线和日 K，New API 按分组完整展开模型列表。停用或价格拉取失败时明确提示仅展示已保存倍率，不使用内置静态价目表。
+
+### Sub2API 价格
+
+倍率来自 `/api/v1/groups/available`，模型单价来自 `/api/v1/channels/available`。
 
 每百万 Token 展示价按 `每 Token 单价 × 1,000,000 × 分组倍率` 计算。项目沿用 Sub2API 的 `1 CNY = 1 USD` 计价单位约定，**不是实时外汇换算**，具体结算以上游为准。
+
+### New API 模型广场
+
+模型价格、分组倍率和可用模型关系来自 `/api/pricing`，只在对应的 `enable_groups` 分组中展示模型。已有登录会话或访问令牌会用于读取账号对应的倍率；倍率监控沿用 `/api/user/self/groups`。
+
+接口结构参考 [New API 模型广场实现](https://github.com/QuantumNous/new-api/blob/main/controller/pricing.go)。
+
+- Token 计费：基础输入价为 `model_ratio × 2 USD / MTok`，再乘分组倍率；输出、缓存读、缓存写分别使用对应倍率。
+- 计次计费：`model_price × 分组倍率`，标注 `/ 次`，不换算成百万 Token。
+- 单档线性 `tier(...)` 表达式：读取表达式中的输入、输出、缓存读和缓存写价格；缓存写可区分 5 分钟与 1 小时。
+- 条件阶梯、插件和其他无法可靠换算的表达式：保留模型并标注“动态计费，详见模型广场”，不拿旧倍率字段冒充价格。接口未提供的缓存价格显示 `—`。
+- 币种：读取站点 `/api/status` 的显示币种及换算设置；设置不可用时明确使用 USD，不套用 Sub2API 的计价约定，也不使用外部实时汇率。
 
 历史走势和日 K 按北京时间自然日聚合，没有采样的日期留空。涨为红色，跌为绿色；顶部显示全 Bot 当日投票比例。
 
@@ -166,7 +226,8 @@ Sub2API 首次采样保存基线，不发送变动通知；后续倍率变化或
 | `ONEBOT_WS_URL` / `ONEBOT_ACCESS_TOKEN` | OneBot WebSocket 地址及 token |
 | `CHECK_INTERVAL_SECONDS` / `REQUEST_TIMEOUT_SECONDS` | 默认巡检间隔和请求超时 |
 | `NIGHT_SAVER_*` | 夜间省流默认参数 |
-| `STATUS_SNAPSHOT_BROWSER_PATH` | 可选指定网页截图所用浏览器 |
+| `TIBO_X_BEARER_TOKEN` | 可选，Tibo 雷达使用的 X API v2 Bearer Token |
+| `TIBO_RADAR_SOURCE_URL` | 可选，账号 RSS/Atom/JSON 时间线；留空使用 FxTwitter/FixupX RSS |
 
 部分运行参数在 WebUI 保存到 SQLite 后优先于环境变量默认值。需要远程访问时，请自行配置 HTTPS、反向代理与访问控制，不要直接暴露本地演示服务。
 

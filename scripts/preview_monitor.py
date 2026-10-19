@@ -26,7 +26,7 @@ from backend.app.monitor_extensions import PublicRule, PublicSettings
 from backend.app.notifier import Notifier
 from backend.app.onebot import OneBotClient
 from backend.app.settings import Settings
-from backend.app.time_utils import utc_now
+from backend.app.time_utils import coerce_aware_utc, utc_now
 from backend.app.webui_auth import set_webui_secret, webui_secret_configured
 from sqlalchemy import select
 import uvicorn
@@ -69,6 +69,20 @@ with db.SessionLocal() as session:
         session.commit()
         set_app_setting(session, "monitor.public", PublicSettings(enabled=True, rules=[
             PublicRule(config_id=sub.id, platform="openai", group_key="plus", visible=True)]).model_dump_json())
+    # Keep this reusable offline database's sample timeline within today's view.
+    # Only move known offline fixtures; this process never opens production data.
+    now = utc_now()
+    for config in session.scalars(select(APIConfig).where(APIConfig.base_url == "https://offline.invalid/v1")):
+        records = list(session.scalars(select(CheckRecord).where(CheckRecord.api_config_id == config.id)))
+        if not records:
+            continue
+        shift = now - max(coerce_aware_utc(record.checked_at) for record in records)
+        for record in records:
+            record.checked_at = coerce_aware_utc(record.checked_at) + shift
+        for observation in session.scalars(select(ProbeObservation).where(ProbeObservation.api_config_id == config.id)):
+            observation.checked_at = coerce_aware_utc(observation.checked_at) + shift
+        config.last_checked_at = now
+    session.commit()
 
 app = create_app(settings)
 

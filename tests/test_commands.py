@@ -25,7 +25,7 @@ from backend.app.settings import Settings
 from backend.app.model_pricing import ModelTokenPrice
 from backend.app.sub2api import Sub2AuthTokens, Sub2AvailableCatalog, Sub2ChannelRateSnapshot
 from backend.app.time_utils import utc_now
-from backend.app.tibo_radar import TiboPost, TiboPresence, TiboRadarReport
+from backend.app.tibo_radar import TiboPost, TiboRadarReport
 
 
 class FakeProbe:
@@ -35,15 +35,6 @@ class FakeProbe:
     async def probe(self, base_url: str, api_key: str, model_name: str):
         self.calls.append((base_url, api_key, model_name))
         return CheckResult(ok=True, code="200", latency_ms=12, response_preview="hi")
-
-
-class FakeSnapshotter:
-    def __init__(self):
-        self.calls = 0
-
-    async def capture(self) -> bytes:
-        self.calls += 1
-        return b"fake-png"
 
 
 class FakeRadarClient:
@@ -81,18 +72,6 @@ class FakeTiboClient:
         return TiboRadarReport(
             monitored_at=now,
             timezone="Asia/Shanghai",
-            presence=TiboPresence(
-                location_zh="旧金山湾区 / PT",
-                location_en="San Francisco Bay Area / PT",
-                probability=0.3,
-                confidence="low",
-                evidence_zh="公开帖子与 PT 时区大致相符。",
-                evidence_en="Public posts align with PT.",
-                safety_note_zh="仅展示公开粗粒度信息。",
-                observations=40,
-                observed_at=now,
-                updated_at=now,
-            ),
             post=TiboPost(
                 source_url="https://x.com/thsottiaux/status/123",
                 author_name="Tibo",
@@ -619,41 +598,6 @@ async def test_status_without_group_id_does_not_reply_permission_denied():
 
 
 @pytest.mark.asyncio
-async def test_stat_command_sends_web_snapshot_to_notification_group_and_uses_cooldown():
-    session = make_session()
-    secret_box = SecretBox("test-key")
-    session.add(
-        APIConfig(
-            name="cfg-one",
-            target_type="group",
-            target_id="123456",
-            base_url="https://example.com/v1",
-            api_key_encrypted=secret_box.encrypt("sk-test"),
-            model_name="gpt-test",
-            enabled=True,
-        )
-    )
-    session.commit()
-    onebot = FakeOneBot()
-    snapshotter = FakeSnapshotter()
-    router = CommandRouter(Settings(), onebot, secret_box, probe=FakeProbe(), snapshotter=snapshotter)
-    incoming = IncomingMessage(user_id="10001", message="/stat", message_type="group", group_id="123456")
-
-    reply = await router.handle_message(session, incoming)
-
-    assert reply == ""
-    assert snapshotter.calls == 1
-    assert onebot.sent == [("group", "123456", "[image:gptstore-status.png]")]
-    send_row = session.scalar(select(SendRecord).where(SendRecord.message_preview == "[image:gptstore-status.png]"))
-    assert send_row is not None
-
-    reply = await router.handle_message(session, incoming)
-
-    assert "操作太频繁" in (reply or "")
-    assert snapshotter.calls == 1
-
-
-@pytest.mark.asyncio
 async def test_radar_command_sends_image_and_uses_cooldown():
     session = make_session()
     secret_box = SecretBox("test-key")
@@ -802,17 +746,17 @@ async def test_admin_bypasses_command_cooldown():
     session = make_session()
     secret_box = SecretBox("test-key")
     onebot = FakeOneBot()
-    snapshotter = FakeSnapshotter()
-    router = CommandRouter(Settings(), onebot, secret_box, probe=FakeProbe(), snapshotter=snapshotter)
-    incoming = IncomingMessage(user_id="2087900785", message="/stat", message_type="private")
+    radar = FakeRadarClient()
+    router = CommandRouter(Settings(), onebot, secret_box, probe=FakeProbe(), radar_client=radar)
+    incoming = IncomingMessage(user_id="2087900785", message="/radar", message_type="private")
 
     first = await router.handle_message(session, incoming)
     second = await router.handle_message(session, incoming)
 
     assert first == ""
     assert second == ""
-    assert snapshotter.calls == 2
+    assert radar.calls == 2
     assert onebot.sent == [
-        ("private", "2087900785", "[image:gptstore-status.png]"),
-        ("private", "2087900785", "[image:gptstore-status.png]"),
+        ("private", "2087900785", "[image:codex-radar.png]"),
+        ("private", "2087900785", "[image:codex-radar.png]"),
     ]

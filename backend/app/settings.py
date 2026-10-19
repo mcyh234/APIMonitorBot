@@ -51,15 +51,11 @@ class Settings(BaseSettings):
     checker_enabled: bool = True
     hide_status_targets: bool = True
 
-    status_snapshot_url: str = "https://status.gptstore.club/"
-    status_snapshot_browser_path: str = ""
-    status_snapshot_timeout_seconds: float = 45.0
-    status_snapshot_viewport_width: int = Field(default=1920, ge=800, le=3840)
-
     codex_radar_source_url: str = "https://codexradar.com/current.jsor"
     codex_radar_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
 
-    tibo_radar_source_url: str = "https://codexradar.com/current.json"
+    tibo_radar_source_url: str = ""
+    tibo_x_bearer_token: str = Field(default="", repr=False)
     tibo_radar_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
 
 

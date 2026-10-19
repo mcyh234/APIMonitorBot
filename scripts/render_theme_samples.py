@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import runpy
 import sys
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -14,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 from backend.app.check_image import CheckResultImageRow, render_check_result_image
 from backend.app.codex_radar import parse_codex_radar_payload, render_codex_radar_image
 from backend.app.model_pricing import ModelTokenPrice
+from backend.app.newapi_pricing import flatten_newapi_catalog
 from backend.app.status_bars import ConfigStatusBarsData, StatusBucketData, StatusWindowData
 from backend.app.status_image import render_status_image
 from backend.app.sub2_price_image import Sub2PriceBoard, render_sub2_price_image
@@ -52,8 +54,32 @@ async def render(output: Path):
                        for model, platform in [("gpt-5.4", "openai"), ("claude-sonnet", "anthropic")])
         (output / f"price-{mode}.png").write_bytes(render_sub2_price_image([Sub2PriceBoard("API 价格监控", rates, model_prices=prices)],
               sentiment=Sub2SentimentSummary(sentiment_date(now), 3, 2), generated_at=now))
+        plaza = flatten_newapi_catalog({
+            "group_ratio": {"standard": .25, "Claude": .5},
+            "usable_group": {"standard": "标准组", "Claude": "Claude 组"},
+            "data": [
+                {"model_name": f"demo-text-{index}", "quota_type": 0, "model_ratio": 1 + index / 2,
+                 "completion_ratio": 4, "cache_ratio": .1, "create_cache_ratio": 1.25,
+                 "enable_groups": ["standard"]} for index in range(1, 5)
+            ] + [
+                {"model_name": "demo-image-request", "quota_type": 1, "model_price": .04,
+                 "enable_groups": ["standard"]},
+                {"model_name": "demo-context-tiered", "billing_mode": "tiered_expr",
+                 "billing_expr": 'len > 10000 ? tier("long", p * 6 + c * 30) : tier("base", p * 3 + c * 15)',
+                 "enable_groups": ["standard"]},
+                {"model_name": "demo-claude-linear", "billing_mode": "tiered_expr",
+                 "billing_expr": 'tier("base", p * 3 + c * 15 + cr * 0.3 + cc * 3.75 + cc1h * 6)',
+                 "enable_groups": ["Claude"]},
+            ],
+        }, {"quota_display_type": "CNY", "usd_exchange_rate": 1})
+        plaza_rates = [Sub2StoredRate(rate.platform, rate.group_key, rate.group_name, rate.rate_multiplier, now,
+                       tuple(Sub2RateHistoryPoint(now - timedelta(days=5 - i), rate.rate_multiplier + (i % 3) * .02)
+                             for i in range(6))) for rate in plaza.rates]
+        (output / f"newapi-price-{mode}.png").write_bytes(render_sub2_price_image(
+            [Sub2PriceBoard("New API 模型广场 · 离线演示", plaza_rates, model_prices=plaza.model_prices)],
+            sentiment=Sub2SentimentSummary(sentiment_date(now), 3, 2), generated_at=now))
         (output / f"radar-{mode}.png").write_bytes(render_codex_radar_image(radar, generated_at=now))
-        (output / f"tibo-{mode}.png").write_bytes(render_tibo_radar_image(tibo, generated_at=now))
+        (output / f"tibo-{mode}.png").write_bytes(render_tibo_radar_image(replace(tibo, monitored_at=now), generated_at=now))
     print(output.resolve())
 
 

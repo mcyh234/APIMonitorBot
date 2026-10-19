@@ -72,7 +72,6 @@ flowchart TD
     MON --> NOTIFY[Notifier]
     NOTIFY --> OB
 
-    EXT --> STATUS[status.gptstore.club]
     EXT --> RADAR[codexradar.com]
     EXT --> XAPI[FxTwitter / X oEmbed]
     EXT --> TRANS[Google Translate public endpoint]
@@ -118,7 +117,6 @@ FastAPI lifespan 顺序：
 | `backend/app/status_bars.py` | 30 分钟/5 小时/24 小时状态桶 |
 | `backend/app/status_image.py` | `/status` PNG |
 | `backend/app/check_image.py` | `/check` 多配置 PNG |
-| `backend/app/web_snapshot.py` | `/stat` Edge/Chrome CDP 全页截图 |
 | `backend/app/sub2api.py` | Sub2API/NewAPI 登录、token、Cookie、倍率、实时价格目录 |
 | `backend/app/sub2_rates.py` | 倍率同步、历史、删除/变动识别、最低关键词分组 |
 | `backend/app/sub2_sentiment.py` | 全 Bot 每日看涨/看跌投票和比例聚合 |
@@ -166,14 +164,11 @@ INTERNET_CHECK_TIMEOUT_SECONDS=8
 INTERNET_DISCONNECT_NOTIFY_COOLDOWN_SECONDS=600
 CHECKER_ENABLED=true
 
-STATUS_SNAPSHOT_URL=https://status.gptstore.club/
-STATUS_SNAPSHOT_BROWSER_PATH=
-STATUS_SNAPSHOT_TIMEOUT_SECONDS=45
-STATUS_SNAPSHOT_VIEWPORT_WIDTH=1920
 
 CODEX_RADAR_SOURCE_URL=https://codexradar.com/current.jsor
 CODEX_RADAR_TIMEOUT_SECONDS=20
-TIBO_RADAR_SOURCE_URL=https://codexradar.com/current.json
+TIBO_X_BEARER_TOKEN=
+TIBO_RADAR_SOURCE_URL=
 TIBO_RADAR_TIMEOUT_SECONDS=20
 ```
 
@@ -328,7 +323,6 @@ G123456789&P2087900785
 | `/remove <name>` | 管理员，删除 API 配置 |
 | `/check [name]` | 群普通用户仅本群配置；无参数多项时发 PNG |
 | `/status [name]` | 状态条 PNG |
-| `/stat` | GPTStore 状态页全页截图 |
 | `/price` | Sub2API 分组倍率、历史和实时 CNY/MTok 价格图 |
 | `/up`、`up` | 全 Bot 当日整体 Token 倍率看涨投票 |
 | `/down`、`down` | 全 Bot 当日整体 Token 倍率看跌投票 |
@@ -347,7 +341,7 @@ G123456789&P2087900785
 
 ### 冷却
 
-- 普通用户：`/check /status /stat /price /radar /tibo` 默认 5 分钟。
+- 普通用户：`/check /status /price /radar /tibo` 默认 5 分钟。
 - 管理员永不冷却。
 - 冷却为 0 表示关闭限制。
 - 冷却键按用户和命令隔离。
@@ -604,17 +598,12 @@ GET {BaseURL}/api/user/self/groups
 当前限制：
 
 - 定时倍率变动图使用 `/groups/available`，没有实时模型价格目录，因此变动图的模型价格区可能为空。
-- `/price` 命令会实时请求 `/channels/available`，价格完整。
+- `/price` 命令会实时请求 Sub2API `/api/v1/channels/available` 或 New API `/api/pricing`；New API 动态计价的支持范围见 README。
 - WebUI `/api/sub2/prices` 当前只返回倍率和历史，不返回实时模型 Token 单价。
 
-## 20. `/stat` 网页快照
+## 20. 外部状态页截图（已移除）
 
-- 目标：`status.gptstore.club`。
-- 使用本机 Edge/Chrome DevTools Protocol。
-- 不依赖 Playwright 浏览器下载。
-- 切换到“1 小时”成功率视图。
-- 截取全页。
-- 普通用户冷却，管理员免冷却。
+2026-10-19 已移除截图命令、实现及浏览器配置。当前功能与价格协议以 README 为准。
 
 ## 21. `/radar`
 
@@ -632,13 +621,11 @@ GET {BaseURL}/api/user/self/groups
 
 数据链：
 
-1. 请求 `codexradar.com/current.json`。
-2. 读取 `tibo_presence`。
-3. 从 `source_url` 或 `source_urls[0]` 提取 X username/status ID。
-4. 请求 `api.fxtwitter.com/{user}/status/{id}` 获取完整帖子和头像。
-5. FxTwitter 失败时回退 X oEmbed；oEmbed 长帖可能截断。
-6. 使用 Google Translate public endpoint 翻译中文。
-7. 翻译失败时使用 `tibo_presence.evidence_summary_zh` 作为中文摘要。
+1. 有 `TIBO_X_BEARER_TOKEN` 时优先读取 X API v2 的账号时间线。
+2. 否则读取 FxTwitter RSS，失败时回退 FixupX 同源 RSS；或使用 `TIBO_RADAR_SOURCE_URL` 配置的 RSS/Atom/JSON 时间线。
+3. 按时间选择 `@thsottiaux` 最新原创或回复，过滤转帖及其他账号；公开源可通过 FxTwitter 增强帖子详情，失败时保留时间线正文。
+4. 使用 Google Translate public endpoint 分段翻译中文；失败时通过 MyMemory 英文转中文接口回退。
+5. 翻译失败时明确标注，不再使用区域判断摘要。抓取失败时不假装旧帖是最新帖。
 
 回复链：
 
@@ -654,11 +641,11 @@ GET {BaseURL}/api/user/self/groups
 
 图片：
 
-- 白底 X 风格。
+- 统一 Material 日夜主题的 X 帖子卡片。
 - 虚线外框。
-- 右侧 presence：粗粒度位置、概率、置信度、依据、更新时间、安全说明。
+- 已删除区域、位置概率、置信度及依据面板，正文使用完整内容宽度。
 - 高度按正文、翻译、原帖和评论实际行数计算。
-- 最低 1600x1080，长内容向下扩展。
+- 最低 1600x800，长内容向下扩展。
 - 内容底部额外保留 150px 页脚安全区，禁止与来源文字重叠。
 
 ## 23. Web API 路由
@@ -961,7 +948,7 @@ rg/rg --files -> 读取源码 -> apply_patch -> pytest/compileall/npm build -> �
 - [ ] 首次故障、十分钟跟进、两次恢复状态机一致。
 - [ ] 同目标多 API 告警合并。
 - [ ] 多目标逐个通知。
-- [ ] `/check /status /stat /price /radar /tibo` 可生成图片。
+- [ ] `/check /status /price /radar /tibo` 可生成图片。
 - [ ] `/price` 示例计算得到 `0.375/2.25/0/0.0375 CNY/MTok`。
 - [ ] `/tibo` 长原帖不覆盖页脚。
 - [ ] 普通用户权限和 5 分钟冷却正确。

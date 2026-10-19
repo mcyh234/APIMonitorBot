@@ -16,6 +16,7 @@ from backend.app.availability import ApiProbe
 from backend.app.commands import CommandRouter, parse_onebot_message
 from backend.app.intelligence import IntelPipeline, router as intel_router
 from backend.app.monitor_extensions import apply_advanced_settings, router as extensions_router
+from backend.app.tibo_watch import TiboWatcher, router as tibo_watch_router
 from backend.app.models import ConversationState
 from sqlalchemy import select
 import json
@@ -70,10 +71,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.command_router = command_router
         app.state.onebot_ws_receiver = ws_receiver
         app.state.scheduler = scheduler
+        watcher = TiboWatcher(command_router.tibo_client, notifier, secret_box)
+        app.state.tibo_watcher = watcher
 
         scheduler.add_job(
             monitor.run_all_scheduled, "interval", args=[SessionLocal], seconds=10,
             id="api-availability-check", replace_existing=True, max_instances=1,
+        )
+        scheduler.add_job(
+            watcher.run_once, "interval", args=[SessionLocal], seconds=15,
+            id="tibo-post-watch", replace_existing=True, max_instances=1, coalesce=True,
         )
         scheduler.start()
         ws_receiver.start()
@@ -98,6 +105,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(onebot_router)
     app.include_router(extensions_router)
     app.include_router(intel_router)
+    app.include_router(tibo_watch_router)
 
     root = Path(__file__).resolve().parents[2]
     frontend_dist = root / "frontend" / "dist"

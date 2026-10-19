@@ -30,12 +30,12 @@ COMMAND_DEFINITIONS: tuple[CommandDefinition, ...] = (
     CommandDefinition("/remove", "删除配置", "删除指定 API 配置。"),
     CommandDefinition("/check", "立即检查", "手动检查某个 API 配置；不带参数时检查当前通知对象的全部配置。"),
     CommandDefinition("/status", "状态图", "发送 API 状态条图片。"),
-    CommandDefinition("/stat", "网页快照", "抓取 GPTStore 状态页快照。"),
-    CommandDefinition("/price", "价格图", "发送 Sub2API 渠道倍率图片。"),
+    CommandDefinition("/price", "价格图", "发送 Sub2API / New API 渠道倍率与模型价格图片。"),
     CommandDefinition("/up", "看涨投票", "看涨整体 Token 倍率。", ("up",)),
     CommandDefinition("/down", "看跌投票", "看跌整体 Token 倍率。", ("down",)),
     CommandDefinition("/radar", "降智雷达", "读取 Codex Radar 公开摘要并发送模型 IQ 趋势图。"),
-    CommandDefinition("/tibo", "Tibo 雷达", "读取 Tibo 最新公开帖子与 presence 摘要并发送 X 风格图片。"),
+    CommandDefinition("/tibo", "Tibo 雷达", "自动读取 X @thsottiaux 最新公开帖子，发送原文与中文翻译图片。"),
+    CommandDefinition("/tibowatch", "Tibo 消息监听", "管理员设置 Tibo 新帖自动推送：G群号、PQQ号，多个目标用 & 连接；支持 on/off/status。"),
 )
 
 
@@ -150,7 +150,7 @@ def _validate_aliases(session: Session, command: str, aliases: list[str]) -> lis
                 raise ValueError(f"别名“{alias}”已经被 {definition.command} 使用。")
     rows = session.scalars(select(BotCommandSetting)).all()
     for row in rows:
-        if row.command == command:
+        if row.command == command or row.command not in KNOWN_COMMANDS:
             continue
         for alias in _clean_alias_list(row.aliases or []):
             if alias.casefold() in current_keys:

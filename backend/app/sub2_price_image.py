@@ -22,12 +22,13 @@ class Sub2PriceBoard:
     rates: list[Sub2StoredRate]
     changes: list[Sub2RateChange] = field(default_factory=list)
     model_prices: tuple[ModelTokenPrice, ...] = field(default_factory=tuple)
+    price_note: str = ""
 
 
 def render_sub2_price_image(
     boards: list[Sub2PriceBoard],
     *,
-    title: str = "Sub2API 渠道倍率",
+    title: str = "渠道倍率与模型价格",
     timezone_name: str = "Asia/Shanghai",
     sentiment: Sub2SentimentSummary | None = None,
     generated_at: datetime | None = None,
@@ -48,7 +49,7 @@ def render_sub2_price_image(
     draw.text((30, 22), title, fill=draw.theme.on_primary_container, font=font_title)
     draw.text(
         (30, 62),
-        "接口每 Token 单价 × 1,000,000 × 分组倍率 · 1 CNY = 1 USD 计价单位",
+        "Token 价格按百万 Token 展示，计次价格单独标注 · 已乘当前分组倍率",
         fill=draw.theme.on_primary_container,
         font=font_tiny,
     )
@@ -58,7 +59,7 @@ def render_sub2_price_image(
 
     y = header_height
     if not boards:
-        draw.text((30, y + 20), "没有可显示的 Sub2API 价格表", fill="#475569", font=font_heading)
+        draw.text((30, y + 20), "没有可显示的渠道价格表", fill="#475569", font=font_heading)
     for board, board_height in zip(boards, board_heights):
         _draw_board(
             draw,
@@ -83,11 +84,27 @@ def render_sub2_price_image(
 
 def _measure_board_height(board: Sub2PriceBoard) -> int:
     groups = _rates_by_platform(board.rates)
-    rate_rows = sum((len(items) + 1) // 2 for items in groups.values())
+    rate_height = sum(sum(max(_rate_card_height(rate, board.model_prices) for rate in row) + 22
+                          for row in _rate_rows(items, platform))
+                      for platform, items in groups.items())
     change_rows = min(len(board.changes), 4)
     change_block = change_rows * 28 + (16 if board.changes else 0)
     best_block = 34 if best_subscription_groups(board.rates) else 0
-    return 96 + best_block + change_block + max(1, rate_rows) * 358 + len(groups) * 42
+    return 96 + best_block + change_block + max(350, rate_height) + len(groups) * 42 + (28 if board.price_note else 0)
+
+
+def _rate_rows(rates: list[Sub2StoredRate], platform: str):
+    columns = 1 if platform == "newapi" else min(2, len(rates))
+    return [rates[index:index + columns] for index in range(0, len(rates), columns)]
+
+
+def _group_models(rate: Sub2StoredRate, prices: tuple[ModelTokenPrice, ...]):
+    return model_prices_for_group(prices, platform=rate.platform, group_name=rate.group_name,
+                                  group_key=rate.group_key, limit=None if rate.platform == "newapi" else 3)
+
+
+def _rate_card_height(rate: Sub2StoredRate, prices: tuple[ModelTokenPrice, ...]) -> int:
+    return (344 if rate.platform == "newapi" else 328) + max(0, len(_group_models(rate, prices)) - 3) * 22
 
 
 def _draw_board(
@@ -111,6 +128,9 @@ def _draw_board(
     draw.text((x + 22, y + 18), _fit_text(heading, font_heading, width - 44), fill="#0f172a", font=font_heading)
 
     cursor_y = y + 58
+    if board.price_note:
+        draw.text((x + 24, cursor_y), _fit_text(board.price_note, font_small, width - 48), fill="#b45309", font=font_small)
+        cursor_y += 28
     change_keys = {change.identity for change in board.changes}
     best_groups = best_subscription_groups(board.rates)
     if best_groups:
@@ -147,30 +167,20 @@ def _draw_board(
         draw.rounded_rectangle((x + 22, cursor_y + 2, x + 138, cursor_y + 30), radius=14, fill=color)
         draw.text((x + 44, cursor_y + 7), label, fill="#ffffff", font=font_small)
         cursor_y += 42
-        columns = min(2, len(rates))
+        columns = 1 if platform == "newapi" else min(2, len(rates))
         column_width = (width - 44) // columns
-        for index, rate in enumerate(rates):
-            col = index % columns
-            row = index // columns
-            card_x = x + 22 + col * column_width
-            card_y = cursor_y + row * 350
-            _draw_rate_card(
-                draw,
-                rate,
-                card_x,
-                card_y,
-                column_width - 14,
-                328,
-                timezone_name,
-                changed=rate.identity in change_keys,
-                platform_color=color,
-                model_prices=board.model_prices,
-                font_regular=font_regular,
-                font_rate=font_rate,
-                font_small=font_small,
-                font_tiny=font_tiny,
-            )
-        cursor_y += ((len(rates) + 1) // 2) * 350 + 10
+        for row in _rate_rows(rates, platform):
+            row_height = max(_rate_card_height(rate, board.model_prices) for rate in row)
+            for col, rate in enumerate(row):
+                _draw_rate_card(
+                    draw, rate, x + 22 + col * column_width, cursor_y,
+                    column_width - 14, row_height, timezone_name,
+                    changed=rate.identity in change_keys, platform_color=color,
+                    model_prices=board.model_prices, font_regular=font_regular,
+                    font_rate=font_rate, font_small=font_small, font_tiny=font_tiny,
+                )
+            cursor_y += row_height + 22
+        cursor_y += 10
 
 
 def _draw_rate_card(
@@ -240,40 +250,45 @@ def _draw_model_price_table(
     model_prices: tuple[ModelTokenPrice, ...],
     font: ImageFont.ImageFont,
 ) -> None:
-    models = model_prices_for_group(
-        model_prices,
-        platform=rate.platform,
-        group_name=rate.group_name,
-        group_key=rate.group_key,
-    )
-    columns = ["模型", "输入", "输出", "缓存写", "缓存读"]
-    widths = [int(width * .28)] + [int(width * .18)] * 4
+    models = _group_models(rate, model_prices)
+    newapi = rate.platform == "newapi"
+    columns = ["模型", "输入 / 次价" if newapi else "输入", "输出", "缓存写 5m / 1h" if newapi else "缓存写", "缓存读"]
+    widths = ([int(width * .40)] + [int(width * .15)] * 4) if newapi else ([int(width * .28)] + [int(width * .18)] * 4)
     positions = [x + sum(widths[:index]) for index in range(5)]
-    draw.text((x, y), "接口模型结算价（CNY / MTok，已乘当前倍率）", fill="#475569", font=font)
+    currency = models[0].currency if models else "USD" if newapi else "CNY"
+    draw.text((x, y), f"{'模型广场价格' if newapi else '接口模型结算价'}（{currency} / MTok，已乘当前倍率）", fill="#475569", font=font)
     y += 20
     draw.rectangle((x, y, x + width, y + 18), fill="#e2e8f0")
     for text, position in zip(columns, positions):
         draw.text((position + 4, y + 3), text, fill="#334155", font=font)
     if not models:
-        draw.text((x + 4, y + 27), "未从 /api/v1/channels/available 获取到 Token 单价", fill="#94a3b8", font=font)
+        draw.text((x + 4, y + 27), "未获取到当前分组的模型价格", fill="#94a3b8", font=font)
         return
     for index, model in enumerate(models):
         row_y = y + 19 + index * 22
         if index % 2 == 0:
             draw.rectangle((x, row_y, x + width, row_y + 21), fill="#f1f5f9")
-        cny = token_price_to_cny_per_mtok(model, rate.rate_multiplier)
-        values = [
-            cny.model_name,
-            _format_cny(cny.input),
-            _format_cny(cny.output),
-            _format_cny(cny.cache_write),
-            _format_cny(cny.cache_read),
-        ]
+        if model.billing_mode == "dynamic":
+            draw.text((x + 4, row_y + 3), _fit_text(model.model_name, font, widths[0] - 8), fill="#0f172a", font=font)
+            draw.text((positions[1] + 4, row_y + 3), model.price_note, fill="#b45309", font=font)
+            continue
+        if model.billing_mode == "request":
+            amount = model.request_price * rate.rate_multiplier if model.request_price is not None else None
+            values = [model.model_name, f"{_format_cny(amount)} / 次", "—", "—", "—"]
+        else:
+            converted = token_price_to_cny_per_mtok(model, rate.rate_multiplier)
+            cache_write = _format_cny(converted.cache_write)
+            if newapi and model.cache_write_1h_price is not None:
+                cache_write += " / " + _format_cny(model.cache_write_1h_price * 1_000_000 * rate.rate_multiplier)
+            values = [model.model_name, _format_cny(converted.input), _format_cny(converted.output),
+                      cache_write, _format_cny(converted.cache_read)]
         for text, position, column_width in zip(values, positions, widths):
             draw.text((position + 4, row_y + 3), _fit_text(text, font, column_width - 8), fill="#0f172a", font=font)
 
 
-def _format_cny(value: float) -> str:
+def _format_cny(value: float | None) -> str:
+    if value is None:
+        return "—"
     if math.isclose(value, 0, rel_tol=0, abs_tol=1e-12):
         return "0"
     if value >= 10:

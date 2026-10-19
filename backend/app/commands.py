@@ -4,13 +4,13 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.app.availability import ApiProbe
 from backend.app.check_image import CheckResultImageRow, render_check_result_image
-from backend.app.command_settings import is_command_enabled, resolve_command_text
+from backend.app.command_settings import is_command_enabled, known_command, resolve_command_text
 from backend.app.codex_radar import CodexRadarClient, CodexRadarError, render_codex_radar_image
 from backend.app.crypto import SecretBox
 from backend.app.models import APIConfig, ReceivedMessage, Sub2Config
@@ -40,7 +40,6 @@ from backend.app.sub2_sentiment import record_sentiment_vote, sentiment_summary
 from backend.app.sub2api import Sub2ApiClient, Sub2ApiError
 from backend.app.tibo_radar import TiboRadarClient, TiboRadarError, render_tibo_radar_image
 from backend.app.time_utils import utc_now
-from backend.app.web_snapshot import StatusPageSnapshotter, StatusSnapshotError
 
 
 @dataclass(slots=True)
@@ -64,7 +63,6 @@ class CommandRouter:
         onebot: OneBotClient,
         secret_box: SecretBox,
         probe: ApiProbe | None = None,
-        snapshotter: StatusPageSnapshotter | None = None,
         sub2_client: Sub2ApiClient | None = None,
         radar_client: CodexRadarClient | None = None,
         tibo_client: TiboRadarClient | None = None,
@@ -73,7 +71,6 @@ class CommandRouter:
         self.onebot = onebot
         self.secret_box = secret_box
         self.probe = probe or ApiProbe(timeout_seconds=settings.request_timeout_seconds)
-        self.snapshotter = snapshotter or StatusPageSnapshotter(settings)
         self.sub2_client = sub2_client or Sub2ApiClient(timeout_seconds=settings.request_timeout_seconds)
         self.radar_client = radar_client or CodexRadarClient(
             settings.codex_radar_source_url,
@@ -82,6 +79,8 @@ class CommandRouter:
         self.tibo_client = tibo_client or TiboRadarClient(
             settings.tibo_radar_source_url,
             timeout_seconds=settings.tibo_radar_timeout_seconds,
+            bearer_token=settings.tibo_x_bearer_token,
+            timezone_name=settings.app_timezone,
         )
         from backend.app.monitor import MonitorService
         from backend.app.notifier import OneBotNotifier
@@ -133,6 +132,8 @@ class CommandRouter:
         if command == "/cancel":
             clear_conversation(session, incoming.user_id)
             return "已取消当前对话。"
+        if not known_command(command):
+            return None
         if not is_command_enabled(session, command):
             return "该命令已关闭。"
         if command == "/list":
@@ -171,8 +172,6 @@ class CommandRouter:
             return await self._manual_check(session, incoming, arg)
         if command == "/status":
             return await self._status(session, incoming, arg)
-        if command == "/stat":
-            return await self._stat(session, incoming)
         if command == "/price":
             return await self._price(session, incoming)
         if command == "/up":
@@ -183,6 +182,8 @@ class CommandRouter:
             return await self._radar(session, incoming)
         if command == "/tibo":
             return await self._tibo(session, incoming)
+        if command == "/tibowatch":
+            return self._tibo_watch(session, incoming, arg)
         return None
 
     async def _manual_check(self, session: Session, incoming: IncomingMessage, name: str) -> str:
@@ -315,32 +316,12 @@ class CommandRouter:
             return None
         return list(session.scalars(select(APIConfig).order_by(APIConfig.name)).all())
 
-    async def _stat(self, session: Session, incoming: IncomingMessage) -> str:
-        target = self._notification_target_for_context(session, incoming)
-        if target is None:
-            return "权限不足，当前会话不是通知对象。"
-        ok, remaining = self._consume_command_cooldown(session, incoming, "stat")
-        if not ok:
-            return f"操作太频繁，请 {remaining} 秒后再试。"
-
-        try:
-            image = await self.snapshotter.capture()
-        except StatusSnapshotError as exc:
-            return f"网页快照失败：{exc}"
-        except Exception as exc:
-            return f"网页快照失败：{exc}"
-
-        target_type, target_id = target
-        result = await self.onebot.send_image_message(target_type, target_id, image, "gptstore-status.png")
-        record_send_result(session, result)
-        return ""
-
     async def _price(self, session: Session, incoming: IncomingMessage) -> str:
         configs = self._sub2_configs_for_notification_context(session, incoming)
         if configs is None:
-            return "权限不足，当前会话不是 Sub2API 通知对象。"
+            return "权限不足，当前会话不是渠道价格通知对象。"
         if not configs:
-            return "没有可显示的 Sub2API 价格表。"
+            return "没有可显示的渠道价格表。"
         ok, remaining = self._consume_command_cooldown(session, incoming, "price")
         if not ok:
             return f"操作太频繁，请 {remaining} 秒后再试。"
@@ -349,14 +330,15 @@ class CommandRouter:
         for config in configs:
             rate_views = stored_sub2_rate_views(session, config)
             model_prices = ()
-            if config.enabled and config.upstream_type != "newapi":
+            price_note = "配置已停用，当前仅展示已保存倍率。" if not config.enabled else ""
+            if config.enabled:
                 try:
                     catalog = await self.sub2_client.fetch_available_catalog_with_cached_token(
                         session,
                         config,
                         self.secret_box,
                     )
-                    if catalog.rates:
+                    if catalog.rates or config.upstream_type == "newapi":
                         sync_sub2_rates(session, config, list(catalog.rates))
                     rate_views = stored_sub2_rate_views(session, config)
                     model_prices = catalog.model_prices
@@ -365,25 +347,19 @@ class CommandRouter:
                 except Sub2ApiError as exc:
                     config.last_error = str(exc)
                     session.commit()
-            elif not rate_views and config.enabled:
-                try:
-                    rates = await self.sub2_client.fetch_rates_with_cached_token(session, config, self.secret_box)
-                    sync_sub2_rates(session, config, rates)
-                    rate_views = stored_sub2_rate_views(session, config)
-                except Sub2ApiError as exc:
-                    config.last_error = str(exc)
-                    session.commit()
+                    price_note = "模型价格获取失败，当前仅展示已保存倍率。"
             boards.append(
                 Sub2PriceBoard(
                     config.name,
                     rate_views,
                     model_prices=model_prices,
+                    price_note=price_note,
                 )
             )
 
         image = render_sub2_price_image(
             boards,
-            title="Sub2API 渠道倍率",
+            title="渠道倍率与模型价格",
             timezone_name=self.settings.app_timezone,
             sentiment=sentiment_summary(session),
         )
@@ -459,6 +435,36 @@ class CommandRouter:
         result = await self.onebot.send_image_message(target_type, target_id, image, "codex-radar.png")
         record_send_result(session, result)
         return ""
+
+    def _tibo_watch(self, session: Session, incoming: IncomingMessage, arg: str) -> str:
+        if not is_admin(session, incoming.user_id):
+            return "权限不足，Tibo 监听仅限 Bot 管理员配置。"
+        from backend.app.tibo_watch import TiboWatchSettings, read_watch_settings, save_watch_settings, watch_view
+        settings = read_watch_settings(session)
+        option = arg.strip()
+        if option.casefold() in {"", "status"}:
+            state = watch_view(session)["status"]
+            return (f"Tibo 监听：{'已启用' if settings.enabled else '已停用'}\n"
+                    f"通知对象：{settings.targets or '未配置'}\n检查间隔：{settings.interval_seconds} 秒\n"
+                    f"待推送：{state['pending_count']} 条\n"
+                    "用法：/tibowatch G群号&PQQ号；/tibowatch on 或 off。")
+        try:
+            values = settings.model_dump()
+            if option.casefold() == "off":
+                values["enabled"] = False
+            elif option.casefold() == "on":
+                if not settings.targets:
+                    return "请先配置通知对象，例如 /tibowatch G123456&P112233。"
+                values["enabled"] = True
+            else:
+                values.update(targets=option, enabled=True)
+            updated = TiboWatchSettings(**values)
+            save_watch_settings(session, updated)
+        except ValueError:
+            return "通知对象格式错误，请使用 /tibowatch G群号&PQQ号。"
+        return (f"Tibo 监听{'已启用' if updated.enabled else '已停用'}。\n"
+                f"通知对象：{updated.targets or '未配置'}\n"
+                "首次检查只建立基线，之后发现新帖会自动生成翻译图片并推送。")
 
     async def _tibo(self, session: Session, incoming: IncomingMessage) -> str:
         target = self._notification_target_for_context(session, incoming)

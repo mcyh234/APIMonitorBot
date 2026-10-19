@@ -25,6 +25,7 @@ from backend.app.repository import get_conversation, today_availability, upsert_
 from backend.app.settings import Settings
 from backend.app.status_bars import StatusBucketData, StatusWindowData, build_status_bars, should_render_timeout
 from backend.app.status_image import render_status_image
+from backend.app.time_utils import utc_now
 from test_monitor import FakeNotifier, SequenceProbe, add_config, add_sub2_config
 
 
@@ -299,3 +300,591 @@ async def test_sensitive_notification_does_not_leave_plaintext_audit(database):
     await OneBotNotifier(Client(), factory).send_sensitive(NotifyTarget("private", "123"), "private-content")
     row = session.scalar(select(SendRecord))
     assert "private-content" not in str((row.message_preview, row.error, row.response_payload))
+
+
+def newapi_pricing_payload():
+    def model(name, **values):
+        return {"model_name": name, "quota_type": 0, "model_ratio": 1.25,
+                "completion_ratio": 4, "enable_groups": ["standard"], **values}
+    return {
+        "success": True,
+        "group_ratio": {"standard": 0.2, "free": 0, "staff": 1, "auto": "自动", "broken": -1},
+        "usable_group": {"standard": "标准分组说明", "free": "免费分组", "auto": "自动"},
+        "data": [
+            model("token-model", cache_ratio=0.1, create_cache_ratio=1.25),
+            model("request-model", quota_type=1, model_price=0.03),
+            model("linear-model", billing_mode="tiered_expr", model_ratio=999,
+                  billing_expr='tier("base", p * 3 + c * 15 + cr * 0.3 + cc * 3.75 + cc1h * 6)'),
+            model("dynamic-model", billing_mode="tiered_expr", model_ratio=999,
+                  billing_expr='len > 10000 ? tier("long", p * 6 + c * 30) : tier("base", p * 3 + c * 15)'),
+            model("zero-model", model_ratio=0, enable_groups=["all"]),
+            model("hidden-model", enable_groups=["staff"]),
+        ],
+    }
+
+
+def test_newapi_prices_use_plaza_units_currency_and_model_group_membership():
+    from backend.app.newapi_pricing import flatten_newapi_catalog
+    from backend.app.model_pricing import model_prices_for_group, token_price_to_cny_per_mtok
+    catalog = flatten_newapi_catalog(newapi_pricing_payload(), {"quota_display_type": "CNY", "usd_exchange_rate": 7})
+    assert [(r.group_key, r.rate_multiplier) for r in catalog.rates] == [("free", 0), ("standard", 0.2)]
+    models = {p.model_name: p for p in catalog.model_prices}
+    assert "hidden-model" not in models
+    price = token_price_to_cny_per_mtok(models["token-model"], 0.2)
+    assert price.input == pytest.approx(3.5)
+    assert price.output == pytest.approx(14)
+    assert price.cache_read == pytest.approx(0.35)
+    assert price.cache_write == pytest.approx(4.375)
+    assert models["token-model"].currency == "CNY"
+    assert models["request-model"].request_price * 0.2 == pytest.approx(0.042)
+    assert models["request-model"].billing_mode == "request"
+    assert models["dynamic-model"].billing_mode == "dynamic"
+    linear = token_price_to_cny_per_mtok(models["linear-model"], 0.2)
+    assert linear.input == pytest.approx(4.2)
+    assert linear.output == pytest.approx(21)
+    assert models["linear-model"].cache_write_1h_price * 1_000_000 * 0.2 == pytest.approx(8.4)
+    assert models["zero-model"].cache_read_price is None
+    assert token_price_to_cny_per_mtok(models["zero-model"], 0).input == 0
+    free = model_prices_for_group(catalog.model_prices, platform="newapi", group_name="免费", group_key="free", limit=None)
+    assert [p.model_name for p in free] == ["zero-model"]
+    assert len(model_prices_for_group(catalog.model_prices, platform="newapi", group_name="standard", group_key="standard", limit=None)) == 5
+
+
+@pytest.mark.parametrize("status,currency,rate", [
+    ({}, "USD", 1), ({"quota_display_type": "USD", "usd_exchange_rate": 7}, "USD", 1),
+    ({"quota_display_type": "CNY"}, "USD", 1),
+    ({"quota_display_type": "CNY", "usd_exchange_rate": 0}, "USD", 1),
+    ({"quota_display_type": "CUSTOM", "custom_currency_symbol": "积分", "custom_currency_exchange_rate": 3}, "积分", 3),
+])
+def test_newapi_display_currency_never_guesses_exchange_rate(status, currency, rate):
+    from backend.app.newapi_pricing import flatten_newapi_catalog
+    model = next(p for p in flatten_newapi_catalog(newapi_pricing_payload(), status).model_prices if p.model_name == "token-model")
+    assert model.currency == currency
+    assert model.input_price * 1_000_000 == pytest.approx(2.5 * rate)
+
+
+@pytest.mark.parametrize("expression", [
+    'tier("base", max(p * 3, 100) + c * 15)',
+    'tier("base", p * 3 + c * 15) * 2',
+    'tier("base", p * 3 + c * 15 + img * 5)',
+    'tier("base", p * 3 + p * 2 + c * 15)',
+    '__import__("os").system("echo forbidden")',
+])
+def test_newapi_unrecognized_expressions_remain_dynamic(expression):
+    from backend.app.newapi_pricing import flatten_newapi_catalog
+    data = newapi_pricing_payload()
+    data["data"] = [{"model_name": "custom-model", "enable_groups": ["standard"],
+                     "billing_mode": "tiered_expr", "billing_expr": expression, "model_ratio": 999}]
+    model = flatten_newapi_catalog(data).model_prices[0]
+    assert model.billing_mode == "dynamic"
+    assert model.price_note
+
+
+@pytest.mark.asyncio
+async def test_newapi_catalog_reuses_credentials_and_normalizes_pricing_url(database):
+    from backend.app.sub2api import Sub2ApiClient
+    from backend.app.models import Sub2Config
+    session, _ = database
+    box = SecretBox("test")
+    add_sub2_config(session, box)
+    config = session.scalar(select(Sub2Config))
+    config.upstream_type = "newapi"
+    config.newapi_user_id = "42"
+    config.base_url = "https://plaza.example/pricing?view=all#models"
+    requests = []
+    def handle(request):
+        requests.append(request)
+        if request.url.path == "/api/pricing":
+            assert request.headers["New-Api-User"] == "42"
+            assert request.headers["Authorization"] == "access-token"
+            assert not request.url.query and not request.url.fragment
+            return httpx.Response(200, json=newapi_pricing_payload())
+        assert request.url.path == "/api/status"
+        return httpx.Response(200, json={"success": True, "data": {"quota_display_type": "CNY", "usd_exchange_rate": 1}})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        catalog = await Sub2ApiClient(client=client).fetch_available_catalog_with_cached_token(session, config, box)
+    assert len(requests) == 2
+    assert {p.currency for p in catalog.model_prices} == {"CNY"}
+
+
+@pytest.mark.asyncio
+async def test_newapi_expired_session_relogs_and_status_failure_keeps_usd_prices(database):
+    from backend.app.sub2api import Sub2ApiClient
+    from backend.app.models import Sub2Config
+    session, _ = database
+    box = SecretBox("test")
+    add_sub2_config(session, box)
+    config = session.scalar(select(Sub2Config))
+    config.upstream_type, config.newapi_user_id = "newapi", "42"
+    config.access_token_encrypted = box.encrypt("expired-token")
+    config.session_cookie_encrypted = box.encrypt("session=expired")
+    calls = []
+    def handle(request):
+        calls.append(request.url.path)
+        if request.url.path == "/api/pricing":
+            if request.headers.get("cookie") != "session=fresh":
+                return httpx.Response(401, text="Session expired")
+            assert "authorization" not in request.headers
+            return httpx.Response(200, json=newapi_pricing_payload())
+        if request.url.path == "/api/user/login":
+            assert json.loads(request.content) == {"username": "bot@example.com", "password": "password"}
+            return httpx.Response(200, json={"success": True, "data": {"id": 42}}, headers={"set-cookie": "session=fresh; Path=/; HttpOnly"})
+        assert request.url.path == "/api/status"
+        return httpx.Response(502, text="unavailable")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        catalog = await Sub2ApiClient(client=client).fetch_available_catalog_with_cached_token(session, config, box)
+    assert calls == ["/api/pricing", "/api/user/login", "/api/pricing", "/api/status"]
+    assert box.decrypt(config.session_cookie_encrypted) == "session=fresh"
+    assert config.access_token_encrypted is None
+    assert {p.currency for p in catalog.model_prices} == {"USD"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [{"success": False, "message": "denied"}, {"success": True, "data": []}, []])
+async def test_newapi_catalog_rejects_error_or_incomplete_payload(payload):
+    from backend.app.sub2api import Sub2ApiClient, Sub2ApiError
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=payload))) as client:
+        with pytest.raises(Sub2ApiError):
+            await Sub2ApiClient(client=client).fetch_newapi_catalog("https://plaza.example")
+
+
+@pytest.mark.asyncio
+async def test_newapi_price_command_obeys_targets_cooldown_and_pause(database, monkeypatch):
+    from backend.app.commands import CommandRouter, IncomingMessage
+    from backend.app.sub2api import Sub2ApiClient
+    from backend.app.models import Sub2Config
+    from tests.test_commands import FakeOneBot, FakeProbe
+    session, _ = database
+    box = SecretBox("test")
+    add_sub2_config(session, box, target_type="multi", target_id="G123&P456")
+    config = session.scalar(select(Sub2Config))
+    config.upstream_type, config.newapi_user_id = "newapi", "42"
+    onebot, boards, requests = FakeOneBot(), [], []
+    def render(items, **kwargs):
+        boards.extend(items)
+        return b"fake-png"
+    monkeypatch.setattr("backend.app.commands.render_sub2_price_image", render)
+    def handle(request):
+        requests.append(request.url.path)
+        return httpx.Response(200, json=newapi_pricing_payload() if request.url.path == "/api/pricing" else {"success": True, "data": {}})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        router = CommandRouter(Settings(), onebot, box, probe=FakeProbe(), sub2_client=Sub2ApiClient(client=client))
+        wrong_group = IncomingMessage("111", "/price", "group", "999")
+        assert "权限不足" in await router.handle_message(session, wrong_group)
+        assert requests == []
+        incoming = IncomingMessage("111", "/price", "group", "123")
+        assert await router.handle_message(session, incoming) == ""
+        assert len(boards[0].model_prices) == 5
+        assert {r.platform for r in boards[0].rates} == {"newapi"}
+        assert len(requests) == 2
+        assert "操作太频繁" in await router.handle_message(session, incoming)
+        assert len(requests) == 2
+        # Admin private requests still require a bound notification target.
+        session.add_all([BotAdmin(qq="456"), BotAdmin(qq="789")])
+        session.commit()
+        assert "没有可显示" in await router.handle_message(session, IncomingMessage("789", "/price", "private"))
+        config.enabled = False
+        session.commit()
+        assert await router.handle_message(session, IncomingMessage("456", "/price", "private")) == ""
+        assert boards[-1].price_note and not boards[-1].model_prices
+        assert len(requests) == 2
+    assert onebot.sent == [("group", "123", "[image:sub2-price.png]"), ("private", "456", "[image:sub2-price.png]")]
+
+
+@pytest.mark.asyncio
+async def test_newapi_price_error_preserves_saved_rates_and_explains_missing_prices(database, monkeypatch):
+    from backend.app.commands import CommandRouter, IncomingMessage
+    from backend.app.models import Sub2Config
+    from backend.app.sub2api import Sub2ApiError
+    from tests.test_commands import FakeOneBot, FakeProbe
+    session, _ = database
+    box = SecretBox("test")
+    add_sub2_config(session, box)
+    config = session.scalar(select(Sub2Config))
+    config.upstream_type = "newapi"
+    boards = []
+    class BrokenClient:
+        async def fetch_available_catalog_with_cached_token(self, *args):
+            raise Sub2ApiError("pricing unavailable")
+    def render(items, **kwargs):
+        boards.extend(items)
+        return b"fake-png"
+    monkeypatch.setattr("backend.app.commands.render_sub2_price_image", render)
+    router = CommandRouter(Settings(), FakeOneBot(), box, probe=FakeProbe(), sub2_client=BrokenClient())
+    assert await router.handle_message(session, IncomingMessage("111", "/price", "group", "123")) == ""
+    assert boards[0].rates and not boards[0].model_prices
+    assert "获取失败" in boards[0].price_note
+    assert config.last_error == "pricing unavailable"
+
+
+def test_newapi_image_expands_all_models_and_marks_dynamic_request_and_unknown_cache(monkeypatch):
+    from backend.app.material_theme import MaterialDraw
+    from backend.app.newapi_pricing import flatten_newapi_catalog
+    from backend.app.sub2_price_image import Sub2PriceBoard, render_sub2_price_image
+    from backend.app.sub2_rates import Sub2StoredRate
+    catalog = flatten_newapi_catalog(newapi_pricing_payload())
+    rates = [Sub2StoredRate(r.platform, r.group_key, r.group_name, r.rate_multiplier, utc_now(), ()) for r in catalog.rates]
+    texts = []
+    original = MaterialDraw.__getattr__
+    def tracked(self, name):
+        function = original(self, name)
+        if name != "text":
+            return function
+        def draw_text(position, value, **kwargs):
+            texts.append((position, value))
+            return function(position, value, **kwargs)
+        return draw_text
+    monkeypatch.setattr(MaterialDraw, "__getattr__", tracked)
+    image = Image.open(BytesIO(render_sub2_price_image([Sub2PriceBoard("New API 离线价格", rates, model_prices=catalog.model_prices)])))
+    values = [value for _, value in texts]
+    assert all(model.model_name in values for model in catalog.model_prices)
+    assert any("USD / MTok" in value for value in values)
+    assert "0.006000 / 次" in values
+    assert "动态计费，详见模型广场" in values
+    assert "—" in values
+    assert max(position[1] for position, _ in texts) + 20 < image.height
+
+
+@pytest.mark.asyncio
+async def test_removed_stat_command_and_legacy_alias_never_send(database):
+    from backend.app.command_settings import list_command_settings, set_command_aliases
+    from backend.app.commands import CommandRouter, IncomingMessage
+    from backend.app.models import BotCommandSetting
+    from tests.test_commands import FakeOneBot, FakeProbe
+    session, _ = database
+    session.add(BotCommandSetting(command="/stat", enabled=False, aliases=["网页快照"]))
+    session.commit()
+    onebot = FakeOneBot()
+    router = CommandRouter(Settings(), onebot, SecretBox("test"), probe=FakeProbe())
+    for command in ("/stat", "网页快照"):
+        assert await router.handle_message(session, IncomingMessage("123", command, "group", "456")) is None
+    assert onebot.sent == []
+    assert "/stat" not in {definition.command for definition, _, _ in list_command_settings(session)}
+    set_command_aliases(session, "/status", ["网页快照"])
+
+
+def tibo_timeline_post(post_id="200", text="New release.", **values):
+    return {"id": post_id, "text": text, "created_at": "2026-10-19T04:00:00Z",
+            "author": {"screen_name": "thsottiaux", "name": "Tibo"}, **values}
+
+
+def test_tibo_timeline_ignores_pin_order_other_authors_and_reposts():
+    from backend.app.x_timeline import parse_timeline
+    posts = [tibo_timeline_post("100", "Old pinned post.", created_at="2026-01-01T00:00:00Z"),
+             tibo_timeline_post(),
+             tibo_timeline_post("300", "Reposted.", is_retweet=True, created_at="2026-10-19T05:00:00Z"),
+             tibo_timeline_post("400", "Other author.", author={"screen_name": "someone_else"}, created_at="2026-10-19T06:00:00Z")]
+    payload = {"props": {"pageProps": {"timeline": {"entries": [
+        {"type": "tweet", "content": {"tweet": post}} for post in posts
+    ]}}}}
+    page = f'<html><script id="__NEXT_DATA__" type="application/json">{json.dumps(payload)}</script></html>'
+    assert parse_timeline(page.encode())["url"] == "https://x.com/thsottiaux/status/200"
+
+
+@pytest.mark.parametrize("atom", [False, True])
+def test_tibo_rss_and_atom_keep_full_text_and_select_latest_by_time(atom):
+    from backend.app.x_timeline import parse_timeline
+    if atom:
+        body = '''<feed xmlns="http://www.w3.org/2005/Atom"><entry><title>New release.</title>
+        <link href="https://x.com/thsottiaux/status/200"/><published>2026-10-19T04:00:00Z</published>
+        <content type="html">&lt;p&gt;New &amp;amp; complete.&lt;br/&gt;Second line.&lt;/p&gt;</content></entry></feed>'''
+    else:
+        body = '''<rss><channel><item><title>Old pin</title><link>https://x.com/thsottiaux/status/100</link>
+        <pubDate>Sun, 18 Oct 2026 12:00:00 GMT</pubDate><description>Old.</description></item>
+        <item><title>New release</title><link>https://x.com/thsottiaux/status/200</link>
+        <pubDate>Mon, 19 Oct 2026 04:00:00 GMT</pubDate><description><![CDATA[<p>New &amp; complete.<br/>Second line.</p>]]></description></item>
+        <item><title>Other account</title><link>https://x.com/another/status/300</link>
+        <pubDate>Mon, 19 Oct 2026 05:00:00 GMT</pubDate><description>Other.</description></item></channel></rss>'''
+    post = parse_timeline(body.encode())
+    assert post["url"] == "https://x.com/thsottiaux/status/200"
+    assert post["text"] == "New & complete.\nSecond line."
+
+
+@pytest.mark.parametrize("body", [b"<html>Sign in</html>", b'{"tibo_presence":{"source_url":"https://x.com/thsottiaux/status/100"}}', b'{"tweets":[]}', b"\xff\xfe"])
+def test_tibo_invalid_timelines_never_fall_back_to_old_summary_links(body):
+    from backend.app.x_timeline import TimelineError, parse_timeline
+    with pytest.raises(TimelineError):
+        parse_timeline(body)
+
+
+@pytest.mark.asyncio
+async def test_tibo_official_api_keeps_note_text_reply_context_and_token_private():
+    from backend.app.tibo_radar import TiboRadarClient
+    calls = []
+    def handle(request):
+        calls.append(request)
+        if request.url.host == "api.x.com":
+            assert request.headers["authorization"] == "Bearer local-secret"
+            if "/by/username/" in request.url.path:
+                return httpx.Response(200, json={"data": {"id": "42", "name": "Tibo", "username": "thsottiaux"}})
+            assert request.url.path == "/2/users/42/tweets"
+            assert request.url.params["exclude"] == "retweets"
+            return httpx.Response(200, json={
+                "data": [{"id": "200", "author_id": "42", "text": "Short preview…",
+                          "note_tweet": {"text": "Full original text from the latest reply."},
+                          "created_at": "2026-10-19T04:00:00Z", "public_metrics": {"like_count": 0},
+                          "referenced_tweets": [{"id": "150", "type": "replied_to"}]},
+                         {"id": "100", "author_id": "42", "text": "Old pinned post.", "created_at": "2026-01-01T00:00:00Z"}],
+                "includes": {"tweets": [{"id": "150", "author_id": "7", "text": "Parent post.", "created_at": "2026-10-19T03:00:00Z"}],
+                             "users": [{"id": "7", "username": "parent_user", "name": "Parent"}]},
+            })
+        assert request.url.host == "translate.googleapis.com"
+        assert "authorization" not in request.headers
+        return httpx.Response(200, json=[[["最新帖子的完整中文译文。", "original"]]])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        radar = TiboRadarClient(client=client, bearer_token="local-secret")
+        first = await radar.fetch()
+        second = await radar.fetch()
+    assert first.post.source_url == second.post.source_url == "https://x.com/thsottiaux/status/200"
+    assert first.post.text == "Full original text from the latest reply."
+    assert first.post.translated_zh == "最新帖子的完整中文译文。"
+    assert first.post.likes == 0
+    assert first.post.parent.username == "parent_user"
+    assert not hasattr(first, "presence")
+    assert sum("/by/username/" in request.url.path for request in calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_tibo_default_rss_mirror_fallback_and_legacy_source_migration():
+    from backend.app.tibo_radar import TiboRadarClient
+    hosts = []
+    def handle(request):
+        hosts.append(request.url.host)
+        assert "authorization" not in request.headers
+        if request.url.host == "fxtwitter.com":
+            return httpx.Response(503)
+        if request.url.host == "fixupx.com":
+            return httpx.Response(200, json={"tweets": [tibo_timeline_post()]})
+        if request.url.host == "api.fxtwitter.com":
+            return httpx.Response(403)
+        assert request.url.host == "translate.googleapis.com"
+        return httpx.Response(200, json=[[["新版本。", "New release."]]])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        report = await TiboRadarClient("https://codexradar.com/current.json", client=client).fetch()
+    assert hosts[:2] == ["fxtwitter.com", "fixupx.com"]
+    assert "codexradar.com" not in hosts
+    assert report.post.text == "New release."
+    assert report.post.translated_zh == "新版本。"
+
+
+@pytest.mark.asyncio
+async def test_tibo_google_rate_limit_uses_translation_fallback_with_byte_limits():
+    from backend.app.tibo_radar import TiboRadarClient
+    pieces = []
+    source = "An update on Codex. " * 150
+    def handle(request):
+        assert "authorization" not in request.headers
+        if request.url.host == "translate.googleapis.com":
+            return httpx.Response(429)
+        assert request.url.host == "api.mymemory.translated.net"
+        piece = request.url.params["q"]
+        assert len(piece.encode()) <= 480
+        assert request.url.params["langpair"] == "en|zh-CN"
+        pieces.append(piece)
+        return httpx.Response(200, json={"responseStatus": 200, "responseData": {"translatedText": "Codex 最新动态。"}})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        translated, label = await TiboRadarClient(client=client)._translate(source)
+    assert "".join(pieces) == source
+    assert translated.count("Codex 最新动态。") == len(pieces)
+    assert label == "中文翻译 · 机器翻译"
+
+
+@pytest.mark.asyncio
+async def test_tibo_translation_failure_preserves_original_and_explicit_error():
+    from backend.app.tibo_radar import TiboRadarClient
+    source = "Complete original text, even when services fail."
+    def handle(request):
+        if request.url.host == "timeline.example":
+            return httpx.Response(200, json={"tweets": [tibo_timeline_post(text=source)]})
+        return httpx.Response(503)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        report = await TiboRadarClient("https://timeline.example/rss", client=client).fetch()
+    assert report.post.text == source
+    assert report.post.translation_label == "中文翻译 · 暂不可用"
+    assert report.post.translated_zh == "翻译暂不可用，请查看上方原文。"
+
+
+@pytest.mark.asyncio
+async def test_tibo_all_sources_down_fail_without_returning_a_stale_post():
+    from backend.app.tibo_radar import TiboRadarClient, TiboRadarError
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(429))) as client:
+        with pytest.raises(TiboRadarError, match="无法读取最新帖子"):
+            await TiboRadarClient(client=client).fetch()
+
+
+def test_tibo_image_has_original_translation_and_no_regional_panel(monkeypatch):
+    from backend.app.material_theme import MaterialDraw
+    from backend.app.tibo_radar import TiboPost, TiboRadarReport, render_tibo_radar_image
+    texts = []
+    original = MaterialDraw.__getattr__
+    def tracked(self, name):
+        function = original(self, name)
+        if name != "text":
+            return function
+        def draw_text(position, value, **kwargs):
+            texts.append((position, value))
+            return function(position, value, **kwargs)
+        return draw_text
+    monkeypatch.setattr(MaterialDraw, "__getattr__", tracked)
+    post = TiboPost("https://x.com/thsottiaux/status/200", "Tibo", "thsottiaux", "New release.",
+                    "新版本已发布。", "中文翻译 · 机器翻译", utc_now(), 0, 0, 0, None, None)
+    report = TiboRadarReport(utc_now(), "Asia/Shanghai", post)
+    image = Image.open(BytesIO(render_tibo_radar_image(report)))
+    values = [value for _, value in texts]
+    assert "New release." in values and "新版本已发布。" in values
+    assert not any(term in value for _, value in texts for term in ("PRESENCE", "概率", "判断依据", "位置", "区域"))
+    assert max(position[1] for position, _ in texts) + 20 < image.height
+
+
+@pytest.mark.asyncio
+async def test_tibo_watch_baseline_burst_dedup_and_per_target_restart_retry(database, monkeypatch):
+    from backend.app.app_settings import get_app_setting
+    from backend.app.tibo_watch import TiboWatcher, TiboWatchSettings, STATE_KEY, read_watch_state, save_watch_settings
+    session, factory = database
+    clock = [datetime(2026, 10, 19, 5, tzinfo=timezone.utc)]
+    monkeypatch.setattr("backend.app.tibo_watch.utc_now", lambda: clock[0])
+    rendered, sent = [], []
+    class Client:
+        posts = [tibo_timeline_post("100", "Initial baseline.")]
+        calls = 0
+        async def fetch_posts(self):
+            self.calls += 1
+            return self.posts
+        async def report_for_post(self, raw):
+            return raw
+    def render(raw):
+        rendered.append(raw["id"])
+        return b"png"
+    monkeypatch.setattr("backend.app.tibo_watch.render_tibo_radar_image", render)
+    class Delivery:
+        private_failed = False
+        async def send_image(self, target, image_bytes, filename):
+            sent.append((target.target_type, target.target_id))
+            assert filename == "tibo-radar.png" and image_bytes == b"png"
+            if target.target_type == "private" and not self.private_failed:
+                self.private_failed = True
+                return SimpleNamespace(ok=False)
+            return SimpleNamespace(ok=True)
+    box, client, delivery = SecretBox("watch-test"), Client(), Delivery()
+    watcher = TiboWatcher(client, delivery, box)
+    await watcher.run_once(factory)
+    assert client.calls == 0  # Disabled unless explicitly configured.
+    save_watch_settings(session, TiboWatchSettings(enabled=True, targets="G123&P456"))
+    await watcher.run_once(factory)
+    assert read_watch_state(session).cursor == "100"
+    assert rendered == sent == []
+    clock[0] += timedelta(seconds=120)
+    client.posts = [tibo_timeline_post("300", "Private queued post body."), tibo_timeline_post("200", "Another new post."), *client.posts]
+    await watcher.run_once(factory)
+    assert rendered == ["200", "300"]
+    assert sent == [("group", "123"), ("private", "456"), ("group", "123")]
+    state = read_watch_state(session)
+    assert [(item.post_id, item.target) for item in state.pending] == [("200", "P456"), ("300", "P456")]
+    stored = get_app_setting(session, STATE_KEY)
+    assert "Private queued post body" not in stored and "Another new post" not in stored
+    # Restart the worker with no new poll due; retry pending private deliveries only.
+    restarted = TiboWatcher(client, delivery, box)
+    clock[0] += timedelta(seconds=61)
+    await restarted.run_once(factory)
+    assert sent[-2:] == [("private", "456"), ("private", "456")]
+    assert not read_watch_state(session).pending
+    clock[0] += timedelta(seconds=120)
+    await restarted.run_once(factory)
+    assert len(sent) == 5  # Re-reading the same feed sends nothing again.
+
+
+@pytest.mark.asyncio
+async def test_tibo_watch_pause_or_removed_target_during_render_stops_delivery(database, monkeypatch):
+    from backend.app.tibo_watch import TiboWatcher, TiboWatchSettings, read_watch_state, save_watch_settings
+    session, factory = database
+    box = SecretBox("watch-test")
+    clock = [datetime(2026, 10, 19, 5, tzinfo=timezone.utc)]
+    monkeypatch.setattr("backend.app.tibo_watch.utc_now", lambda: clock[0])
+    save_watch_settings(session, TiboWatchSettings(enabled=True, targets="G123&P456"))
+    sent = []
+    class Client:
+        posts = [tibo_timeline_post("100")]
+        async def fetch_posts(self):
+            return self.posts
+        async def report_for_post(self, raw):
+            with factory() as other:
+                save_watch_settings(other, TiboWatchSettings(enabled=False, targets="G123&P456"))
+            return raw
+    class Delivery:
+        async def send_image(self, *args):
+            sent.append(args)
+            return SimpleNamespace(ok=True)
+    monkeypatch.setattr("backend.app.tibo_watch.render_tibo_radar_image", lambda raw: b"png")
+    client = Client()
+    watcher = TiboWatcher(client, Delivery(), box)
+    await watcher.run_once(factory)
+    clock[0] += timedelta(seconds=120)
+    client.posts = [tibo_timeline_post("200")]
+    await watcher.run_once(factory)
+    assert sent == [] and len(read_watch_state(session).pending) == 2
+    with factory() as other:
+        save_watch_settings(other, TiboWatchSettings(enabled=True, targets="P456"))
+    async def report(raw):
+        return raw
+    client.report_for_post = report
+    await watcher.run_once(factory)
+    assert len(sent) == 1 and sent[0][0].target_id == "456"
+    assert not read_watch_state(session).pending
+
+
+@pytest.mark.asyncio
+async def test_tibo_watch_fetch_failure_preserves_cursor_and_retry_persistence(database, monkeypatch):
+    from backend.app.app_settings import set_app_setting
+    from backend.app.tibo_watch import TiboWatcher, TiboWatchSettings, WatchState, STATE_KEY, read_watch_state, save_watch_settings
+    session, factory = database
+    box = SecretBox("watch-test")
+    save_watch_settings(session, TiboWatchSettings(enabled=True, targets="G123"))
+    set_app_setting(session, STATE_KEY, WatchState(cursor="100").model_dump_json())
+    class BrokenClient:
+        async def fetch_posts(self):
+            raise RuntimeError("unavailable")
+    class NoDelivery:
+        async def send_image(self, *args):
+            pytest.fail("No new post should be sent")
+    await TiboWatcher(BrokenClient(), NoDelivery(), box).run_once(factory)
+    state = read_watch_state(session)
+    assert state.cursor == "100" and state.last_error and state.last_checked_at
+
+
+@pytest.mark.asyncio
+async def test_tibowatch_admin_command_uses_shared_web_settings_and_switch(database):
+    from backend.app.commands import CommandRouter, IncomingMessage
+    from backend.app.command_settings import set_command_enabled
+    from backend.app.tibo_watch import read_watch_settings, watch_view
+    from tests.test_commands import FakeOneBot, FakeProbe
+    session, _ = database
+    session.add(BotAdmin(qq="999"))
+    session.commit()
+    router = CommandRouter(Settings(), FakeOneBot(), SecretBox("watch-test"), probe=FakeProbe())
+    def message(text, user="999"):
+        return IncomingMessage(user, text, "private")
+    assert "权限不足" in await router.handle_message(session, message("/tibowatch G123", "111"))
+    assert not read_watch_settings(session).enabled
+    assert "请先配置" in await router.handle_message(session, message("/tibowatch on"))
+    assert "已启用" in await router.handle_message(session, message("/tibowatch g123&P456&G123"))
+    assert watch_view(session)["settings"]["targets"] == "G123&P456"
+    assert "已停用" in await router.handle_message(session, message("/tibowatch off"))
+    assert not read_watch_settings(session).enabled
+    assert "已启用" in await router.handle_message(session, message("/tibowatch on"))
+    assert "G123&P456" in await router.handle_message(session, message("/tibowatch status"))
+    assert "格式错误" in await router.handle_message(session, message("/tibowatch 123"))
+    set_command_enabled(session, "/tibowatch", False)
+    assert await router.handle_message(session, message("/tibowatch off")) == "该命令已关闭。"
+    assert read_watch_settings(session).enabled
+
+
+def test_tibo_watch_configuration_validation_and_status_never_expose_payload(database):
+    from backend.app.tibo_watch import TiboWatchSettings, put_watch, watch_view
+    session, _ = database
+    for data in ({"enabled": True}, {"targets": "Gbad"}, {"interval_seconds": 5}):
+        with pytest.raises(ValueError):
+            TiboWatchSettings(**data)
+    view = put_watch(TiboWatchSettings(enabled=True, targets="g123&p456"), session)
+    assert view["settings"] == {"enabled": True, "targets": "G123&P456", "interval_seconds": 120}
+    assert not view["status"]["initialized"]
+    assert "pending" not in watch_view(session)["status"]

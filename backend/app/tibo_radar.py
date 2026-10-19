@@ -1,35 +1,29 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 import html
 from io import BytesIO
 import re
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urlencode
 from zoneinfo import ZoneInfo
 
 import httpx
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from backend.app.material_theme import material_canvas, load_font as _font
+from backend.app.time_utils import utc_now
+from backend.app.x_timeline import TimelineError, posts_from_json, parse_timeline_posts, post_datetime
+
+
+TIBO_USERNAME = "thsottiaux"
+DEFAULT_TIMELINE_URL = f"https://fxtwitter.com/{TIBO_USERNAME}/feed.xml?count=30&with_replies=1"
+FALLBACK_TIMELINE_URL = f"https://fixupx.com/{TIBO_USERNAME}/feed.xml?count=30&with_replies=1"
 
 
 class TiboRadarError(RuntimeError):
     pass
-
-
-@dataclass(frozen=True, slots=True)
-class TiboPresence:
-    location_zh: str
-    location_en: str
-    probability: float
-    confidence: str
-    evidence_zh: str
-    evidence_en: str
-    safety_note_zh: str
-    observations: int
-    observed_at: datetime | None
-    updated_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,70 +67,138 @@ class TiboPost:
 class TiboRadarReport:
     monitored_at: datetime
     timezone: str
-    presence: TiboPresence
     post: TiboPost
 
 
 class TiboRadarClient:
     def __init__(
         self,
-        source_url: str = "https://codexradar.com/current.json",
+        source_url: str = "",
         timeout_seconds: float = 20.0,
         client: httpx.AsyncClient | None = None,
+        *,
+        bearer_token: str = "",
+        timezone_name: str = "Asia/Shanghai",
     ) -> None:
-        self.source_url = source_url
+        # Old installations used the regional summary URL as the source.
+        # Migrate that default without reading its contents or old post links.
+        source_url = source_url.strip()
+        if source_url.rstrip("/") == "https://codexradar.com/current.json":
+            source_url = ""
+        self.source_url = source_url.strip() or DEFAULT_TIMELINE_URL
+        self._source_urls = (source_url.strip(),) if source_url.strip() else (DEFAULT_TIMELINE_URL, FALLBACK_TIMELINE_URL)
         self.timeout_seconds = timeout_seconds
         self._client = client
+        self._bearer_token = bearer_token.strip()
+        self.timezone = timezone_name
+        self._x_user: dict | None = None
 
     async def fetch(self) -> TiboRadarReport:
-        payload = await self._json(self.source_url, "Codex Radar")
-        monitored_at = _datetime(payload.get("monitored_at")) or datetime.now(ZoneInfo("Asia/Shanghai"))
-        timezone = str(payload.get("timezone") or "Asia/Shanghai")
-        presence_raw = payload.get("tibo_presence")
-        if not isinstance(presence_raw, dict):
-            raise TiboRadarError("Codex Radar 公开摘要缺少 tibo_presence。")
-        presence = parse_tibo_presence(presence_raw)
-        source_url = _source_url(presence_raw)
-        post = await self._fetch_post(source_url, presence)
-        return TiboRadarReport(monitored_at=monitored_at, timezone=timezone, presence=presence, post=post)
+        posts = await self.fetch_posts()
+        return await self.report_for_post(posts[0])
 
-    async def _fetch_post(self, source_url: str, presence: TiboPresence) -> TiboPost:
-        username, tweet_id = _tweet_identity(source_url)
-        api_url = f"https://api.fxtwitter.com/{quote(username)}/status/{quote(tweet_id)}"
+    async def report_for_post(self, raw: dict) -> TiboRadarReport:
+        post = await self._fetch_post(raw)
+        return TiboRadarReport(monitored_at=utc_now(), timezone=self.timezone, post=post)
+
+    async def fetch_posts(self) -> list[dict]:
+        latest = None
+        api_failed = False
+        if self._bearer_token:
+            try:
+                latest = await self._fetch_api_timeline()
+            except TiboRadarError:
+                api_failed = True
+        if latest is None:
+            failure = None
+            for source_url in self._source_urls:
+                try:
+                    response = await self._get(source_url, accept="application/rss+xml, application/atom+xml, application/json, text/html")
+                    if response.status_code >= 400:
+                        raise TiboRadarError(f"X 时间线请求失败：HTTP {response.status_code}")
+                    latest = parse_timeline_posts(response.content, TIBO_USERNAME)
+                    break
+                except (httpx.RequestError, TimelineError, TiboRadarError) as exc:
+                    failure = exc
+            if latest is None:
+                prefix = "X API 与时间线来源均不可用。" if api_failed else ""
+                raise TiboRadarError(prefix + "无法读取最新帖子，RSS 来源暂不可用；可通过 TIBO_RADAR_SOURCE_URL 更换来源。") from failure
+        return latest
+
+    async def _fetch_api_timeline(self) -> list[dict]:
+        if self._x_user is None:
+            payload = await self._json(f"https://api.x.com/2/users/by/username/{TIBO_USERNAME}?user.fields=profile_image_url", "X 用户", authenticated=True)
+            user = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(user, dict) or not str(user.get("id", "")).isdigit() or str(user.get("username", "")).casefold() != TIBO_USERNAME:
+                raise TiboRadarError("X 用户响应无效。")
+            self._x_user = user
+        query = urlencode({"max_results": 10, "exclude": "retweets",
+                           "tweet.fields": "created_at,public_metrics,referenced_tweets,note_tweet,author_id",
+                           "expansions": "author_id,referenced_tweets.id,referenced_tweets.id.author_id",
+                           "user.fields": "name,username,profile_image_url"})
+        payload = await self._json(f"https://api.x.com/2/users/{self._x_user['id']}/tweets?{query}", "X 最新帖子", authenticated=True)
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            raise TiboRadarError("X API 未返回帖子时间线。")
+        includes = payload.setdefault("includes", {})
+        if not isinstance(includes, dict):
+            raise TiboRadarError("X API 时间线附加信息无效。")
+        if not isinstance(includes.get("users", []), list):
+            raise TiboRadarError("X API 时间线用户信息无效。")
+        includes.setdefault("users", []).append(self._x_user)
         try:
-            payload = await self._json(api_url, "X 帖子")
-            raw = payload.get("tweet")
-            if not isinstance(raw, dict):
-                raise TiboRadarError("X 帖子响应缺少 tweet。")
-            text = str(raw.get("text") or "").strip()
-            if not text:
-                raise TiboRadarError("X 帖子正文为空。")
-            author = raw.get("author") if isinstance(raw.get("author"), dict) else {}
-            avatar_url = str(author.get("avatar_url") or "").strip()
-            translated, translation_label = await self._translate(text, presence)
-            avatar = await self._bytes(avatar_url) if avatar_url else None
-            parent = await self._fetch_parent(raw, presence)
-            comments = await self._extract_comments(raw, presence)
-            return TiboPost(
-                source_url=str(raw.get("url") or source_url),
-                author_name=str(author.get("name") or "Tibo"),
-                username=str(author.get("screen_name") or username),
-                text=text,
-                translated_zh=translated,
-                translation_label=translation_label,
-                created_at=_twitter_datetime(raw.get("created_at")),
-                replies=_integer(raw.get("replies")),
-                reposts=_integer(raw.get("retweets")),
-                likes=_integer(raw.get("likes")),
-                views=_integer(raw.get("views")),
-                avatar=avatar,
-                parent=parent,
-                comments=comments,
-            )
-        except TiboRadarError:
-            return await self._fetch_oembed(source_url, username, presence)
+            latest = posts_from_json(payload, TIBO_USERNAME)
+        except (TimelineError, TypeError, AttributeError) as exc:
+            raise TiboRadarError("X API 时间线中没有可读取的最新帖子。") from exc
+        for post in latest:
+            post["_official"] = True
+        return latest
 
-    async def _fetch_parent(self, raw: dict[str, Any], presence: TiboPresence) -> TiboContextPost | None:
+    async def _fetch_post(self, latest: dict) -> TiboPost:
+        source_url = latest["url"]
+        username, tweet_id = _tweet_identity(source_url)
+        raw = latest
+        if not latest.get("_official"):
+            try:
+                payload = await self._json(f"https://api.fxtwitter.com/{quote(username)}/status/{quote(tweet_id)}", "X 帖子详情")
+                detail = payload.get("tweet") if isinstance(payload, dict) else None
+                if isinstance(detail, dict) and _tweet_identity(str(detail.get("url") or "")) == (username, tweet_id):
+                    raw = {**latest, **detail}
+            except TiboRadarError:
+                pass
+        # A detail service may return a truncated preview; keep the full timeline
+        # text whenever it is longer and never let detail lookup select a post.
+        text = max((str(raw.get("text") or "").strip(), latest["text"]), key=len)
+        author = raw.get("author") if isinstance(raw.get("author"), dict) else latest["author"]
+        translated, translation_label = await self._translate(text)
+        avatar_url = str(author.get("avatar_url") or "").strip()
+        avatar = await self._bytes(avatar_url) if avatar_url else None
+        parent = await self._fetch_parent(raw)
+        comments = await self._extract_comments(raw)
+        return TiboPost(
+            source_url=source_url,
+            author_name=str(author.get("name") or "Tibo"),
+            username=username,
+            text=text,
+            translated_zh=translated,
+            translation_label=translation_label,
+            created_at=post_datetime(raw.get("created_at")) or post_datetime(latest.get("created_at")),
+            replies=_integer(raw.get("replies")),
+            reposts=_integer(raw.get("retweets")),
+            likes=_integer(raw.get("likes")),
+            views=_integer(raw.get("views")),
+            avatar=avatar,
+            parent=parent,
+            comments=comments,
+        )
+
+    async def _fetch_parent(self, raw: dict[str, Any]) -> TiboContextPost | None:
+        parent_raw = raw.get("parent_post")
+        if isinstance(parent_raw, dict) and isinstance(parent_raw.get("text"), str) and isinstance(parent_raw.get("url"), str):
+            author = parent_raw.get("author") if isinstance(parent_raw.get("author"), dict) else {}
+            translated, _label = await self._translate(parent_raw["text"])
+            return TiboContextPost(parent_raw["url"], str(author.get("name") or "X 用户"),
+                                   str(author.get("screen_name") or "unknown"), parent_raw["text"],
+                                   translated, post_datetime(parent_raw.get("created_at")))
         parent_id = str(raw.get("replying_to_status") or "").strip()
         parent_user = str(raw.get("replying_to") or "").strip()
         if not parent_id or not parent_user:
@@ -144,21 +206,21 @@ class TiboRadarClient:
         api_url = f"https://api.fxtwitter.com/{quote(parent_user)}/status/{quote(parent_id)}"
         try:
             payload = await self._json(api_url, "被回复的原帖")
-            parent_raw = payload.get("tweet")
+            parent_raw = payload.get("tweet") if isinstance(payload, dict) else None
             if not isinstance(parent_raw, dict):
                 return None
             text = str(parent_raw.get("text") or "").strip()
             if not text:
                 return None
             author = parent_raw.get("author") if isinstance(parent_raw.get("author"), dict) else {}
-            translated, _label = await self._translate(text, presence)
+            translated, _label = await self._translate(text)
             return TiboContextPost(
                 source_url=str(parent_raw.get("url") or f"https://x.com/{parent_user}/status/{parent_id}"),
                 author_name=str(author.get("name") or parent_user),
                 username=str(author.get("screen_name") or parent_user),
                 text=text,
                 translated_zh=translated,
-                created_at=_twitter_datetime(parent_raw.get("created_at")),
+                created_at=post_datetime(parent_raw.get("created_at")),
             )
         except TiboRadarError:
             return None
@@ -166,7 +228,6 @@ class TiboRadarClient:
     async def _extract_comments(
         self,
         raw: dict[str, Any],
-        presence: TiboPresence,
     ) -> tuple[TiboComment, ...]:
         candidates: list[Any] = []
         for key in ("comments", "reply_tweets", "replies_data", "conversation_replies"):
@@ -181,7 +242,7 @@ class TiboRadarClient:
             if not _comment_allowed(text):
                 continue
             author = item.get("author") if isinstance(item.get("author"), dict) else {}
-            translated, _label = await self._translate(text, presence)
+            translated, _label = await self._translate(text)
             comments.append(
                 TiboComment(
                     author_name=str(author.get("name") or author.get("screen_name") or "X 用户"),
@@ -195,38 +256,13 @@ class TiboRadarClient:
                 break
         return tuple(comments)
 
-    async def _fetch_oembed(self, source_url: str, username: str, presence: TiboPresence) -> TiboPost:
-        url = f"https://publish.twitter.com/oembed?url={quote(source_url, safe='')}&omit_script=true&dnt=true"
-        payload = await self._json(url, "X oEmbed")
-        body = str(payload.get("html") or "")
-        match = re.search(r"<p[^>]*>(.*?)</p>", body, flags=re.IGNORECASE | re.DOTALL)
-        if match is None:
-            raise TiboRadarError("X oEmbed 未返回帖子正文。")
-        text = re.sub(r"<br\s*/?>", "\n", match.group(1), flags=re.IGNORECASE)
-        text = html.unescape(re.sub(r"<[^>]+>", "", text)).strip()
-        translated, translation_label = await self._translate(text, presence)
-        return TiboPost(
-            source_url=source_url,
-            author_name=str(payload.get("author_name") or "Tibo"),
-            username=username,
-            text=text,
-            translated_zh=translated,
-            translation_label=translation_label,
-            created_at=None,
-            replies=None,
-            reposts=None,
-            likes=None,
-            views=None,
-            avatar=None,
-        )
-
-    async def _translate(self, text: str, presence: TiboPresence) -> tuple[str, str]:
-        url = (
-            "https://translate.googleapis.com/translate_a/single"
-            f"?client=gtx&sl=auto&tl=zh-CN&dt=t&q={quote(text, safe='')}"
-        )
-        try:
-            payload = await self._json(url, "翻译服务")
+    async def _translate(self, text: str) -> tuple[str, str]:
+        semaphore = asyncio.Semaphore(3)
+        async def translate_chunk(chunk):
+            url = ("https://translate.googleapis.com/translate_a/single"
+                   f"?client=gtx&sl=auto&tl=zh-CN&dt=t&q={quote(chunk, safe='')}")
+            async with semaphore:
+                payload = await self._json(url, "翻译服务")
             chunks = payload[0] if isinstance(payload, list) and payload else None
             if isinstance(chunks, list):
                 translated = "".join(
@@ -235,16 +271,34 @@ class TiboRadarClient:
                     if isinstance(item, list) and item and isinstance(item[0], str)
                 ).strip()
                 if translated:
-                    return translated, "中文翻译 · 机器翻译"
-        except TiboRadarError:
-            pass
-        return presence.evidence_zh, "中文摘要 · 来自 tibo_presence"
+                    return translated
+            raise TiboRadarError("翻译服务未返回中文译文。")
+        chunks = _translation_chunks(text, 1800)
+        results = await asyncio.gather(*(translate_chunk(chunk) for chunk in chunks), return_exceptions=True)
+        if results and all(isinstance(result, str) for result in results):
+            return "\n".join(results), "中文翻译 · 机器翻译"
+        async def translate_fallback(chunk):
+            query = urlencode({"q": chunk, "langpair": "en|zh-CN"})
+            async with semaphore:
+                payload = await self._json(f"https://api.mymemory.translated.net/get?{query}", "备用翻译服务")
+            if not isinstance(payload, dict) or payload.get("responseStatus") != 200 or payload.get("quotaFinished"):
+                raise TiboRadarError("备用翻译服务不可用。")
+            body = payload.get("responseData")
+            translated = body.get("translatedText") if isinstance(body, dict) else None
+            if not isinstance(translated, str) or not translated.strip():
+                raise TiboRadarError("备用翻译服务未返回译文。")
+            return html.unescape(translated.strip())
+        chunks = _translation_chunks(text, 480)
+        results = await asyncio.gather(*(translate_fallback(chunk) for chunk in chunks), return_exceptions=True)
+        if results and all(isinstance(result, str) for result in results):
+            return "\n".join(results), "中文翻译 · 机器翻译"
+        return "翻译暂不可用，请查看上方原文。", "中文翻译 · 暂不可用"
 
-    async def _json(self, url: str, label: str) -> Any:
+    async def _json(self, url: str, label: str, *, authenticated: bool = False) -> Any:
         try:
-            response = await self._get(url, accept="application/json")
+            response = await self._get(url, accept="application/json", authenticated=authenticated)
         except httpx.RequestError as exc:
-            raise TiboRadarError(f"{label}请求失败：{str(exc).strip() or exc.__class__.__name__}") from exc
+            raise TiboRadarError(f"{label}请求失败：{exc.__class__.__name__}") from exc
         if response.status_code >= 400:
             raise TiboRadarError(f"{label}请求失败：HTTP {response.status_code}")
         try:
@@ -259,35 +313,43 @@ class TiboRadarClient:
         except httpx.RequestError:
             return None
 
-    async def _get(self, url: str, *, accept: str) -> httpx.Response:
+    async def _get(self, url: str, *, accept: str, authenticated: bool = False) -> httpx.Response:
         headers = {"Accept": accept, "User-Agent": "APIMonitorBot/1.0"}
+        if authenticated:
+            if urlparse(url).netloc != "api.x.com" or urlparse(url).scheme != "https":
+                raise TiboRadarError("X API Token 只能发送至官方 API。")
+            headers["Authorization"] = f"Bearer {self._bearer_token}"
         if self._client is not None:
+            if authenticated:
+                return await self._client.get(url, headers=headers, follow_redirects=False)
             return await self._client.get(url, headers=headers)
-        async with httpx.AsyncClient(timeout=self.timeout_seconds, verify=False, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=self.timeout_seconds, verify=False, follow_redirects=not authenticated) as client:
             return await client.get(url, headers=headers)
 
 
-def parse_tibo_presence(raw: dict[str, Any]) -> TiboPresence:
-    return TiboPresence(
-        location_zh=str(raw.get("location_label_zh") or "未知"),
-        location_en=str(raw.get("location_label_en") or "Unknown"),
-        probability=max(0.0, min(1.0, _number(raw.get("probability"), 0.0))),
-        confidence=str(raw.get("confidence") or "unknown"),
-        evidence_zh=str(raw.get("evidence_summary_zh") or "暂无中文证据摘要。"),
-        evidence_en=str(raw.get("evidence_summary_en") or ""),
-        safety_note_zh=str(raw.get("safety_note_zh") or "仅展示公开、粗粒度信息。"),
-        observations=max(0, _integer(raw.get("observations_considered")) or 0),
-        observed_at=_datetime(raw.get("observed_at")),
-        updated_at=_datetime(raw.get("updated_at")),
-    )
+def _translation_chunks(text: str, maximum_bytes: int) -> list[str]:
+    chunks = []
+    start = 0
+    while start < len(text):
+        size, end = 0, start
+        while end < len(text) and size + len(text[end].encode("utf-8")) <= maximum_bytes:
+            size += len(text[end].encode("utf-8"))
+            end += 1
+        if end < len(text):
+            boundary = max(text.rfind(" ", start + (end - start) // 2, end),
+                           text.rfind("\n", start + (end - start) // 2, end))
+            if boundary >= start:
+                end = boundary + 1
+        chunks.append(text[start:end])
+        start = end
+    return chunks
 
 
 def render_tibo_radar_image(report: TiboRadarReport, *, generated_at: datetime | None = None) -> bytes:
     width = 1600
     left, right = 84, 1516
-    main_width = 950
     main_x = 120
-    side_x = 1120
+    main_width = right - main_x - 42
     body_font = _font(25)
     body_bold = _font(25, bold=True)
     small_font = _font(17)
@@ -317,12 +379,12 @@ def render_tibo_radar_image(report: TiboRadarReport, *, generated_at: datetime |
         content_bottom += 34 + _parent_block_height(parent_original_lines, parent_translated_lines)
     if comment_lines:
         content_bottom += 34 + _comments_block_height(comment_lines)
-    height = max(1080, content_bottom + 150)
+    height = max(800, content_bottom + 150)
 
     image, draw = material_canvas((width, height), generated_at)
     _dashed_rectangle(draw, (left, 42, right, height - 42), fill="#94a3b8", width=2, dash=14, gap=10)
     draw.text((main_x, 76), "TIBO RADAR  /  X POST", fill="#0f172a", font=title_font)
-    draw.text((main_x, 132), "最新公开帖子与粗粒度动态雷达", fill="#64748b", font=body_font)
+    draw.text((main_x, 132), "@thsottiaux 最新公开帖子 · 原文与中文翻译", fill="#64748b", font=body_font)
     draw.line((main_x, 184, right - 42, 184), fill="#e2e8f0", width=2)
 
     avatar_x, avatar_y = main_x, 220
@@ -387,9 +449,8 @@ def render_tibo_radar_image(report: TiboRadarReport, *, generated_at: datetime |
             tiny_font,
         )
 
-    _draw_presence_panel(draw, report, side_x, 220, 350, body_font, body_bold, small_font, tiny_font)
     draw.text((main_x, height - 94), f"原帖：{report.post.source_url}", fill="#64748b", font=small_font)
-    draw.text((main_x, height - 66), "数据来源：Codex Radar 公开摘要 · 仅展示公开、粗粒度信息", fill="#94a3b8", font=tiny_font)
+    draw.text((main_x, height - 66), f"数据来源：X / @{TIBO_USERNAME} · 抓取时间：{_display_time(report.monitored_at, report.timezone)}", fill="#94a3b8", font=tiny_font)
 
     buffer = BytesIO()
     image.save(buffer, format="PNG", optimize=True)
@@ -457,28 +518,6 @@ def _comments_block_height(comments: list[tuple[TiboComment, list[str], list[str
     )
 
 
-def _draw_presence_panel(draw, report, x, y, width, body_font, body_bold, small_font, tiny_font) -> None:
-    panel_bottom = y + 650
-    draw.rounded_rectangle((x, y, x + width, panel_bottom), radius=8, fill="#f8fafc", outline="#cbd5e1", width=2)
-    draw.text((x + 24, y + 24), "TIBO PRESENCE", fill="#0f172a", font=small_font)
-    draw.text((x + 24, y + 60), "动态雷达", fill="#0f172a", font=body_bold)
-    probability = report.presence.probability * 100
-    draw.text((x + 24, y + 118), report.presence.location_zh, fill="#1d9bf0", font=body_bold)
-    draw.text((x + width - 24, y + 118), f"{probability:.0f}%", fill="#0f172a", font=body_bold, anchor="ra")
-    draw.text((x + 24, y + 158), report.presence.location_en, fill="#64748b", font=tiny_font)
-    draw.text((x + 24, y + 190), f"置信度：{report.presence.confidence} · 公开观察 {report.presence.observations} 条", fill="#64748b", font=tiny_font)
-    draw.line((x + 24, y + 224, x + width - 24, y + 224), fill="#cbd5e1", width=1)
-    draw.text((x + 24, y + 248), "判断依据", fill="#475569", font=small_font)
-    evidence = _wrap_paragraphs(report.presence.evidence_zh, small_font, width - 48)
-    cursor = _draw_lines(draw, evidence, x + 24, y + 282, small_font, "#334155", 28)
-    cursor += 20
-    draw.text((x + 24, cursor), "更新时间", fill="#475569", font=small_font)
-    cursor += 34
-    draw.text((x + 24, cursor), _display_time(report.presence.updated_at, report.timezone) or "未知", fill="#0f172a", font=small_font)
-    safety = _wrap_paragraphs(report.presence.safety_note_zh, tiny_font, width - 48)
-    _draw_lines(draw, safety, x + 24, panel_bottom - 92, tiny_font, "#94a3b8", 23)
-
-
 def _draw_avatar(image, draw, avatar, x, y, size, font) -> None:
     if avatar:
         try:
@@ -520,18 +559,6 @@ def _comment_allowed(text: str) -> bool:
     if "http://" in folded or "https://" in folded or "www." in folded:
         return False
     return not any(term in folded for term in _SENSITIVE_COMMENT_TERMS)
-
-
-def _source_url(raw: dict[str, Any]) -> str:
-    direct = raw.get("source_url")
-    if isinstance(direct, str) and direct.strip():
-        return direct.strip()
-    urls = raw.get("source_urls")
-    if isinstance(urls, list):
-        for item in urls:
-            if isinstance(item, str) and item.strip():
-                return item.strip()
-    raise TiboRadarError("tibo_presence 缺少 source_url/source_urls。")
 
 
 def _tweet_identity(url: str) -> tuple[str, str]:
@@ -603,31 +630,6 @@ def _display_time(value: datetime | None, timezone: str) -> str:
         return value.astimezone(ZoneInfo(timezone)).strftime("%Y-%m-%d %H:%M")
     except Exception:
         return value.isoformat(timespec="minutes")
-
-
-def _twitter_datetime(value: Any) -> datetime | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        return datetime.strptime(value, "%a %b %d %H:%M:%S %z %Y")
-    except ValueError:
-        return _datetime(value)
-
-
-def _datetime(value: Any) -> datetime | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
-def _number(value: Any, default: float) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def _integer(value: Any) -> int | None:
