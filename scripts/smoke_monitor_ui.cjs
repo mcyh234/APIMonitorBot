@@ -33,6 +33,11 @@ const assert = require("node:assert/strict");
     await page.getByRole("status").filter({ hasText: "AI 消息监听设置已保存" }).waitFor();
     const watchResponse = await page.request.get(base + "/api/tibo-watch", { headers: { Authorization: `Bearer ${token}` } });
     const watchView = await watchResponse.json();
+    assert.equal(watchView.moderation.enabled, true);
+    assert.equal(watchView.moderation.mode, "strict");
+    if (!watchView.moderation.model_configured) {
+      await page.getByRole("status").filter({ hasText: "审核模型：未配置，已暂停投递" }).waitFor();
+    }
     assert.equal(watchView.settings.enabled, true);
     assert.equal(watchView.settings.targets, "G123456&P112233");
     assert.equal(watchView.settings.interval_seconds, 120);

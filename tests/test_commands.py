@@ -628,7 +628,7 @@ async def test_radar_command_sends_image_and_uses_cooldown():
 
 
 @pytest.mark.asyncio
-async def test_tibo_command_sends_image_and_uses_cooldown():
+async def test_tibo_command_requires_moderation_and_uses_cooldown():
     session = make_session()
     secret_box = SecretBox("test-key")
     session.add(
@@ -648,13 +648,13 @@ async def test_tibo_command_sends_image_and_uses_cooldown():
     router = CommandRouter(Settings(), onebot, secret_box, probe=FakeProbe(), tibo_client=tibo)
     incoming = IncomingMessage(user_id="10001", message="/tibo", message_type="group", group_id="123456")
 
-    assert await router.handle_message(session, incoming) == ""
-    assert onebot.sent == [("group", "123456", "[image:tibo-radar.png]")]
-    assert tibo.calls == 1
+    assert "审核模型未配置" in await router.handle_message(session, incoming)
+    assert onebot.sent == []
+    assert tibo.calls == 0
 
     reply = await router.handle_message(session, incoming)
     assert "操作太频繁" in (reply or "")
-    assert tibo.calls == 1
+    assert tibo.calls == 0
 
 
 @pytest.mark.asyncio

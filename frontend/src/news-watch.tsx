@@ -5,8 +5,9 @@ type RequestJSON = <T>(url: string, init?: RequestInit) => Promise<T>;
 type Config = { enabled: boolean; targets: string; interval_seconds: number; accounts: string[] };
 type Account = { username: string; name: string; company: string; category: string; reason: string; recommended: boolean; url: string };
 type AccountStatus = { username: string; cursor: string | null; last_checked_at: string | null; last_error: string | null; pending_count: number };
-type Status = { initialized: boolean; last_checked_at: string | null; last_sent_at: string | null; pending_count: number; last_error: string | null; accounts: AccountStatus[] };
-type View = { settings: Config; status: Status; catalog: Account[] };
+type Status = { initialized: boolean; last_checked_at: string | null; last_sent_at: string | null; pending_count: number; last_error: string | null; accounts: AccountStatus[]; blocked_count: number; last_blocked_reason: string | null; last_blocked_at: string | null };
+type Moderation = { enabled: boolean; mode: string; model_configured: boolean };
+type View = { settings: Config; status: Status; catalog: Account[]; moderation: Moderation };
 const categories = ["公司", "产品", "负责人", "创始人"];
 const time = (value: string | null) => value ? new Date(value).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "暂无";
 
@@ -14,17 +15,18 @@ export function NewsWatchPanel({ request }: { request: RequestJSON }) {
   const [config, setConfig] = useState<Config | null>(null);
   const [status, setStatus] = useState<Status | null>(null);
   const [catalog, setCatalog] = useState<Account[]>([]);
+  const [moderation, setModeration] = useState<Moderation | null>(null);
   const [search, setSearch] = useState("");
   const [custom, setCustom] = useState("");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
-  const apply = (view: View) => { setConfig(view.settings); setStatus(view.status); setCatalog(view.catalog); };
+  const apply = (view: View) => { setConfig(view.settings); setStatus(view.status); setCatalog(view.catalog); setModeration(view.moderation); };
   useEffect(() => {
     let active = true;
     void request<View>("/api/tibo-watch").then(view => { if (active) apply(view); })
       .catch(() => { if (active) setMessage("AI 消息监听加载失败，请刷新页面重试。"); });
     const timer = window.setInterval(() => {
-      void request<View>("/api/tibo-watch").then(view => { if (active) setStatus(view.status); }).catch(() => {});
+      void request<View>("/api/tibo-watch").then(view => { if (active) { setStatus(view.status); setModeration(view.moderation); } }).catch(() => {});
     }, 30000);
     return () => { active = false; window.clearInterval(timer); };
   }, [request]);
@@ -47,6 +49,8 @@ export function NewsWatchPanel({ request }: { request: RequestJSON }) {
   return <details>
     <summary>AI 消息监听</summary>
     <p>订阅公司官号、产品号、负责人和创始人的 X 帖子，自动生成原文与中文翻译图片，推送到群聊或私聊。每个账号首次检查只建立基线。</p>
+    <p className="extension-message">严格内容过滤始终开启：拦截政治及高风险内容，仅发送审核通过的 AI 技术与产品消息。原文、译文和回复上下文一并检查，不展示外部头像。</p>
+    {moderation && <p role="status">审核模型：{moderation.model_configured ? "已配置，发送前仍须审核通过" : "未配置，已暂停投递"}。在「群聊情报 → 分析模型」配置并测试模型即可，无需启用群聊情报采集。审核失败或结果不确定时不会发送。</p>}
     {config && <form onSubmit={event => {
       event.preventDefault(); setBusy(true); setMessage("");
       void request<View>("/api/tibo-watch", { method: "PUT", body: JSON.stringify(config) })
@@ -95,6 +99,7 @@ export function NewsWatchPanel({ request }: { request: RequestJSON }) {
     {status && <div className="tibo-watch-status">
       <p>监听进度：{status.accounts.filter(item => item.cursor !== null).length} / {status.accounts.length} 个账号已建立基线 · 待推送 {status.pending_count} 条</p>
       <p>最近检查：{time(status.last_checked_at)} · 最近推送：{time(status.last_sent_at)}</p>
+      <p>内容拦截：{status.blocked_count} 条{status.last_blocked_reason ? ` · 最近原因：${status.last_blocked_reason} · ${time(status.last_blocked_at)}` : ""}</p>
       {status.last_error && <p role="alert">{status.last_error}</p>}
       <details><summary>各账号抓取状态</summary><div className="news-account-grid">{status.accounts.map(item => <div className="news-account-state" key={item.username}>
         <strong>@{item.username}</strong><span>{item.last_error ? "获取失败，等待重试" : item.cursor ? "已建立基线" : "等待首次检查"} · 待推送 {item.pending_count}</span><span>最近检查：{time(item.last_checked_at)}</span>

@@ -20,6 +20,7 @@ from backend.app.tibo_radar import TiboRadarClient, render_tibo_radar_image
 from backend.app.time_utils import utc_now
 from backend.app.models import AppSetting
 from backend.app.news_accounts import NEWS_ACCOUNTS, normalize_username, recommended_accounts
+from backend.app.news_filter import ContentBlocked, ModerationUnavailable, REASONS, check_post_payload, moderation_view, moderator_config, review_report
 
 
 router = APIRouter(prefix="/api/tibo-watch")
@@ -76,6 +77,9 @@ class WatchState(BaseModel):
     pending: list[PendingDelivery] = Field(default_factory=list)
     accounts: dict[str, AccountState] = Field(default_factory=dict)
     generation: str = "legacy"
+    blocked_count: int = 0
+    last_blocked_at: datetime | None = None
+    last_blocked_reason: str | None = None
 
 
 def read_watch_settings(session: Session) -> TiboWatchSettings:
@@ -116,12 +120,14 @@ def watch_view(session: Session):
     accounts = [{"username": username, **state.accounts.get(username, AccountState()).model_dump(),
                  "pending_count": sum(item.account == username for item in pending)} for username in settings.accounts]
     error = next((item["last_error"] for item in accounts if item["last_error"]), None)
-    return {"settings": settings.model_dump(), "catalog": [item.view() for item in NEWS_ACCOUNTS], "status": {
+    return {"settings": settings.model_dump(), "catalog": [item.view() for item in NEWS_ACCOUNTS], "moderation": moderation_view(session), "status": {
         "initialized": bool(accounts) and all(item["cursor"] is not None for item in accounts), "last_post_id": state.cursor,
         "last_checked_at": state.last_checked_at, "last_sent_at": state.last_sent_at,
         "pending_count": len(pending),
         "last_error": next((item.last_error for item in pending if item.last_error), error),
         "accounts": accounts,
+        "blocked_count": state.blocked_count, "last_blocked_at": state.last_blocked_at,
+        "last_blocked_reason": REASONS.get(state.last_blocked_reason),
     }}
 
 
@@ -156,6 +162,10 @@ class TiboWatcher:
                     return
                 self._clients = {key: value for key, value in self._clients.items() if key in settings.accounts or key == "thsottiaux"}
                 state, now = read_watch_state(session), utc_now()
+                def blocked(exc):
+                    state.blocked_count += 1
+                    state.last_blocked_at = utc_now()
+                    state.last_blocked_reason = exc.code
                 def save():
                     if read_watch_state(session).generation != state.generation:
                         return False
@@ -193,6 +203,11 @@ class TiboWatcher:
                             if account.cursor is not None:
                                 new_posts = sorted((post for post in posts if int(post["id"]) > int(account.cursor)), key=lambda post: int(post["id"]))
                                 for post in new_posts:
+                                    try:
+                                        check_post_payload(post)
+                                    except ContentBlocked as exc:
+                                        blocked(exc)
+                                        continue
                                     encrypted = self.box.encrypt(json.dumps(post, ensure_ascii=False))
                                     state.pending.extend(PendingDelivery(account=username, post_id=str(post["id"]), payload_encrypted=encrypted, target=target)
                                                          for target in settings.targets.split("&"))
@@ -208,6 +223,8 @@ class TiboWatcher:
                 images = {}
                 processed_posts = set()
                 for item in list(state.pending):
+                    if item not in state.pending:
+                        continue
                     current = read_watch_settings(session)
                     if not current.enabled or read_watch_state(session).generation != state.generation:
                         return
@@ -227,7 +244,10 @@ class TiboWatcher:
                     try:
                         if post_key not in images:
                             raw = json.loads(self.box.decrypt(item.payload_encrypted))
+                            check_post_payload(raw)  # Recheck persisted work from older versions.
+                            moderator_config(session)
                             report = await self.account_client(item.account).report_for_post(raw)
+                            await review_report(report, session, self.box)
                             images[post_key] = await asyncio.to_thread(render_tibo_radar_image, report)
                         # Re-read after rendering so a paused/removed target stays quiet.
                         current = read_watch_settings(session)
@@ -242,6 +262,13 @@ class TiboWatcher:
                         result = await self.notifier.send_image(NotifyTarget(kind, target_id), images[post_key], filename)
                         if not getattr(result, "ok", False):
                             raise RuntimeError("Delivery not acknowledged")
+                    except ContentBlocked as exc:
+                        blocked(exc)
+                        state.pending = [other for other in state.pending if (other.account, other.post_id) != post_key]
+                    except ModerationUnavailable as exc:
+                        item.attempts += 1
+                        item.last_error = str(exc)
+                        item.retry_at = utc_now() + timedelta(seconds=min(3600, 60 * 2 ** min(item.attempts - 1, 6)))
                     except Exception:
                         item.attempts += 1
                         item.last_error = "图片生成或推送失败，将自动重试。"

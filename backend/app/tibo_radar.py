@@ -15,6 +15,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 from backend.app.material_theme import material_canvas, load_font as _font
 from backend.app.time_utils import utc_now
 from backend.app.news_accounts import account_name, normalize_username
+from backend.app.news_filter import check_post_payload
 from backend.app.x_timeline import TimelineError, posts_from_json, parse_timeline_posts, post_datetime
 
 
@@ -62,6 +63,7 @@ class TiboPost:
     avatar: bytes | None
     parent: TiboContextPost | None = None
     comments: tuple[TiboComment, ...] = ()
+    context_complete: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +113,7 @@ class TiboRadarClient:
         return await self.report_for_post(posts[0])
 
     async def report_for_post(self, raw: dict) -> TiboRadarReport:
+        check_post_payload({key: raw.get(key) for key in ("text", "author", "url")})
         post = await self._fetch_post(raw)
         return TiboRadarReport(monitored_at=utc_now(), timezone=self.timezone, post=post)
 
@@ -182,11 +185,16 @@ class TiboRadarClient:
         # text whenever it is longer and never let detail lookup select a post.
         text = max((str(raw.get("text") or "").strip(), latest["text"]), key=len)
         author = raw.get("author") if isinstance(raw.get("author"), dict) else latest["author"]
+        check_post_payload({"text": text, "author": author, "url": source_url})
         translated, translation_label = await self._translate(text)
-        avatar_url = str(author.get("avatar_url") or "").strip()
-        avatar = await self._bytes(avatar_url) if avatar_url else None
+        # External avatars have no image moderation and cannot enter outbound PNGs.
+        avatar = None
         parent = await self._fetch_parent(raw)
         comments = await self._extract_comments(raw)
+        refs = raw.get("referenced_tweets")
+        refs = refs if isinstance(refs, list) else []
+        is_reply = bool(raw.get("replying_to_status") or any(isinstance(ref, dict) and ref.get("type") == "replied_to" for ref in refs) or text.lstrip().startswith("@"))
+        has_unshown_quote = bool(raw.get("quote") or raw.get("quoted_tweet") or raw.get("quoted_status") or any(isinstance(ref, dict) and ref.get("type") == "quoted" for ref in refs))
         return TiboPost(
             source_url=source_url,
             author_name=account_name(username) if not author.get("name") or str(author["name"]).casefold() == username.casefold() else str(author["name"]),
@@ -202,11 +210,13 @@ class TiboRadarClient:
             avatar=avatar,
             parent=parent,
             comments=comments,
+            context_complete=not has_unshown_quote and (not is_reply or parent is not None),
         )
 
     async def _fetch_parent(self, raw: dict[str, Any]) -> TiboContextPost | None:
         parent_raw = raw.get("parent_post")
         if isinstance(parent_raw, dict) and isinstance(parent_raw.get("text"), str) and isinstance(parent_raw.get("url"), str):
+            check_post_payload(parent_raw)
             author = parent_raw.get("author") if isinstance(parent_raw.get("author"), dict) else {}
             translated, _label = await self._translate(parent_raw["text"])
             return TiboContextPost(parent_raw["url"], str(author.get("name") or "X 用户"),
@@ -225,6 +235,7 @@ class TiboRadarClient:
             text = str(parent_raw.get("text") or "").strip()
             if not text:
                 return None
+            check_post_payload(parent_raw)
             author = parent_raw.get("author") if isinstance(parent_raw.get("author"), dict) else {}
             translated, _label = await self._translate(text)
             return TiboContextPost(
@@ -254,6 +265,7 @@ class TiboRadarClient:
             text = str(item.get("text") or "").strip()
             if not _comment_allowed(text):
                 continue
+            check_post_payload(item)
             author = item.get("author") if isinstance(item.get("author"), dict) else {}
             translated, _label = await self._translate(text)
             comments.append(

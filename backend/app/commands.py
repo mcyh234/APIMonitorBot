@@ -444,11 +444,14 @@ class CommandRouter:
         settings = read_watch_settings(session)
         option = arg.strip()
         if option.casefold() in {"", "status"}:
-            state = watch_view(session)["status"]
+            view = watch_view(session)
+            state = view["status"]
             return (f"AI 消息监听：{'已启用' if settings.enabled else '已停用'}\n"
                     f"通知对象：{settings.targets or '未配置'}\n检查间隔：{settings.interval_seconds} 秒\n"
                     f"订阅账号：{len(settings.accounts)} 个\n"
                     f"待推送：{state['pending_count']} 条\n"
+                    f"严格内容过滤：开启；已拦截 {state['blocked_count']} 条\n"
+                    f"审核模型：{'已配置' if view['moderation']['model_configured'] else '未配置，已暂停投递'}\n"
                     f"{state['last_error'] or ''}\n"
                     "用法：/newswatch G群号&PQQ号；on/off/status；accounts 查看订阅；recommend 推荐组合；all 全部；add/remove @账号。")
         if option.casefold() == "accounts":
@@ -479,9 +482,11 @@ class CommandRouter:
         return (f"AI 消息监听{'已启用' if updated.enabled else '已停用'}。\n"
                 f"通知对象：{updated.targets or '未配置'}\n"
                 f"订阅账号：{len(updated.accounts)} 个（/newswatch accounts 查看）\n"
-                "首次检查只建立基线，之后发现新帖会自动生成翻译图片并推送。")
+                "首次检查只建立基线，之后仅推送通过严格内容审核的新帖。\n"
+                + ("审核模型已配置。" if watch_view(session)["moderation"]["model_configured"] else "审核模型未配置，已暂停投递；请在 WebUI 的群聊情报 → 分析模型中配置。"))
 
     async def _tibo(self, session: Session, incoming: IncomingMessage) -> str:
+        from backend.app.news_filter import ContentBlocked, ModerationUnavailable, moderator_config, review_report
         target = self._notification_target_for_context(session, incoming)
         if target is None:
             return "权限不足，当前会话不是通知对象。"
@@ -489,8 +494,14 @@ class CommandRouter:
         if not ok:
             return f"操作太频繁，请 {remaining} 秒后再试。"
         try:
+            moderator_config(session)
             report = await self.tibo_client.fetch()
+            await review_report(report, session, self.secret_box)
             image = render_tibo_radar_image(report)
+        except ContentBlocked:
+            return "该帖子未通过内容过滤，已停止发送。"
+        except ModerationUnavailable as exc:
+            return str(exc)
         except TiboRadarError as exc:
             return f"Tibo 雷达数据读取失败：{exc}"
         except Exception as exc:

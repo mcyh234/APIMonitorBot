@@ -39,6 +39,15 @@ def database():
     engine.dispose()
 
 
+@pytest.fixture
+def approved_delivery_unit(monkeypatch):
+    """Delivery state-machine tests isolate approval; policy has real-path tests below."""
+    monkeypatch.setattr("backend.app.tibo_watch.moderator_config", lambda session: {})
+    async def approved(*args):
+        return None
+    monkeypatch.setattr("backend.app.tibo_watch.review_report", approved)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("base,protocol", [("https://api.test", "auto"), ("https://api.test/v1/messages", "anthropic")])
 async def test_claude_messages(base, protocol):
@@ -737,7 +746,7 @@ def test_tibo_image_has_original_translation_and_no_regional_panel(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_tibo_watch_baseline_burst_dedup_and_per_target_restart_retry(database, monkeypatch):
+async def test_tibo_watch_baseline_burst_dedup_and_per_target_restart_retry(database, monkeypatch, approved_delivery_unit):
     from backend.app.app_settings import get_app_setting
     from backend.app.tibo_watch import TiboWatcher, TiboWatchSettings, STATE_KEY, read_watch_state, save_watch_settings
     session, factory = database
@@ -794,7 +803,7 @@ async def test_tibo_watch_baseline_burst_dedup_and_per_target_restart_retry(data
 
 
 @pytest.mark.asyncio
-async def test_tibo_watch_pause_or_removed_target_during_render_stops_delivery(database, monkeypatch):
+async def test_tibo_watch_pause_or_removed_target_during_render_stops_delivery(database, monkeypatch, approved_delivery_unit):
     from backend.app.tibo_watch import TiboWatcher, TiboWatchSettings, read_watch_state, save_watch_settings
     session, factory = database
     box = SecretBox("watch-test")
@@ -935,7 +944,7 @@ async def test_news_client_uses_account_feed_and_custom_template_without_token_l
 
 
 @pytest.mark.asyncio
-async def test_news_accounts_have_independent_cursors_and_failure_isolation(database, monkeypatch):
+async def test_news_accounts_have_independent_cursors_and_failure_isolation(database, monkeypatch, approved_delivery_unit):
     from backend.app.tibo_watch import TiboWatcher, TiboWatchSettings, read_watch_state, save_watch_settings
     session, factory = database
     clock = [datetime(2026, 10, 19, 5, tzinfo=timezone.utc)]
@@ -975,7 +984,7 @@ async def test_news_accounts_have_independent_cursors_and_failure_isolation(data
 
 
 @pytest.mark.asyncio
-async def test_news_removed_subscription_discards_queue_and_readdition_baselines(database, monkeypatch):
+async def test_news_removed_subscription_discards_queue_and_readdition_baselines(database, monkeypatch, approved_delivery_unit):
     from backend.app.tibo_watch import TiboWatcher, TiboWatchSettings, read_watch_state, save_watch_settings
     session, factory = database
     clock = [datetime(2026, 10, 19, 5, tzinfo=timezone.utc)]
@@ -1044,7 +1053,7 @@ async def test_newswatch_admin_account_management_and_command_switch(database):
 
 
 @pytest.mark.asyncio
-async def test_news_polling_is_batched_and_delivery_work_is_bounded(database, monkeypatch):
+async def test_news_polling_is_batched_and_delivery_work_is_bounded(database, monkeypatch, approved_delivery_unit):
     from backend.app.tibo_watch import TiboWatcher, TiboWatchSettings, read_watch_state, save_watch_settings
     session, factory = database
     clock = [datetime(2026, 10, 19, 5, tzinfo=timezone.utc)]
@@ -1132,3 +1141,258 @@ async def test_news_account_api_identity_cache_and_bearer_boundary(api_unavailab
                 assert posts[0]["author"]["screen_name"] == username
     assert len(external) == (4 if api_unavailable else 0)
     assert lookups == ([] if api_unavailable else ["openai", "claudeai"])
+
+
+@pytest.mark.parametrize("value,code", [
+    ("New GPT model for government election campaigns", "politics"),
+    ("GPT: Ｐｏｌｉｔｉｃａｌ debate", "politics"),
+    ("poli\u200btical news about GPT", "politics"),
+    ("新模型发布。政 治 评论。", "politics"),
+    ("新模型发布。政&#x6cbb;评论。", "politics"),
+    ("GPT update https://example.test/%2570olitics", "politics"),
+    ("AI policy: President Trump announces sanctions", "politics"),
+    ("GPT 政府合作新闻", "politics"),
+    ("模型功能与台灣政黨", "politics"),
+    ("图像模型 NSFW examples", "sexual"),
+    ("未成年人裸照", "sexual"),
+    ("GPT promotes genocide", "violence"),
+    ("GPT self-harm instructions", "violence"),
+    ("AI casino gambling offers", "illegal"),
+    ("新模型用于电信诈骗", "illegal"),
+    ("api_key=sk-abcdefghijklmno", "privacy"),
+])
+def test_news_local_filter_normalizes_and_blocks_risk(value, code):
+    from backend.app.news_filter import ContentBlocked, check_post_payload
+    with pytest.raises(ContentBlocked) as caught:
+        check_post_payload({"text": value})
+    assert caught.value.code == code
+    assert value not in str(caught.value)
+
+
+@pytest.mark.parametrize("value", ["New GPT model API release", "Claude Code improves tool use", "Gemini 图像模型发布，降低 API 价格。", "The API reward cache has a new schema."])
+def test_news_local_filter_keeps_benign_technical_messages(value):
+    from backend.app.news_filter import check_post_payload
+    check_post_payload({"text": value})
+
+
+def filtered_news_report(**changes):
+    from dataclasses import replace
+    from backend.app.tibo_radar import TiboPost, TiboRadarReport
+    post = TiboPost("https://x.com/OpenAI/status/200", "OpenAI", "OpenAI", "GPT API adds a new tool.", "GPT API 新增工具。",
+                    "中文翻译 · 机器翻译", utc_now(), 0, 0, 0, None, None)
+    return TiboRadarReport(utc_now(), "Asia/Shanghai", replace(post, **changes))
+
+
+def configure_news_moderator(session, box):
+    set_app_setting(session, "intel.llm", json.dumps({"base_url": "https://review.example/v1", "model": "review-model",
+                    "key_cipher": box.encrypt("test-review-key"), "timeout_seconds": 2}))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verdict,blocked", [
+    ({"allowed": True, "ai_related": True, "confidence": 99, "risk_categories": []}, False),
+    ({"allowed": False, "ai_related": True, "confidence": 99, "risk_categories": ["politics"]}, True),
+    ({"allowed": True, "ai_related": True, "confidence": 94, "risk_categories": []}, True),
+    ({"allowed": True, "ai_related": False, "confidence": 99, "risk_categories": []}, True),
+    ({"allowed": True, "ai_related": True, "confidence": 99, "risk_categories": ["uncertain"]}, True),
+])
+async def test_news_semantic_review_requires_clear_approval(database, verdict, blocked):
+    from backend.app.news_filter import ContentBlocked, review_report
+    session, _ = database
+    box = SecretBox("review-test"); configure_news_moderator(session, box)
+    async def handle(request):
+        assert request.headers["authorization"] == "Bearer test-review-key"
+        body = json.loads(request.content)
+        assert body["model"] == "review-model" and "max_tokens" not in body and "max_output_tokens" not in body
+        assert body["messages"][0]["role"] == "system" and "untrusted" in body["messages"][0]["content"]
+        assert "GPT API" in body["messages"][1]["content"]
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(verdict)}}]})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        if blocked:
+            with pytest.raises(ContentBlocked):
+                await review_report(filtered_news_report(), session, box, client=client)
+        else:
+            await review_report(filtered_news_report(), session, box, client=client)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["timeout", "http", "redirect", "json", "schema", "string_boolean", "missing_config", "oversize"])
+async def test_news_moderation_fails_closed_without_leaking_response(database, mode):
+    from backend.app.news_filter import ModerationUnavailable, review_report
+    session, _ = database
+    box = SecretBox("review-test")
+    if mode != "missing_config":
+        configure_news_moderator(session, box)
+    calls = []
+    async def handle(request):
+        calls.append(request)
+        if mode == "timeout":
+            raise httpx.ReadTimeout("private server details")
+        if mode == "http":
+            return httpx.Response(500, text="private server details")
+        if mode == "redirect":
+            return httpx.Response(302, headers={"Location": "https://untrusted.example/"})
+        if mode == "json":
+            return httpx.Response(200, text="private server details")
+        if mode == "oversize":
+            return httpx.Response(200, content=b"x" * 1_048_577)
+        content = {"allowed": True} if mode == "schema" else {"allowed": "true", "ai_related": True, "confidence": 100, "risk_categories": []}
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(content)}}]})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle), follow_redirects=True) as client:
+        with pytest.raises(ModerationUnavailable) as caught:
+            await review_report(filtered_news_report(), session, box, client=client)
+    assert "private server details" not in str(caught.value) and "test-review-key" not in str(caught.value)
+    assert len(calls) == (0 if mode == "missing_config" else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("part", ["original", "translation", "parent", "comment", "author", "avatar", "no_translation", "parent_translation", "comment_translation", "missing_context"])
+async def test_news_all_visible_parts_are_screened_before_model(database, part):
+    from backend.app.news_filter import ContentBlocked, review_report
+    from backend.app.tibo_radar import TiboContextPost, TiboComment
+    changes = {
+        "original": {"text": "GPT political campaign"},
+        "translation": {"translated_zh": "GPT 政治宣传"},
+        "parent": {"parent": TiboContextPost("https://x.com/other/status/1", "User", "other", "government news", "背景信息", utc_now())},
+        "comment": {"comments": (TiboComment("User", "other", "new API", "选举评论"),)},
+        "author": {"author_name": "Political account"},
+        "avatar": {"avatar": b"unreviewed-image"},
+        "no_translation": {"translation_label": "中文翻译 · 暂不可用"},
+        "parent_translation": {"parent": TiboContextPost("https://x.com/other/status/1", "User", "other", "GPT tools", "翻译暂不可用，请查看原文。", utc_now())},
+        "comment_translation": {"comments": (TiboComment("User", "other", "GPT tools", "翻译暂不可用，请查看原文。"),)},
+        "missing_context": {"context_complete": False},
+    }
+    session, _ = database
+    with pytest.raises(ContentBlocked):
+        await review_report(filtered_news_report(**changes[part]), session, SecretBox("test"))
+
+
+@pytest.mark.asyncio
+async def test_news_client_rejects_before_translation_and_discards_avatar():
+    from backend.app.news_filter import ContentBlocked
+    from backend.app.tibo_radar import TiboRadarClient
+    seen = []
+    async def handle(request):
+        seen.append(str(request.url))
+        if request.url.host == "api.fxtwitter.com":
+            return httpx.Response(404)
+        if request.url.host == "translate.googleapis.com":
+            return httpx.Response(200, json=[[["新 GPT 工具。", "GPT tool"]]])
+        pytest.fail("External avatar must not be fetched")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        radar = TiboRadarClient(client=client)
+        with pytest.raises(ContentBlocked):
+            await radar.report_for_post(tibo_timeline_post("200", "GPT government election campaign", url="https://x.com/thsottiaux/status/200"))
+        assert not seen
+        raw = tibo_timeline_post("200", "GPT tool", url="https://x.com/thsottiaux/status/200",
+                                 author={"screen_name": "thsottiaux", "name": "Tibo", "avatar_url": "https://untrusted.example/avatar.png"})
+        assert (await radar.report_for_post(raw)).post.avatar is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("semantic_block", [False, True])
+async def test_news_watch_filters_blocked_posts_and_continues_safe_delivery(database, monkeypatch, semantic_block):
+    from backend.app.news_filter import review_report
+    from backend.app.app_settings import get_app_setting
+    from backend.app.tibo_watch import TiboWatcher, TiboWatchSettings, read_watch_state, save_watch_settings, STATE_KEY, watch_view
+    session, factory = database
+    box = SecretBox("review-test"); configure_news_moderator(session, box)
+    clock = [datetime(2026, 10, 19, 5, tzinfo=timezone.utc)]
+    monkeypatch.setattr("backend.app.tibo_watch.utc_now", lambda: clock[0])
+    class Client:
+        posts = [tibo_timeline_post("100", "GPT baseline")]
+        async def fetch_posts(self):
+            return self.posts
+        async def report_for_post(self, raw):
+            return filtered_news_report(text=raw["text"])
+    calls, sent = [], []
+    async def handle(request):
+        calls.append(request)
+        if semantic_block and "audience A" in json.loads(request.content)["messages"][1]["content"]:
+            return httpx.Response(200, json={"choices": [{"message": {"content": '{"allowed":false,"ai_related":true,"confidence":99,"risk_categories":["politics"]}'}}]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"allowed":true,"ai_related":true,"confidence":99,"risk_categories":[]}'}}]})
+    class Delivery:
+        async def send_image(self, target, image_bytes, filename):
+            assert Image.open(BytesIO(image_bytes)).width == 1600
+            sent.append(target.target_id)
+            return SimpleNamespace(ok=True)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+        async def review(report, session, box):
+            await review_report(report, session, box, client=http)
+        monkeypatch.setattr("backend.app.tibo_watch.review_report", review)
+        client = Client(); watcher = TiboWatcher(client, Delivery(), box)
+        save_watch_settings(session, TiboWatchSettings(enabled=True, targets="G123&P456"))
+        await watcher.run_once(factory)
+        clock[0] += timedelta(seconds=120)
+        client.posts = [tibo_timeline_post("200", "GPT API note for audience A" if semantic_block else "GPT political election campaign"), tibo_timeline_post("300", "GPT API adds a tool")]
+        await watcher.run_once(factory)
+    state = read_watch_state(session)
+    assert state.cursor == "300" and state.blocked_count == 1 and not state.pending
+    assert sent == ["123", "456"] and len(calls) == (2 if semantic_block else 1)
+    assert "election campaign" not in get_app_setting(session, STATE_KEY)
+    assert watch_view(session)["status"]["last_blocked_reason"] == "政治或公共事务内容"
+
+
+@pytest.mark.asyncio
+async def test_news_existing_pending_content_is_rechecked_and_removed_for_all_targets(database):
+    from backend.app.tibo_watch import TiboWatcher, TiboWatchSettings, WatchState, PendingDelivery, STATE_KEY, read_watch_state, save_watch_settings
+    session, factory = database
+    box = SecretBox("review-test")
+    save_watch_settings(session, TiboWatchSettings(enabled=True, targets="G123&P456"))
+    unsafe = json.dumps(tibo_timeline_post("200", "GPT political election campaign"))
+    state = WatchState(cursor="200", last_checked_at=utc_now(), pending=[PendingDelivery(post_id="200", payload_encrypted=box.encrypt(unsafe), target=target) for target in ["G123", "P456"]])
+    set_app_setting(session, STATE_KEY, state.model_dump_json())
+    class Never:
+        async def send_image(self, *args):
+            pytest.fail("Blocked content reached sender")
+        async def report_for_post(self, *args):
+            pytest.fail("Blocked content reached translator")
+    await TiboWatcher(Never(), Never(), box).run_once(factory)
+    state = read_watch_state(session)
+    assert not state.pending and state.blocked_count == 1
+
+
+@pytest.mark.asyncio
+async def test_news_missing_moderator_keeps_encrypted_work_and_sends_nothing(database, monkeypatch):
+    from backend.app.app_settings import get_app_setting
+    from backend.app.tibo_watch import TiboWatcher, TiboWatchSettings, WatchState, PendingDelivery, STATE_KEY, read_watch_state, save_watch_settings
+    session, factory = database
+    box = SecretBox("review-test")
+    save_watch_settings(session, TiboWatchSettings(enabled=True, targets="G123"))
+    raw = json.dumps(tibo_timeline_post("200", "GPT API adds a tool"))
+    state = WatchState(cursor="200", last_checked_at=utc_now(), pending=[PendingDelivery(post_id="200", payload_encrypted=box.encrypt(raw), target="G123")])
+    set_app_setting(session, STATE_KEY, state.model_dump_json())
+    class Never:
+        async def send_image(self, *args):
+            pytest.fail("Unreviewed content reached sender")
+        async def report_for_post(self, *args):
+            pytest.fail("Missing moderator should not call translator")
+    await TiboWatcher(Never(), Never(), box).run_once(factory)
+    state = read_watch_state(session)
+    assert len(state.pending) == 1 and state.pending[0].retry_at and "审核模型" in state.pending[0].last_error
+    assert "GPT API adds a tool" not in get_app_setting(session, STATE_KEY)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("political", [False, True])
+async def test_manual_tibo_command_obeys_same_moderation(database, monkeypatch, political):
+    from backend.app.commands import CommandRouter, IncomingMessage
+    from backend.app.news_filter import review_report
+    from tests.test_commands import FakeOneBot, FakeProbe
+    session, _ = database
+    box = SecretBox("review-test"); configure_news_moderator(session, box)
+    session.add(BotAdmin(qq="999")); session.commit()
+    class Client:
+        async def fetch(self):
+            return filtered_news_report(text="GPT political campaign" if political else "GPT API adds a tool")
+    async def handle(request):
+        assert not political
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"allowed":true,"ai_related":true,"confidence":99,"risk_categories":[]}'}}]})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+        async def review(report, session, box):
+            await review_report(report, session, box, client=http)
+        monkeypatch.setattr("backend.app.news_filter.review_report", review)
+        onebot = FakeOneBot()
+        router = CommandRouter(Settings(), onebot, box, probe=FakeProbe(), tibo_client=Client())
+        reply = await router.handle_message(session, IncomingMessage("999", "/tibo", "private"))
+    assert ("内容过滤" in reply and not onebot.sent) if political else (reply == "" and len(onebot.sent) == 1)
