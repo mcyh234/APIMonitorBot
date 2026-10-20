@@ -2,16 +2,14 @@
 from __future__ import annotations
 
 import html
-import asyncio
 import json
 import re
 import unicodedata
 from urllib.parse import unquote
 
-import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
-from backend.app.app_settings import get_app_setting
+from backend.app.news_models import resolve_model, complete, model_view
 
 
 REASONS = {
@@ -36,7 +34,7 @@ class ContentBlocked(ValueError):
 
 class ModerationUnavailable(ValueError):
     def __init__(self):
-        super().__init__("审核模型未配置或暂不可用，已暂停投递；请在监控管理 → 群聊情报 → 分析模型中配置并测试模型。")
+        super().__init__("审核模型未配置或暂不可用，已暂停投递；管理员可用 /reviewmodel list 查看监测模型，再用 /reviewmodel 配置ID 选择；也可在 WebUI 配置分析模型。")
 
 
 RULES = (
@@ -96,10 +94,7 @@ def check_post_payload(raw: dict):
 
 def moderator_config(session):
     try:
-        config = json.loads(get_app_setting(session, "intel.llm") or "{}")
-        if not isinstance(config, dict) or not all(isinstance(config.get(key), str) and config[key].strip() for key in ("base_url", "model", "key_cipher")):
-            raise ValueError("Missing settings")
-        return config
+        return resolve_model(session, "review")
     except Exception:
         raise ModerationUnavailable() from None
 
@@ -110,7 +105,7 @@ def moderation_view(session):
         configured = True
     except ModerationUnavailable:
         configured = False
-    return {"enabled": True, "mode": "strict", "model_configured": configured}
+    return {"enabled": True, "mode": "strict", "model_configured": configured, "review_model": model_view(session, "review"), "translation_model": model_view(session, "translation")}
 
 
 class Verdict(BaseModel):
@@ -168,28 +163,9 @@ async def review_report(report, session, box, *, client=None):
     content = json.dumps(payload, ensure_ascii=False)
     if len(content.encode("utf-8")) > 65536:
         raise ContentBlocked("oversize")
-    url = config["base_url"].rstrip("/")
-    if not url.endswith("/chat/completions"):
-        url += "/chat/completions"
-    async def request(http):
-        async with http.stream("POST", url, follow_redirects=False,
-                               headers={"Authorization": "Bearer " + box.decrypt(config["key_cipher"])},
-                               json={"model": config["model"], "messages": [{"role": "system", "content": INSTRUCTIONS},
-                                      {"role": "user", "content": content}]}) as response:
-            response.raise_for_status()
-            body = bytearray()
-            async for chunk in response.aiter_bytes():
-                body.extend(chunk)
-                if len(body) > 1_048_576:
-                    raise ValueError("Oversized response")
-        result = json.loads(body)["choices"][0]["message"]["content"]
-        return Verdict.model_validate_json(result)
     try:
-        if client is not None:
-            verdict = await asyncio.wait_for(request(client), timeout=30)
-        else:
-            async with httpx.AsyncClient(timeout=min(30, config.get("timeout_seconds", 20)), follow_redirects=False) as http:
-                verdict = await asyncio.wait_for(request(http), timeout=30)
+        result = await complete(config, box, INSTRUCTIONS, content, client=client)
+        verdict = Verdict.model_validate_json(result)
     except Exception:
         raise ModerationUnavailable() from None
     if not verdict.allowed or not verdict.ai_related or verdict.confidence < 95 or verdict.risk_categories:

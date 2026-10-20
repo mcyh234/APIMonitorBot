@@ -37,6 +37,8 @@ COMMAND_DEFINITIONS: tuple[CommandDefinition, ...] = (
     CommandDefinition("/tibo", "Tibo 雷达", "自动读取 X @thsottiaux 最新公开帖子，发送原文与中文翻译图片。"),
     CommandDefinition("/tibowatch", "Tibo 消息监听", "管理员设置 Tibo 新帖自动推送：G群号、PQQ号，多个目标用 & 连接；支持 on/off/status。"),
     CommandDefinition("/newswatch", "AI 消息监听", "管理员订阅 AI 公司、产品与人物账号；支持 all/recommend、add/remove @账号、G群号&PQQ号、on/off/status/accounts。"),
+    CommandDefinition("/reviewmodel", "审核模型", "管理员从监测配置中选择审核模型：list/status/配置ID/default。", ("审核模型",)),
+    CommandDefinition("/translatemodel", "翻译模型", "管理员从监测配置中选择大模型翻译：list/status/配置ID/default。", ("翻译模型",)),
 )
 
 

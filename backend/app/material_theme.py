@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from PIL import Image, ImageDraw, ImageFont
 
 from backend.app.time_utils import coerce_aware_utc, utc_now
+from backend.app.emoji_text import draw_text as draw_emoji_text, runs as emoji_runs
 
 _lock = threading.Lock()
 _last_hue: int | None = None
@@ -80,6 +81,7 @@ class MaterialDraw:
     _header = {"#0f172a", "#111827", "#172229"}
 
     def __init__(self, image: Image.Image, theme: MaterialTheme):
+        self.image = image
         self.raw = ImageDraw.Draw(image)
         self.theme = theme
 
@@ -127,6 +129,8 @@ class MaterialDraw:
             for key in ("fill", "outline", "stroke_fill"):
                 if key in kwargs:
                     kwargs[key] = self._ink(kwargs[key], name, key)
+            if name == "text" and len(args) >= 2 and isinstance(args[1], str) and kwargs.get("font") and any(is_emoji for _, is_emoji in emoji_runs(args[1])):
+                return draw_emoji_text(self.image, self.raw, args[0], args[1], **kwargs)
             if name == "rounded_rectangle" and kwargs.get("radius", 0) >= 7:
                 kwargs["radius"] = max(16, kwargs["radius"])
             return function(*args, **kwargs)

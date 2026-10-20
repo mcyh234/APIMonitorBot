@@ -1,6 +1,6 @@
 # AI 消息推送账号推荐
 
-账号库核对日期：2026-10-19。内置 68 个 X 账号，涵盖模型公司、产品、技术负责人和创始人。WebUI 的「监控管理 → AI 消息监听」可搜索、分类选择或添加自定义用户名。
+账号库核对日期：2026-10-20。内置 69 个 X 账号，涵盖模型公司、产品、技术负责人和创始人。WebUI 的「监控管理 → AI 消息监听」可搜索、分类选择或添加自定义用户名。
 
 ## 选择建议
 
@@ -24,6 +24,7 @@
 | Meta | [AI at Meta](https://x.com/AIatMeta) | — |
 | Microsoft | [Microsoft AI](https://x.com/MicrosoftAI)、[Copilot](https://x.com/Copilot) | [Satya Nadella](https://x.com/satyanadella)、[Mustafa Suleyman](https://x.com/mustafasuleyman) |
 | 国内模型团队 | [DeepSeek](https://x.com/deepseek_ai)、[Qwen](https://x.com/Alibaba_Qwen)、[Kimi](https://x.com/kimi_moonshot)、[MiniMax](https://x.com/MiniMax_AI)、[Z.ai](https://x.com/zai_org)、[StepFun](https://x.com/StepFun_ai)、[Baidu](https://x.com/Baidu_Inc) | — |
+| DeepSeek Harness | — | [崔天翼 / Tianyi Cui](https://x.com/tianyi)；账号由其 [GitHub 主页](https://github.com/tianyicui) 的 X 链接交叉核对 |
 | Mistral / Cohere | [Mistral AI](https://x.com/MistralAI)、[Cohere](https://x.com/cohere) | [Arthur Mensch](https://x.com/arthurmensch)、[Aidan Gomez](https://x.com/aidangomez) |
 | 研究与开放模型 | [AI21 Labs](https://x.com/AI21Labs)、[Ai2](https://x.com/allen_ai)、[Sakana AI](https://x.com/SakanaAILabs)、[Imbue](https://x.com/imbue_ai)、[Amazon Science](https://x.com/AmazonScience)、[Nous Research](https://x.com/NousResearch) | — |
 | Hugging Face | [Hugging Face](https://x.com/huggingface) | [Clément Delangue](https://x.com/ClemDelangue) |

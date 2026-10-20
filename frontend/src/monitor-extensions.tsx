@@ -117,7 +117,7 @@ export function MonitorExtensions({ request }: { request: RequestJSON }) {
         setKey(""); setClearKey(false); setMessage("LLM 设置已保存");
       }); }}>
         <h3>分析模型</h3>
-        <p>此配置也用于 AI 消息的发送前内容审核；审核不通过或调用失败时不发送。内容审核不依赖群聊情报采集开关。</p>
+        <p>未单独选择审核模型时，此配置用于 AI 消息的发送前审核；管理员也可用 /reviewmodel 选择监测配置。审核不通过或调用失败时不发送，无需开启群聊采集。</p>
         <div className="extension-grid">
           <label>BaseURL<input type="url" value={llm.base_url} onChange={e => setLLM({ ...llm, base_url: e.target.value })} /></label>
           <label>模型<input value={llm.model} onChange={e => setLLM({ ...llm, model: e.target.value })} /></label>

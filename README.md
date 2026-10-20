@@ -51,7 +51,7 @@
 | API 监控 | 多配置、协议选择、定时巡检、失败复核、模型回退、故障与恢复通知 |
 | 状态分析 | 滚动 24 小时成功率、三档时间窗口、独立超时展示、延迟曲线及异常标记 |
 | QQ 机器人 | OneBot v11 WebSocket 收发、群聊与私聊通知、多目标绑定、管理员权限、命令开关与别名 |
-| AI 消息 | 68 个公司、产品与人物账号预设，自定义订阅，自动翻译成图，按账号去重与重试 |
+| AI 消息 | 69 个公司、产品与人物账号预设，离线彩色 emoji、大模型翻译，按账号去重与重试 |
 | 渠道价格 | Sub2API / New API 分组倍率、模型广场价格、历史折线、30 日日 K、看涨/看跌投票、地址导入 |
 | 管理后台 | 登录鉴权、配置管理、巡检历史、消息记录、巡检参数、管理员管理、本地升级 |
 | 公开状态 | 默认关闭的 `/status` 页面，按分组开放，只读取本地快照 |
@@ -144,6 +144,8 @@ Linux/macOS 对应使用 `.venv/bin/python` 和 `cp .env.example .env`；其余�
 | `/tibo` | 自动读取 X @thsottiaux 最新公开帖子，发送原文与中文翻译 |
 | `/tibowatch [G群号&PQQ号\|on\|off\|status]` | 管理员配置 Tibo 新帖自动推送，支持群聊和私聊 |
 | `/newswatch` | 管理员配置多账号 AI 消息推送；支持通知对象、`on/off/status/accounts`、`recommend/all`、`add/remove @账号` |
+| `/reviewmodel [list\|status\|配置ID或名称\|default]` | 管理员从已有监测配置选择审核模型，`default` 恢复情报分析模型 |
+| `/translatemodel [list\|status\|配置ID或名称\|default]` | 管理员独立选择大模型翻译；`default` 恢复公开机器翻译 |
 | `/cancel` | 取消当前多轮对话 |
 
 普通用户的查询命令默认冷却 5 分钟，管理员不受此限制。群聊普通用户只能查询本群绑定配置，私聊命令默认仅管理员可用。WebUI 可维护命令开关与别名，`/cancel` 始终保留。
@@ -160,7 +162,7 @@ Linux/macOS 对应使用 `.venv/bin/python` 和 `cp .env.example .env`；其余�
 
 ### AI 多账号消息推送
 
-监听默认关闭，可在 WebUI 的「监控管理 → AI 消息监听」中设置账号、开关、通知对象和检查间隔。内置 **68 个账号**，按公司、产品、负责人和创始人分类，支持搜索、按类选择、推荐组合、全部选择及自定义 X 用户名。覆盖 OpenAI、Anthropic、Google、xAI、Meta、Microsoft、DeepSeek、Qwen、Kimi、MiniMax、Z.ai、StepFun、Mistral，以及推理平台、编程代理和多媒体产品。[账号推荐与来源](docs/ai-news-accounts.md)。
+监听默认关闭，可在 WebUI 的「监控管理 → AI 消息监听」中设置账号、开关、通知对象和检查间隔。内置 **69 个账号**，按公司、产品、负责人和创始人分类，支持搜索、按类选择、推荐组合、全部选择及自定义 X 用户名。覆盖 OpenAI、Anthropic、Google、xAI、Meta、Microsoft、DeepSeek、Qwen、Kimi、MiniMax、Z.ai、StepFun、Mistral，以及推理平台、编程代理和多媒体产品，包含崔天翼 `@tianyi` 的 DeepSeek Harness 动态。[账号推荐与来源](docs/ai-news-accounts.md)。
 
 新安装预选推荐组合；旧安装保留已有 Tibo 订阅、通知对象和开关，升级不会自动扩大正在推送的账号范围。可点击「加入全部账号」并保存，或使用 `/newswatch all` 加入完整账号库。人物账号可能发布非 AI 话题，Grok 等互动账号消息较多，可单独取消。
 
@@ -195,13 +197,37 @@ Bot 管理员也可通过命令配置同一份设置：
 
 1. 原文在翻译前先做本地规则检查，包含 Unicode、隐藏字符及常见编码归一化。
 2. 原文、中文译文、作者名称、原帖链接、可见回复上下文和评论在发送前接受语义审核。外部头像不下载、不进入图片；帖子附件图片和视频也不转发。
-3. 复用 WebUI「监控管理 → 群聊情报 → 分析模型」保存的 BaseURL、模型和加密密钥，**无需开启群聊情报采集**。审核会将这些公开帖子文本发送到所配置的模型服务。
+3. 管理员可用 `/reviewmodel` 选择已监测模型；未单独选择时复用 WebUI「监控管理 → 群聊情报 → 分析模型」保存的配置，**无需开启群聊情报采集**。审核会将这些公开帖子文本发送到所配置的模型服务。
 4. **未配置模型、请求失败、重定向、无效或不完整的审核结果均不发送**；审核不可用时加密排队并退避重试。只有结构有效、明确允许、属于 AI 内容、无风险分类且置信度至少 95 的结果才可继续发送。
 5. 内容命中规则、被模型拒绝、判定不确定、非 AI 内容或翻译不可用时，整帖跳过并清理其所有目标的待发送项，游标仍前进，避免重复审核同一条和阻塞后续消息。旧版本遗留待发送记录同样重新检查。
 
 WebUI 和 `/newswatch status` 显示模型是否配置、拦截计数及固定分类原因，审计不记录被拦截正文或模型返回的自由文本。首次启用前请保存并测试分析模型；否则监听仍可建立基线和发现帖子，但不会发送图片。
 
 规则和模型可能误判，无法保证覆盖全部隐晦表达或所有平台审核标准，不构成中国大陆法律或平台过审保证。严格模式采取保守放行策略，审核失败不回退到未经审核的推送。
+
+### 聊天配置审核模型与大模型翻译
+
+先通过 `/addapi` 或 WebUI 添加监测配置，再由管理员选择其 ID 或完整配置名；审核和翻译可选择不同模型，也可复用同一配置。命令不会显示 BaseURL、APIKey 或密文，选择结果只保存配置 ID，后续修改模型或凭据会立即用于新请求。
+
+```text
+/reviewmodel list
+/reviewmodel 3
+/translatemodel list
+/translatemodel 5
+/reviewmodel status
+/translatemodel status
+/newswatch add @tianyi
+```
+
+`/reviewmodel default` 恢复使用情报分析模型，审核始终不能关闭。`/translatemodel default`（兼容 `off`）恢复公开机器翻译；它不会关闭内容审核。两个配置命令均有独立命令开关，也支持「审核模型」「翻译模型」作为别名。
+
+选择的监测配置必须启用；停用或删除后暂停相关投递，不会悄悄换成其他模型。支持 `auto/openai/anthropic`，沿用配置的 TLS 设置；OpenAI 请求不携带输出 token 上限，Anthropic Messages 携带必需的 `max_tokens`。切换选择会使在途图片失效，并重新尝试因审核或翻译异常而排队的消息。
+
+大模型翻译覆盖原帖、回复背景及显示的评论，优先使用自然的产品与技术表达，原样保留 `@账号`、URL 和 emoji。配置大模型后不再调用公开翻译接口；失败、截断、无效 JSON 或受保护内容丢失时停止发送并重试，不回退到生硬的机器译文。所有最终译文仍接受严格审核。
+
+报告中的 emoji 使用随项目打包的 [Twemoji 17.0.3](https://github.com/jdecked/twemoji/tree/v17.0.3) 离线彩色素材，测宽与换行保持组合表情完整。素材采用 CC BY 4.0，归属和许可证位于 `backend/app/assets/Twemoji-ATTRIBUTION.md` 与 `Twemoji-LICENSE.txt`；尚无素材的未来表情显示可读名称，不显示缺字方框。
+
+已有部署更新后需先运行 `python -m pip install -r requirements.txt` 安装新增的 emoji 解析依赖，再构建前端并重启服务。
 
 ## 渠道倍率与价格
 

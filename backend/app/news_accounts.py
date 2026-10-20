@@ -51,6 +51,7 @@ NEWS_ACCOUNTS = (
     NewsAccount("satyanadella", "Satya Nadella", "Microsoft", "负责人", "微软 AI 产品与公司方向", False),
     NewsAccount("mustafasuleyman", "Mustafa Suleyman", "Microsoft", "负责人", "微软 AI 与产品方向", False),
     NewsAccount("deepseek_ai", "DeepSeek", "DeepSeek", "公司", "模型发布、API 与开源更新"),
+    NewsAccount("tianyi", "崔天翼 / Tianyi Cui", "DeepSeek", "负责人", "DeepSeek Harness 开发与产品动态"),
     NewsAccount("Alibaba_Qwen", "Qwen", "Qwen", "公司", "通义千问模型、开源与 API 更新"),
     NewsAccount("kimi_moonshot", "Kimi", "Moonshot", "产品", "Kimi 模型与产品更新"),
     NewsAccount("MiniMax_AI", "MiniMax", "MiniMax", "公司", "MiniMax 模型、API 与产品更新"),

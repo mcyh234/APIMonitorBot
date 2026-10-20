@@ -6,7 +6,8 @@ type Config = { enabled: boolean; targets: string; interval_seconds: number; acc
 type Account = { username: string; name: string; company: string; category: string; reason: string; recommended: boolean; url: string };
 type AccountStatus = { username: string; cursor: string | null; last_checked_at: string | null; last_error: string | null; pending_count: number };
 type Status = { initialized: boolean; last_checked_at: string | null; last_sent_at: string | null; pending_count: number; last_error: string | null; accounts: AccountStatus[]; blocked_count: number; last_blocked_reason: string | null; last_blocked_at: string | null };
-type Moderation = { enabled: boolean; mode: string; model_configured: boolean };
+type ModelStatus = { configured: boolean; available: boolean; config_name: string; model: string | null };
+type Moderation = { enabled: boolean; mode: string; model_configured: boolean; review_model: ModelStatus; translation_model: ModelStatus };
 type View = { settings: Config; status: Status; catalog: Account[]; moderation: Moderation };
 const categories = ["公司", "产品", "负责人", "创始人"];
 const time = (value: string | null) => value ? new Date(value).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "暂无";
@@ -50,7 +51,7 @@ export function NewsWatchPanel({ request }: { request: RequestJSON }) {
     <summary>AI 消息监听</summary>
     <p>订阅公司官号、产品号、负责人和创始人的 X 帖子，自动生成原文与中文翻译图片，推送到群聊或私聊。每个账号首次检查只建立基线。</p>
     <p className="extension-message">严格内容过滤始终开启：拦截政治及高风险内容，仅发送审核通过的 AI 技术与产品消息。原文、译文和回复上下文一并检查，不展示外部头像。</p>
-    {moderation && <p role="status">审核模型：{moderation.model_configured ? "已配置，发送前仍须审核通过" : "未配置，已暂停投递"}。在「群聊情报 → 分析模型」配置并测试模型即可，无需启用群聊情报采集。审核失败或结果不确定时不会发送。</p>}
+    {moderation && <p role="status">审核模型：{moderation.model_configured ? `已配置 · ${moderation.review_model.config_name} · ${moderation.review_model.model}` : "未配置，已暂停投递"}。翻译模型：{moderation.translation_model.available ? `${moderation.translation_model.config_name}${moderation.translation_model.model ? ` · ${moderation.translation_model.model}` : ""}` : "配置不可用，暂停发送"}。管理员可用 /reviewmodel、/translatemodel 从监测配置选择模型；也可在「群聊情报 → 分析模型」配置默认审核模型，无需启用群聊采集。审核失败或结果不确定时不会发送。</p>}
     {config && <form onSubmit={event => {
       event.preventDefault(); setBusy(true); setMessage("");
       void request<View>("/api/tibo-watch", { method: "PUT", body: JSON.stringify(config) })

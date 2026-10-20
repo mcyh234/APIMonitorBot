@@ -21,6 +21,7 @@ from backend.app.time_utils import utc_now
 from backend.app.models import AppSetting
 from backend.app.news_accounts import NEWS_ACCOUNTS, normalize_username, recommended_accounts
 from backend.app.news_filter import ContentBlocked, ModerationUnavailable, REASONS, check_post_payload, moderation_view, moderator_config, review_report
+from backend.app.news_models import translation_scope, TranslationUnavailable
 
 
 router = APIRouter(prefix="/api/tibo-watch")
@@ -246,7 +247,8 @@ class TiboWatcher:
                             raw = json.loads(self.box.decrypt(item.payload_encrypted))
                             check_post_payload(raw)  # Recheck persisted work from older versions.
                             moderator_config(session)
-                            report = await self.account_client(item.account).report_for_post(raw)
+                            with translation_scope(session, self.box):
+                                report = await self.account_client(item.account).report_for_post(raw)
                             await review_report(report, session, self.box)
                             images[post_key] = await asyncio.to_thread(render_tibo_radar_image, report)
                         # Re-read after rendering so a paused/removed target stays quiet.
@@ -265,7 +267,7 @@ class TiboWatcher:
                     except ContentBlocked as exc:
                         blocked(exc)
                         state.pending = [other for other in state.pending if (other.account, other.post_id) != post_key]
-                    except ModerationUnavailable as exc:
+                    except (ModerationUnavailable, TranslationUnavailable) as exc:
                         item.attempts += 1
                         item.last_error = str(exc)
                         item.retry_at = utc_now() + timedelta(seconds=min(3600, 60 * 2 ** min(item.attempts - 1, 6)))

@@ -184,6 +184,8 @@ class CommandRouter:
             return await self._tibo(session, incoming)
         if command in {"/tibowatch", "/newswatch"}:
             return self._tibo_watch(session, incoming, arg, command)
+        if command in {"/reviewmodel", "/translatemodel"}:
+            return self._news_model(session, incoming, arg, "review" if command == "/reviewmodel" else "translation")
         return None
 
     async def _manual_check(self, session: Session, incoming: IncomingMessage, name: str) -> str:
@@ -483,10 +485,31 @@ class CommandRouter:
                 f"通知对象：{updated.targets or '未配置'}\n"
                 f"订阅账号：{len(updated.accounts)} 个（/newswatch accounts 查看）\n"
                 "首次检查只建立基线，之后仅推送通过严格内容审核的新帖。\n"
-                + ("审核模型已配置。" if watch_view(session)["moderation"]["model_configured"] else "审核模型未配置，已暂停投递；请在 WebUI 的群聊情报 → 分析模型中配置。"))
+                + ("审核模型已配置。" if watch_view(session)["moderation"]["model_configured"] else "审核模型未配置，已暂停投递；可用 /reviewmodel list 选择监测配置，或在 WebUI 配置分析模型。"))
+
+    def _news_model(self, session: Session, incoming: IncomingMessage, arg: str, role: str) -> str:
+        if not is_admin(session, incoming.user_id):
+            return "权限不足，模型配置仅限 Bot 管理员。"
+        from backend.app.news_models import choose_model, model_view
+        command = "/reviewmodel" if role == "review" else "/translatemodel"
+        label = "审核模型" if role == "review" else "翻译模型"
+        option = arg.strip()
+        if option.casefold() == "list":
+            configs = session.scalars(select(APIConfig).order_by(APIConfig.id)).all()
+            lines = ["可选监测配置（只显示名称和模型，不显示凭据）："]
+            lines.extend(f"{item.id}. {item.name} · {item.model_name} · {item.protocol} · {'启用' if item.enabled else '停用'}" for item in configs)
+            return "\n".join([*lines, f"用法：{command} 配置ID 或 配置名称；支持 status/default。"])
+        try:
+            view = model_view(session, role) if option.casefold() in {"", "status"} else choose_model(session, role, option)
+        except ValueError as exc:
+            return str(exc)
+        return (f"{label}：{view['config_name']}" + (f" · {view['model']}" if view['model'] else "")
+                + ("（不可用，已暂停相关投递）" if not view['available'] else "")
+                + f"\n{command} list 查看配置；{command} 配置ID 选择。审核始终开启。")
 
     async def _tibo(self, session: Session, incoming: IncomingMessage) -> str:
         from backend.app.news_filter import ContentBlocked, ModerationUnavailable, moderator_config, review_report
+        from backend.app.news_models import translation_scope, TranslationUnavailable
         target = self._notification_target_for_context(session, incoming)
         if target is None:
             return "权限不足，当前会话不是通知对象。"
@@ -495,12 +518,13 @@ class CommandRouter:
             return f"操作太频繁，请 {remaining} 秒后再试。"
         try:
             moderator_config(session)
-            report = await self.tibo_client.fetch()
+            with translation_scope(session, self.secret_box):
+                report = await self.tibo_client.fetch()
             await review_report(report, session, self.secret_box)
             image = render_tibo_radar_image(report)
         except ContentBlocked:
             return "该帖子未通过内容过滤，已停止发送。"
-        except ModerationUnavailable as exc:
+        except (ModerationUnavailable, TranslationUnavailable) as exc:
             return str(exc)
         except TiboRadarError as exc:
             return f"Tibo 雷达数据读取失败：{exc}"

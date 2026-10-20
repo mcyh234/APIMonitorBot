@@ -1396,3 +1396,206 @@ async def test_manual_tibo_command_obeys_same_moderation(database, monkeypatch, 
         router = CommandRouter(Settings(), onebot, box, probe=FakeProbe(), tibo_client=Client())
         reply = await router.handle_message(session, IncomingMessage("999", "/tibo", "private"))
     assert ("内容过滤" in reply and not onebot.sent) if political else (reply == "" and len(onebot.sent) == 1)
+
+
+def test_emoji_atlas_covers_current_unicode_and_wraps_whole_sequences():
+    import emoji
+    from backend.app.emoji_text import atlas_index, key_for, text_atoms, text_width
+    from backend.app.material_theme import load_font, material_canvas
+    from backend.app.tibo_radar import _wrap_paragraphs
+    keys = atlas_index()["glyphs"]
+    assert all(key_for(value) in keys for value, info in emoji.EMOJI_DATA.items() if info["E"] <= 17)
+    text = "👏🏽👩‍💻🇨🇳❤️1️⃣👨‍👩‍👧‍👦⛓️‍💥"
+    assert len(list(text_atoms(text))) == 7
+    font = load_font(25)
+    lines = _wrap_paragraphs(text * 3, font, 90)
+    assert "".join(lines) == text * 3
+    assert all(text_width(line, font) <= 90 for line in lines)
+    canvas, draw = material_canvas((300, 100))
+    draw.text((10, 10), text, font=font, fill="#0f172a")
+    colors = canvas.crop((10, 10, 215, 50)).getcolors(10000)
+    assert colors and len(colors) > 30  # Actual colored glyphs, not monochrome tofu.
+
+
+def test_emoji_missing_future_asset_has_readable_fallback(monkeypatch):
+    from backend.app import emoji_text
+    from backend.app.material_theme import load_font
+    monkeypatch.setattr(emoji_text, "atlas_index", lambda: {"glyphs": {}})
+    assert emoji_text.fallback("❤️") == "[red heart]"
+    assert emoji_text.text_width("❤️", load_font(25)) == round(load_font(25).getlength("[red heart]"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol,model,fallback", [("openai", "gpt-test", False), ("anthropic", "claude-test", False), ("auto", "claude-test", True), ("auto", "gpt-test", False)])
+async def test_news_model_protocols_and_output_cap_rules(protocol, model, fallback):
+    from backend.app.news_models import complete
+    box = SecretBox("protocol-test")
+    config = {"base_url": "https://model.example/v1", "model": model, "key_cipher": box.encrypt("local-key"), "protocol": protocol}
+    calls = []
+    async def handle(request):
+        calls.append(request)
+        body = json.loads(request.content)
+        if request.url.path.endswith("/messages"):
+            assert body["max_tokens"] > 1 and body["system"] == "instructions"
+            assert request.headers["x-api-key"] == "local-key" and "authorization" not in request.headers
+            if fallback:
+                return httpx.Response(404)
+            return httpx.Response(200, json={"content": [{"type": "text", "text": "translated"}], "stop_reason": "end_turn"})
+        assert not any(key in body for key in ("max_tokens", "max_output_tokens", "max_completion_tokens"))
+        assert request.headers["authorization"] == "Bearer local-key" and "x-api-key" not in request.headers
+        return httpx.Response(200, json={"choices": [{"message": {"content": "translated"}, "finish_reason": "stop"}]})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        assert await complete(config, box, "instructions", "source", client=client) == "translated"
+    assert len(calls) == (2 if fallback else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["valid", "lost_token", "duplicate_token", "invalid_json", "truncated", "network"])
+async def test_llm_translation_keeps_handles_urls_emoji_and_fails_closed(mode):
+    from backend.app.news_models import translate_text, TranslationUnavailable
+    box = SecretBox("translation-test")
+    config = {"base_url": "https://model.example/v1", "model": "gpt-test", "key_cipher": box.encrypt("local-key")}
+    text = "@superwhisper Meetings is live 🚀👩‍💻\nRead https://example.test/meetings"
+    async def handle(request):
+        if mode == "network":
+            raise httpx.ReadTimeout("private response")
+        body = json.loads(request.content)
+        source = body["messages"][1]["content"]
+        assert "@superwhisper" not in source and "🚀" not in source and "https://example.test" not in source
+        translated = source.replace("Meetings is live", "Meetings 已上线").replace("Read", "阅读")
+        import re
+        token = re.findall(r"__KEEP_\w+__", source)[0]
+        if mode == "lost_token":
+            translated = translated.replace(token, "")
+        elif mode == "duplicate_token":
+            translated += token
+        value = "bad response" if mode == "invalid_json" else json.dumps({"translation": translated})
+        return httpx.Response(200, json={"choices": [{"message": {"content": value}, "finish_reason": "length" if mode == "truncated" else "stop"}]})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        if mode != "valid":
+            with pytest.raises(TranslationUnavailable):
+                await translate_text(text, config, box, client=client)
+        else:
+            translated, label = await translate_text(text, config, box, client=client)
+            assert translated == "@superwhisper Meetings 已上线 🚀👩‍💻\n阅读 https://example.test/meetings"
+            assert "大模型" in label
+
+
+@pytest.mark.asyncio
+async def test_model_commands_select_independent_references_and_respect_permissions(database):
+    from backend.app.commands import CommandRouter, IncomingMessage
+    from backend.app.command_settings import set_command_enabled
+    from backend.app.news_models import resolve_model, model_view, selections
+    from backend.app.tibo_watch import read_watch_state
+    from tests.test_commands import FakeOneBot, FakeProbe
+    session, _ = database
+    box = SecretBox("selection-test")
+    first = add_config(session, box, name="review model", model_name="claude-review")
+    second = add_config(session, box, name="translate model", model_name="gpt-translate")
+    session.add(BotAdmin(qq="999")); session.commit()
+    router = CommandRouter(Settings(), FakeOneBot(), box, probe=FakeProbe())
+    async def command(text, qq="999"):
+        return await router.handle_message(session, IncomingMessage(qq, text, "private"))
+    assert "权限不足" in await command("/reviewmodel list", "111")
+    listing = await command("/reviewmodel list")
+    assert "review model" in listing and "sk-test" not in listing and "https://example.com" not in listing
+    generation = read_watch_state(session).generation
+    assert "claude-review" in await command("/reviewmodel review model")
+    assert "gpt-translate" in await command(f"/translatemodel {second.id}")
+    assert read_watch_state(session).generation != generation
+    assert selections(session) == {"review": first.id, "translation": second.id}
+    assert box.decrypt(resolve_model(session, "translation")["key_cipher"]) == "sk-test"
+    assert "不能关闭" in await command("/reviewmodel off")
+    assert "未找到" in await command("/translatemodel 99999")
+    second.model_name = "gpt-updated"; session.commit()
+    assert resolve_model(session, "translation")["model"] == "gpt-updated"  # Live reference, not a copied credential snapshot.
+    second.enabled = False; session.commit()
+    assert not model_view(session, "translation")["available"]
+    set_command_enabled(session, "/reviewmodel", False)
+    assert await command("/reviewmodel default") == "该命令已关闭。"
+    assert "公开机器翻译" in await command("/translatemodel off")
+
+
+@pytest.mark.asyncio
+async def test_translation_scope_is_task_local_and_replaces_public_translator(database, monkeypatch):
+    from backend.app.news_models import choose_model, translation_scope, active_translator
+    from backend.app.tibo_radar import TiboRadarClient
+    session, _ = database
+    box = SecretBox("scope-test")
+    config = add_config(session, box)
+    choose_model(session, "translation", str(config.id))
+    async def fake(text, config, box):
+        await asyncio.sleep(0)
+        return "自然译文", "中文翻译 · 大模型翻译"
+    monkeypatch.setattr("backend.app.news_models.translate_text", fake)
+    async def scoped():
+        with translation_scope(session, box):
+            return await TiboRadarClient()._translate("GPT product is live")
+    async def isolated():
+        await asyncio.sleep(0)
+        assert active_translator.get() is None
+    result, _ = await asyncio.gather(scoped(), isolated())
+    assert result[0] == "自然译文" and active_translator.get() is None
+
+
+def test_tianyi_is_recommended_and_profile_points_to_correct_handle():
+    from backend.app.news_accounts import NEWS_ACCOUNTS
+    account = next(item for item in NEWS_ACCOUNTS if item.username == "tianyi")
+    assert account.recommended and account.company == "DeepSeek" and account.view()["url"] == "https://x.com/tianyi"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unsafe_translation", [False, True])
+async def test_selected_translation_and_review_models_run_before_delivery(database, monkeypatch, unsafe_translation):
+    from backend.app import news_models, news_filter
+    from backend.app.news_models import choose_model
+    from backend.app.tibo_watch import TiboWatcher, TiboWatchSettings, read_watch_state, save_watch_settings
+    from backend.app.tibo_radar import TiboRadarClient
+    session, factory = database
+    box = SecretBox("selected-flow")
+    review = add_config(session, box, name="review", model_name="claude-review")
+    review.protocol = "anthropic"; session.commit()
+    translate = add_config(session, box, name="translate", model_name="gpt-translate")
+    choose_model(session, "review", str(review.id)); choose_model(session, "translation", str(translate.id))
+    clock = [datetime(2026, 10, 20, 5, tzinfo=timezone.utc)]
+    monkeypatch.setattr("backend.app.tibo_watch.utc_now", lambda: clock[0])
+    sent, calls = [], []
+    class Client:
+        posts = [tibo_timeline_post("100", "GPT API baseline")]
+        async def fetch_posts(self):
+            return self.posts
+        async def report_for_post(self, raw):
+            translated, label = await TiboRadarClient()._translate(raw["text"])
+            return filtered_news_report(text=raw["text"], translated_zh=translated, translation_label=label)
+    class Delivery:
+        async def send_image(self, target, image_bytes, filename):
+            assert Image.open(BytesIO(image_bytes)).width == 1600
+            sent.append(target.target_id)
+            return SimpleNamespace(ok=True)
+    async def handle(request):
+        body = json.loads(request.content); calls.append(body["model"])
+        if body["model"] == "gpt-translate":
+            value = body["messages"][1]["content"].replace("GPT API is live", "GPT API 已上线")
+            if unsafe_translation:
+                value += " 政治评论"
+            return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps({"translation": value})}}]})
+        assert request.url.path.endswith("/messages") and "max_tokens" in body
+        assert "已上线" in body["messages"][0]["content"] and "大模型翻译" in body["messages"][0]["content"]
+        return httpx.Response(200, json={"content": [{"type": "text", "text": '{"allowed":true,"ai_related":true,"confidence":99,"risk_categories":[]}'}], "stop_reason": "end_turn"})
+    original = news_models.complete
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+        async def complete(config, box, system, content, **kwargs):
+            return await original(config, box, system, content, client=http)
+        monkeypatch.setattr(news_models, "complete", complete)
+        monkeypatch.setattr(news_filter, "complete", complete)
+        client = Client(); watcher = TiboWatcher(client, Delivery(), box)
+        save_watch_settings(session, TiboWatchSettings(enabled=True, targets="G123&P456"))
+        await watcher.run_once(factory)
+        clock[0] += timedelta(seconds=120)
+        client.posts = [tibo_timeline_post("200", "@superwhisper GPT API is live 🚀👩‍💻")]
+        await watcher.run_once(factory)
+    state = read_watch_state(session)
+    assert not state.pending
+    assert calls == (["gpt-translate"] if unsafe_translation else ["gpt-translate", "claude-review"])
+    assert sent == ([] if unsafe_translation else ["123", "456"])
+    assert state.blocked_count == (1 if unsafe_translation else 0)

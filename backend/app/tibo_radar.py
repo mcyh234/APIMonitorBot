@@ -16,6 +16,8 @@ from backend.app.material_theme import material_canvas, load_font as _font
 from backend.app.time_utils import utc_now
 from backend.app.news_accounts import account_name, normalize_username
 from backend.app.news_filter import check_post_payload
+from backend.app.emoji_text import text_width, text_atoms
+from backend.app.news_models import active_translator
 from backend.app.x_timeline import TimelineError, posts_from_json, parse_timeline_posts, post_datetime
 
 
@@ -282,6 +284,9 @@ class TiboRadarClient:
         return tuple(comments)
 
     async def _translate(self, text: str) -> tuple[str, str]:
+        translator = active_translator.get()
+        if translator is not None:
+            return await translator(text)
         semaphore = asyncio.Semaphore(3)
         async def translate_chunk(chunk):
             url = ("https://translate.googleapis.com/translate_a/single"
@@ -587,7 +592,7 @@ def _wrap_paragraphs(text: str, font: ImageFont.ImageFont, max_width: int) -> li
             result.append("")
             continue
         current = ""
-        for char in paragraph:
+        for char in text_atoms(paragraph):
             candidate = current + char
             if current and _text_width(candidate, font) > max_width:
                 result.append(current.rstrip())
@@ -651,5 +656,4 @@ def _integer(value: Any) -> int | None:
 
 
 def _text_width(text: str, font: ImageFont.ImageFont) -> int:
-    box = font.getbbox(text)
-    return int(box[2] - box[0])
+    return text_width(text, font)

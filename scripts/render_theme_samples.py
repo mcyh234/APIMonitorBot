@@ -81,8 +81,8 @@ async def render(output: Path):
         (output / f"radar-{mode}.png").write_bytes(render_codex_radar_image(radar, generated_at=now))
         (output / f"tibo-{mode}.png").write_bytes(render_tibo_radar_image(replace(tibo, monitored_at=now), generated_at=now))
         news_post = replace(tibo.post, source_url="https://x.com/OpenAIDevs/status/123456789", author_name="OpenAI Developers",
-                            username="OpenAIDevs", text="Offline demo: a new developer feature is available. Read the release notes for details.",
-                            translated_zh="离线演示：一项新的开发者功能已上线。详情请查看更新说明。", avatar=None, parent=None, comments=())
+                            username="OpenAIDevs", text="Offline demo: @superwhisper Meetings is live 🚀🎉👏🏽👩‍💻🇨🇳❤️1️⃣\nRecord, transcribe and summarize meetings automatically.",
+                            translated_zh="离线演示：@superwhisper Meetings 已上线 🚀🎉👏🏽👩‍💻🇨🇳❤️1️⃣\n自动录音、转写并总结会议。", translation_label="中文翻译 · 大模型翻译（离线示例）", avatar=None, parent=None, comments=())
         (output / f"ai-news-{mode}.png").write_bytes(render_tibo_radar_image(replace(tibo, monitored_at=now, post=news_post), generated_at=now))
     print(output.resolve())
 
