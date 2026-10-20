@@ -18,12 +18,13 @@ from backend.app.news_accounts import account_name, normalize_username
 from backend.app.news_filter import check_post_payload
 from backend.app.emoji_text import text_width, text_atoms
 from backend.app.news_models import active_translator
-from backend.app.x_timeline import TimelineError, posts_from_json, parse_timeline_posts, post_datetime
+from backend.app.news_sources import DEFAULT_FEED_TEMPLATES, FeedPool
+from backend.app.x_timeline import TimelineError, posts_from_json, post_datetime
 
 
 TIBO_USERNAME = "thsottiaux"
-DEFAULT_TIMELINE_URL = f"https://fxtwitter.com/{TIBO_USERNAME}/feed.xml?count=30&with_replies=1"
-FALLBACK_TIMELINE_URL = f"https://fixupx.com/{TIBO_USERNAME}/feed.xml?count=30&with_replies=1"
+DEFAULT_TIMELINE_URL = DEFAULT_FEED_TEMPLATES[0].replace("{username}", TIBO_USERNAME)
+FALLBACK_TIMELINE_URL = DEFAULT_FEED_TEMPLATES[1].replace("{username}", TIBO_USERNAME)
 
 
 class TiboRadarError(RuntimeError):
@@ -85,6 +86,7 @@ class TiboRadarClient:
         bearer_token: str = "",
         timezone_name: str = "Asia/Shanghai",
         username: str = TIBO_USERNAME,
+        source_urls: list[str] | None = None,
     ) -> None:
         # Old installations used the regional summary URL as the source.
         # Migrate that default without reading its contents or old post links.
@@ -93,9 +95,15 @@ class TiboRadarClient:
             source_url = ""
         self.username = normalize_username(username)
         self._configured_source = source_url
-        defaults = tuple(f"https://{host}/{self.username}/feed.xml?count=30&with_replies=1" for host in ("fxtwitter.com", "fixupx.com"))
+        self._configured_sources = source_urls or []
+        defaults = tuple(url.replace("{username}", self.username) for url in DEFAULT_FEED_TEMPLATES)
         self.source_url = source_url.replace("{username}", self.username) if source_url else defaults[0]
-        self._source_urls = (self.source_url,) if source_url else defaults
+        self._source_urls = tuple(dict.fromkeys(([self.source_url] if source_url else []) +
+                                  [url.replace("{username}", self.username) for url in self._configured_sources])) or defaults
+        if not source_url:
+            self.source_url = self._source_urls[0]
+        self._feed_pool = FeedPool()
+        self.source_status: list[dict] = []
         self.timeout_seconds = timeout_seconds
         self._client = client
         self._bearer_token = bearer_token.strip()
@@ -107,8 +115,11 @@ class TiboRadarClient:
         source = self._configured_source if username == self.username else ""
         if "{username}" in self._configured_source:
             source = self._configured_source.replace("{username}", username)
-        return TiboRadarClient(source, self.timeout_seconds, self._client, bearer_token=self._bearer_token,
-                               timezone_name=self.timezone, username=username)
+        result = TiboRadarClient(source, self.timeout_seconds, self._client, bearer_token=self._bearer_token,
+                                timezone_name=self.timezone, username=username,
+                                source_urls=[url for url in self._configured_sources if "{username}" in url or username == self.username])
+        result._feed_pool = self._feed_pool
+        return result
 
     async def fetch(self) -> TiboRadarReport:
         posts = await self.fetch_posts()
@@ -120,28 +131,29 @@ class TiboRadarClient:
         return TiboRadarReport(monitored_at=utc_now(), timezone=self.timezone, post=post)
 
     async def fetch_posts(self) -> list[dict]:
-        latest = None
-        api_failed = False
+        self.source_status = []
         if self._bearer_token:
             try:
-                latest = await self._fetch_api_timeline()
-            except TiboRadarError:
-                api_failed = True
-        if latest is None:
-            failure = None
-            for source_url in self._source_urls:
-                try:
-                    response = await self._get(source_url, accept="application/rss+xml, application/atom+xml, application/json, text/html")
-                    if response.status_code >= 400:
-                        raise TiboRadarError(f"X 时间线请求失败：HTTP {response.status_code}")
-                    latest = parse_timeline_posts(response.content, self.username)
-                    break
-                except (httpx.RequestError, TimelineError, TiboRadarError) as exc:
-                    failure = exc
-            if latest is None:
-                prefix = "X API 与时间线来源均不可用。" if api_failed else ""
-                raise TiboRadarError(prefix + "无法读取最新帖子，RSS 来源暂不可用；可通过 TIBO_RADAR_SOURCE_URL 更换来源。") from failure
-        return latest
+                latest = await asyncio.wait_for(self._fetch_api_timeline(), timeout=min(self.timeout_seconds, 6))
+                self.source_status = [{"host": "api.x.com", "state": "ok", "post_count": len(latest), "latest_id": latest[0]["id"]}]
+                return latest
+            except (TiboRadarError, TimeoutError):
+                self.source_status = [{"host": "api.x.com", "state": "error", "post_count": 0, "latest_id": None}]
+        results = await asyncio.gather(*(self._feed_pool.fetch(url, self.username, self._get, self.timeout_seconds)
+                                         for url in self._source_urls))
+        merged = {}
+        for posts, status in results:
+            self.source_status.append(status)
+            for post in posts:
+                # Keep the fuller entry without losing fields such as reply context.
+                previous = merged.get(post["id"], {})
+                richer, other = (post, previous) if len(post["text"]) >= len(previous.get("text", "")) else (previous, post)
+                merged[post["id"]] = {**other, **richer}
+        if not merged:
+            raise TiboRadarError("无法读取最新帖子：所有 X 时间线来源暂不可用或正在限流退避；可通过 TIBO_RADAR_SOURCE_URLS 配置多个 RSS 来源。")
+        return sorted(merged.values(), key=lambda post: (
+            post_datetime(post.get("created_at")).timestamp() if post_datetime(post.get("created_at")) else
+            ((int(post["id"]) >> 22) + 1288834974657) / 1000, int(post["id"])), reverse=True)
 
     async def _fetch_api_timeline(self) -> list[dict]:
         if self._x_user is None:
@@ -150,7 +162,7 @@ class TiboRadarClient:
             if not isinstance(user, dict) or not str(user.get("id", "")).isdigit() or str(user.get("username", "")).casefold() != self.username:
                 raise TiboRadarError("X 用户响应无效。")
             self._x_user = user
-        query = urlencode({"max_results": 10, "exclude": "retweets",
+        query = urlencode({"max_results": 100, "exclude": "retweets",
                            "tweet.fields": "created_at,public_metrics,referenced_tweets,note_tweet,author_id",
                            "expansions": "author_id,referenced_tweets.id,referenced_tweets.id.author_id",
                            "user.fields": "name,username,profile_image_url"})
@@ -343,8 +355,9 @@ class TiboRadarClient:
         except httpx.RequestError:
             return None
 
-    async def _get(self, url: str, *, accept: str, authenticated: bool = False) -> httpx.Response:
+    async def _get(self, url: str, *, accept: str, authenticated: bool = False, extra_headers: dict | None = None) -> httpx.Response:
         headers = {"Accept": accept, "User-Agent": "APIMonitorBot/1.0"}
+        headers.update(extra_headers or {})
         if authenticated:
             if urlparse(url).netloc != "api.x.com" or urlparse(url).scheme != "https":
                 raise TiboRadarError("X API Token 只能发送至官方 API。")

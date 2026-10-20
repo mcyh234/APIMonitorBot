@@ -44,7 +44,7 @@
 - [Black Forest Labs 官网](https://blackforestlabs.ai) 指向 `@bfl_ai`，[Suno 官网](https://suno.com) 指向 `@suno`。
 - [Windsurf 官网](https://windsurf.com) 当前指向 Cognition；避免订阅旧账号后一直等不到产品更新。
 
-预设账号不等于所有来源始终可抓取。RSS 可能限流、缓存、只保留少量帖子或暂时没有原创内容，WebUI 会分别显示状态。账号更名后可在 WebUI 移除旧用户名、添加新用户名；新账号首次只建立基线。
+预设账号不等于所有来源始终可抓取。RSS 可能限流、缓存、只保留少量帖子或暂时没有原创内容，WebUI 会分别显示状态。当前使用多源合并与限流退避，详情见 [RSS 来源维护](ai-news-sources.md)。账号更名后可在 WebUI 移除旧用户名、添加新用户名；新账号首次只建立基线。
 
 ## 使用
 

@@ -66,6 +66,9 @@ class PendingDelivery(BaseModel):
 
 class AccountState(BaseModel):
     cursor: str | None = None
+    discovery_floor: str | None = None
+    seen_ids: list[str] = Field(default_factory=list)
+    sources: list[dict] = Field(default_factory=list)
     last_checked_at: datetime | None = None
     last_error: str | None = None
 
@@ -118,7 +121,7 @@ def watch_view(session: Session):
     settings, state = read_watch_settings(session), read_watch_state(session)
     active = set(settings.targets.split("&"))
     pending = [item for item in state.pending if item.target in active and item.account in settings.accounts]
-    accounts = [{"username": username, **state.accounts.get(username, AccountState()).model_dump(),
+    accounts = [{"username": username, **state.accounts.get(username, AccountState()).model_dump(exclude={"seen_ids", "discovery_floor"}),
                  "pending_count": sum(item.account == username for item in pending)} for username in settings.accounts]
     error = next((item["last_error"] for item in accounts if item["last_error"]), None)
     return {"settings": settings.model_dump(), "catalog": [item.view() for item in NEWS_ACCOUNTS], "moderation": moderation_view(session), "status": {
@@ -194,6 +197,7 @@ class TiboWatcher:
                         return
                     for username, result in zip(due, results):
                         account = state.accounts[username]
+                        account.sources = getattr(self.account_client(username), "source_status", [])
                         try:
                             if isinstance(result, BaseException):
                                 raise ValueError("Timeline unavailable")
@@ -201,9 +205,16 @@ class TiboWatcher:
                             if not posts:
                                 raise ValueError("Empty timeline")
                             newest_id = max(int(post["id"]) for post in posts)
+                            # Preserve the old cursor as a safe upgrade baseline. A
+                            # moving high-water mark alone loses delayed RSS items.
+                            if account.discovery_floor is None:
+                                account.discovery_floor = account.cursor or str(newest_id)
+                            seen = set(account.seen_ids)
                             if account.cursor is not None:
-                                new_posts = sorted((post for post in posts if int(post["id"]) > int(account.cursor)), key=lambda post: int(post["id"]))
+                                new_posts = sorted((post for post in posts if int(post["id"]) > int(account.discovery_floor)
+                                                    and post["id"] not in seen), key=lambda post: int(post["id"]))
                                 for post in new_posts:
+                                    seen.add(post["id"])
                                     try:
                                         check_post_payload(post)
                                     except ContentBlocked as exc:
@@ -212,6 +223,12 @@ class TiboWatcher:
                                     encrypted = self.box.encrypt(json.dumps(post, ensure_ascii=False))
                                     state.pending.extend(PendingDelivery(account=username, post_id=str(post["id"]), payload_encrypted=encrypted, target=target)
                                                          for target in settings.targets.split("&"))
+                            # Bounded deduplication survives restarts and definitive
+                            # moderation blocks. Eviction advances the safe floor.
+                            retained = sorted(seen | {str(post["id"]) for post in posts}, key=int)
+                            if len(retained) > 2048:
+                                account.discovery_floor = str(max(int(account.discovery_floor), int(retained[-2048]) - 1))
+                            account.seen_ids = retained[-2048:]
                             account.cursor = str(max(int(account.cursor or "0"), newest_id))
                             account.last_error = None
                         except Exception:

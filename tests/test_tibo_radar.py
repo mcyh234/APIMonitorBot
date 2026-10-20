@@ -12,7 +12,7 @@ from backend.app.tibo_radar import TiboRadarClient, render_tibo_radar_image
 class TiboFixtureClient:
     async def get(self, url, headers):
         request = httpx.Request("GET", url)
-        if "/feed.xml" in url:
+        if "/feed.xml" in url or "/with_replies/rss" in url:
             return httpx.Response(
                 200,
                 json={

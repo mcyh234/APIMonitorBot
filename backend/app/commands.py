@@ -81,6 +81,7 @@ class CommandRouter:
             timeout_seconds=settings.tibo_radar_timeout_seconds,
             bearer_token=settings.tibo_x_bearer_token,
             timezone_name=settings.app_timezone,
+            source_urls=settings.tibo_radar_source_urls,
         )
         from backend.app.monitor import MonitorService
         from backend.app.notifier import OneBotNotifier

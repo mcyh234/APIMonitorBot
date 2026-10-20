@@ -27,6 +27,7 @@ from backend.app.notifier import Notifier
 from backend.app.onebot import OneBotClient
 from backend.app.settings import Settings
 from backend.app.time_utils import coerce_aware_utc, utc_now
+from backend.app.tibo_watch import AccountState, STATE_KEY, read_watch_state
 from backend.app.webui_auth import set_webui_secret, webui_secret_configured
 from sqlalchemy import select
 import uvicorn
@@ -83,6 +84,16 @@ with db.SessionLocal() as session:
             observation.checked_at = coerce_aware_utc(observation.checked_at) + shift
         config.last_checked_at = now
     session.commit()
+
+    # Fixed source health examples; no public feed or OneBot calls in preview.
+    watch_state = read_watch_state(session)
+    watch_state.accounts["thsottiaux"] = AccountState(cursor="100", discovery_floor="100", seen_ids=["100"], last_checked_at=now, sources=[
+        {"host": "fxtwitter.com", "state": "ok", "post_count": 61, "latest_id": "100"},
+        {"host": "nitter.kareem.one", "state": "rate_limited", "post_count": 0, "retry_seconds": 600},
+        {"host": "nitter.jaydenha.uk", "state": "cooldown", "post_count": 0, "retry_seconds": 60},
+        {"host": "nitter.netbub.com", "state": "error", "post_count": 0, "retry_seconds": 120},
+    ])
+    set_app_setting(session, STATE_KEY, watch_state.model_dump_json())
 
 app = create_app(settings)
 

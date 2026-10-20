@@ -13,7 +13,7 @@ from sqlalchemy.orm import sessionmaker
 
 from backend.app import db
 from backend.app.api import status_bars_to_out
-from backend.app.app_settings import set_app_setting
+from backend.app.app_settings import get_app_setting, set_app_setting
 from backend.app.availability import ApiProbe, CheckResult
 from backend.app.crypto import SecretBox
 from backend.app.intelligence import IntelPipeline, IntelSettings, LLMSettings, finding_detail, findings, llm_transcript, llm_view, put_llm, safe_text
@@ -662,7 +662,7 @@ async def test_tibo_default_rss_mirror_fallback_and_legacy_source_migration():
         assert "authorization" not in request.headers
         if request.url.host == "fxtwitter.com":
             return httpx.Response(503)
-        if request.url.host == "fixupx.com":
+        if request.url.host.startswith("nitter."):
             return httpx.Response(200, json={"tweets": [tibo_timeline_post()]})
         if request.url.host == "api.fxtwitter.com":
             return httpx.Response(403)
@@ -670,7 +670,7 @@ async def test_tibo_default_rss_mirror_fallback_and_legacy_source_migration():
         return httpx.Response(200, json=[[["新版本。", "New release."]]])
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
         report = await TiboRadarClient("https://codexradar.com/current.json", client=client).fetch()
-    assert hosts[:2] == ["fxtwitter.com", "fixupx.com"]
+    assert set(hosts[:4]) == {"fxtwitter.com", "nitter.kareem.one", "nitter.jaydenha.uk", "nitter.netbub.com"}
     assert "codexradar.com" not in hosts
     assert report.post.text == "New release."
     assert report.post.translated_zh == "新版本。"
@@ -1139,7 +1139,7 @@ async def test_news_account_api_identity_cache_and_bearer_boundary(api_unavailab
             for _ in range(2):
                 posts = await client.fetch_posts()
                 assert posts[0]["author"]["screen_name"] == username
-    assert len(external) == (4 if api_unavailable else 0)
+    assert len(external) == (8 if api_unavailable else 0)  # Four feeds per account; second read uses cache.
     assert lookups == ([] if api_unavailable else ["openai", "claudeai"])
 
 
@@ -1599,3 +1599,167 @@ async def test_selected_translation_and_review_models_run_before_delivery(databa
     assert calls == (["gpt-translate"] if unsafe_translation else ["gpt-translate", "claude-review"])
     assert sent == ([] if unsafe_translation else ["123", "456"])
     assert state.blocked_count == (1 if unsafe_translation else 0)
+
+
+@pytest.mark.asyncio
+async def test_news_feeds_merge_successful_but_incomplete_sources_and_preserve_context():
+    from backend.app.tibo_radar import TiboRadarClient
+    seen = []
+    def handle(request):
+        seen.append(request.url.host)
+        if request.url.host == "first.example":
+            return httpx.Response(200, json={"tweets": [tibo_timeline_post("200", "GPT"),
+                {**tibo_timeline_post("150", "GPT reply"), "replying_to_status": "100"}]})
+        return httpx.Response(200, json={"tweets": [tibo_timeline_post("300", "GPT API release"),
+            tibo_timeline_post("200", "GPT API with complete release notes"), tibo_timeline_post("150", "GPT reply with full notes")]})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+        client = TiboRadarClient(client=http, source_urls=["https://first.example/{username}", "https://second.example/{username}"])
+        posts = await client.fetch_posts()
+        assert {post["id"] for post in posts} == {"150", "200", "300"}
+        assert next(post for post in posts if post["id"] == "200")["text"].endswith("release notes")
+        assert next(post for post in posts if post["id"] == "150")["replying_to_status"] == "100"
+        assert len(seen) == 2 and all(item["state"] == "ok" for item in client.source_status)
+        await client.fetch_posts()
+        assert len(seen) == 2 and all(item["state"] == "cached" for item in client.source_status)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("date_header", [False, True])
+async def test_news_feed_429_backoff_is_shared_across_accounts_and_honors_retry_after(monkeypatch, date_header):
+    from backend.app.tibo_radar import TiboRadarClient, TiboRadarError
+    import backend.app.news_sources as sources
+    from email.utils import format_datetime
+    clock = [100.0]
+    monkeypatch.setattr(sources.time, "monotonic", lambda: clock[0])
+    calls = []
+    retry = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=601)) if date_header else "600"
+    def handle(request):
+        calls.append(str(request.url))
+        return httpx.Response(429, headers={"Retry-After": retry}, text="private upstream error must never appear in status")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+        client = TiboRadarClient(client=http, source_urls=["https://limited.example/{username}"])
+        with pytest.raises(TiboRadarError):
+            await client.fetch_posts()
+        other = client.for_account("openai")
+        with pytest.raises(TiboRadarError):
+            await other.fetch_posts()
+        assert len(calls) == 1
+        assert other.source_status[0]["state"] == "cooldown"
+        assert other.source_status[0]["retry_seconds"] >= 599
+        assert "private upstream" not in json.dumps(client.source_status)
+        clock[0] += 602
+        with pytest.raises(TiboRadarError):
+            await other.fetch_posts()
+        assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_news_feeds_conditional_requests_and_failure_do_not_return_stale_cached_posts(monkeypatch):
+    from backend.app.tibo_radar import TiboRadarClient, TiboRadarError
+    import backend.app.news_sources as sources
+    clock, calls = [100.0], []
+    monkeypatch.setattr(sources.time, "monotonic", lambda: clock[0])
+    def handle(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(200, headers={"ETag": '"revision-1"', "Last-Modified": "Mon, 19 Oct 2026 00:00:00 GMT"},
+                                  json={"tweets": [tibo_timeline_post("200")]})
+        assert request.headers["If-None-Match"] == '"revision-1"'
+        assert "If-Modified-Since" in request.headers
+        return httpx.Response(304 if len(calls) == 2 else 503)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+        client = TiboRadarClient("https://feed.example/rss?token=private", client=http)
+        assert (await client.fetch_posts())[0]["id"] == "200"
+        clock[0] += 61
+        assert (await client.fetch_posts())[0]["id"] == "200"
+        clock[0] += 61
+        with pytest.raises(TiboRadarError):
+            await client.fetch_posts()
+        assert "private" not in json.dumps(client.source_status)
+        with pytest.raises(TiboRadarError):
+            await client.fetch_posts()
+        assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_news_slow_or_invalid_feed_does_not_hide_healthy_source():
+    from backend.app.tibo_radar import TiboRadarClient
+    async def handle(request):
+        if request.url.host == "slow.example":
+            await asyncio.sleep(1)
+        if request.url.host == "invalid.example":
+            return httpx.Response(200, text="not a feed")
+        return httpx.Response(200, json={"tweets": [tibo_timeline_post("300")]})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+        client = TiboRadarClient(client=http, timeout_seconds=.02, source_urls=["https://slow.example/rss", "https://invalid.example/rss", "https://healthy.example/rss", "https://[bad/rss"])
+        assert (await client.fetch_posts())[0]["id"] == "300"
+        assert [item["state"] for item in client.source_status] == ["error", "error", "ok", "error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_news_delayed_posts_survive_high_water_cursor_restart_and_block_dedup(database, monkeypatch, approved_delivery_unit, legacy):
+    from backend.app.tibo_watch import TiboWatcher, TiboWatchSettings, WatchState, STATE_KEY, read_watch_state, save_watch_settings
+    session, factory = database
+    clock, sent = [datetime(2026, 10, 20, tzinfo=timezone.utc)], []
+    monkeypatch.setattr("backend.app.tibo_watch.utc_now", lambda: clock[0])
+    monkeypatch.setattr("backend.app.tibo_watch.render_tibo_radar_image", lambda raw: raw["id"].encode())
+    class Client:
+        posts = [tibo_timeline_post("100", "GPT baseline")]
+        async def fetch_posts(self):
+            return self.posts
+        async def report_for_post(self, raw):
+            return raw
+    class Delivery:
+        async def send_image(self, target, image_bytes, filename):
+            sent.append((target.target_id, image_bytes))
+            return SimpleNamespace(ok=True)
+    save_watch_settings(session, TiboWatchSettings(enabled=True, targets="G123"))
+    if legacy:
+        set_app_setting(session, STATE_KEY, WatchState(cursor="100").model_dump_json())
+    client, box = Client(), SecretBox("late-post-test")
+    watcher = TiboWatcher(client, Delivery(), box)
+    await watcher.run_once(factory)
+    clock[0] += timedelta(seconds=120)
+    client.posts = [tibo_timeline_post("300", "GPT new API")]
+    await watcher.run_once(factory)
+    assert sent == [("123", b"300")]
+    # A different RSS server returns an omitted older ID after the cursor has advanced.
+    clock[0] += timedelta(seconds=120)
+    client.posts += [tibo_timeline_post("200", "GPT delayed API release"), tibo_timeline_post("250", "GPT political news"), tibo_timeline_post("90", "GPT old history")]
+    watcher = TiboWatcher(client, Delivery(), box)
+    await watcher.run_once(factory)
+    assert sent == [("123", b"300"), ("123", b"200")]
+    state = read_watch_state(session)
+    assert state.cursor == "300" and state.blocked_count == 1 and not state.pending
+    assert "250" in state.accounts["thsottiaux"].seen_ids
+    save_watch_settings(session, TiboWatchSettings(enabled=True, targets="G123&P456"))
+    clock[0] += timedelta(seconds=120)
+    await TiboWatcher(client, Delivery(), box).run_once(factory)
+    assert len(sent) == 2 and read_watch_state(session).blocked_count == 1
+    assert "GPT delayed" not in get_app_setting(session, STATE_KEY)
+
+
+@pytest.mark.asyncio
+async def test_news_seen_ledger_is_bounded_and_eviction_never_replays_posts(database, monkeypatch, approved_delivery_unit):
+    from backend.app.tibo_watch import TiboWatcher, TiboWatchSettings, STATE_KEY, read_watch_state, save_watch_settings
+    session, factory = database
+    save_watch_settings(session, TiboWatchSettings(enabled=True, targets="G123"))
+    state = read_watch_state(session)
+    from backend.app.tibo_watch import AccountState
+    state.accounts["thsottiaux"] = AccountState(cursor="3000", discovery_floor="100", seen_ids=[str(value) for value in range(100, 3001)])
+    set_app_setting(session, STATE_KEY, state.model_dump_json())
+    class Client:
+        async def fetch_posts(self):
+            return [tibo_timeline_post("3000"), tibo_timeline_post("101")]
+    class Delivery:
+        async def send_image(self, *args):
+            pytest.fail("An evicted ID must not be resent")
+    await TiboWatcher(Client(), Delivery(), SecretBox("test")).run_once(factory)
+    state = read_watch_state(session)
+    assert len(state.accounts["thsottiaux"].seen_ids) == 2048
+    assert int(state.accounts["thsottiaux"].discovery_floor) > 101
+    state.accounts["thsottiaux"].last_checked_at = None
+    set_app_setting(session, STATE_KEY, state.model_dump_json())
+    await TiboWatcher(Client(), Delivery(), SecretBox("test")).run_once(factory)
+    assert not read_watch_state(session).pending

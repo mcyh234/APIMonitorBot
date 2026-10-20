@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     codex_radar_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
 
     tibo_radar_source_url: str = ""
+    tibo_radar_source_urls: list[str] = Field(default_factory=list, max_length=12)
     tibo_x_bearer_token: str = Field(default="", repr=False)
     tibo_radar_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
 

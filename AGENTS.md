@@ -1,5 +1,12 @@
 # Agent 开发指南
 
+## X / RSS 多源与晚到帖子
+
+- 默认来源池位于 `backend/app/news_sources.py`，FxTwitter 与三个实测可用的 Nitter 实例并行合并，不能在第一个来源成功后停止。FixupX 不算独立上游；来源记录维护在 `docs/ai-news-sources.md`。
+- 429 / 503 跨账号退避并尊重 `Retry-After`；抓取并发、超时、缓存容量必须有界。健康状态只保存域名、固定状态、条数、帖子 ID 与退避时间，不保存响应正文或带凭据的 URL。
+- 按账号保存初次基线与最近 2048 个已处理 ID，晚到帖子可小于移动游标；不得重复投递、重复计入内容拦截或回放初次基线前的历史。旧版本以原游标为安全基线。新发现项仍须严格审核。
+- `TIBO_RADAR_SOURCE_URLS` 是最多 12 项的 JSON 数组，支持 `{username}`；单一来源设置继续兼容。`scripts/check_news_sources.py` 只读诊断，不使用 X Token、不读数据库、不调用审核 / 翻译或发送通知。
+
 ## 新闻模型选择与 emoji
 
 - `/reviewmodel`、`/translatemodel` 为管理员配置命令，各有开关，支持 `list/status/配置ID或完整名称/default`；只存监测配置 ID，不在聊天暴露地址或密钥。审核未单独选择时继续复用 `intel.llm`，`reviewmodel off` 必须拒绝。

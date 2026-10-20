@@ -154,9 +154,9 @@ Linux/macOS 对应使用 `.venv/bin/python` 和 `cp .env.example .env`；其余�
 
 每次调用 `/tibo` 都会从 `@thsottiaux` 的账号时间线选择最新公开帖子（包含回复、排除转帖），不会把旧置顶帖当作最新帖。图片展示原文、中文机器翻译、发布时间、原帖链接和可用的回复上下文；已移除区域判断、位置概率和相关摘要。
 
-默认读取 [FxTwitter RSS](https://fxtwitter.com/thsottiaux/feed.xml?count=30&with_replies=1)，失败时回退 FixupX 的同源 RSS，无需 X Token；[订阅格式说明](https://docs.fxembed.com/guide/advanced/rss-atom-feeds/)。也可将 `.env` 中的 `TIBO_RADAR_SOURCE_URL` 指向其他账号 RSS/Atom 或 JSON 时间线。只解析 `@thsottiaux` 本人发布的帖子，旧 Codex Radar 来源配置会自动使用新的默认 RSS。
+默认并行读取 FxTwitter 与 3 个 Nitter RSS 实例，合并、去重后选择最新帖子，无需 X Token；成功但不完整的来源不会阻止其他来源补充帖子。来源及实测记录见 [RSS 来源维护](docs/ai-news-sources.md)，[FxTwitter 订阅格式说明](https://docs.fxembed.com/guide/advanced/rss-atom-feeds/)。只解析 `@thsottiaux` 本人发布的帖子，旧 Codex Radar 来源配置会自动使用新的默认 RSS。
 
-可选填写 `TIBO_X_BEARER_TOKEN`，优先使用 [X 官方账号时间线 API](https://docs.x.com/x-api/users/get-posts)，失败时仍可回退 RSS。默认两个 RSS 地址共享上游，不能保证彼此独立可用。
+可选填写 `TIBO_X_BEARER_TOKEN`，优先使用 [X 官方账号时间线 API](https://docs.x.com/x-api/users/get-posts)，失败时仍可回退 RSS。FixupX 与 FxTwitter 共用上游，不再把 FixupX 当作独立备用来源。不同 Nitter 实例仍可能共同受到 X 上游限制。
 
 中文翻译优先使用 Google Translate 公开接口，失败时通过 MyMemory 的英文转中文接口回退，长帖按服务限制分段翻译。两者均失败时报告内部标注“翻译暂不可用”，发送前的严格过滤会拦截该帖子；时间线获取失败时明确报错，不用旧摘要替代最新帖子。X API Token 仅发送到 X 官方 API，不发送到翻译服务或自定义时间线。
 
@@ -187,7 +187,9 @@ Bot 管理员也可通过命令配置同一份设置：
 
 发送进度按账号、帖子和通知对象保存；发送成功的对象不会因其他对象失败而重复接收，失败会逐步延长重试间隔，最长一小时。每轮最多处理三条帖子的推送，重启后继续处理待发送记录。移除账号或通知对象时清理对应待发送项，新增对象只接收之后发现的新帖。待发送内容加密保存，发送审计只保留图片短预览。
 
-所有账号复用 Tibo 的 RSS / X API 拉取与翻译流程。`TIBO_RADAR_SOURCE_URL` 填写单一 URL 时仅影响 Tibo；如需为所有账号使用自己的 RSS 服务，可填写包含 `{username}` 的 URL 模板，例如 `https://rss.example/x/{username}`。X Token 始终只发送给 X 官方 API。公开 RSS 可用性随上游变化，失败会独立重试并显示错误，不保证所有预设账号始终可读取。
+所有账号复用 Tibo 的 RSS / X API 拉取与翻译流程。`TIBO_RADAR_SOURCE_URL` 填写单一 URL 时仅影响 Tibo；包含 `{username}` 时应用于所有账号。也可用 `TIBO_RADAR_SOURCE_URLS` 配置最多 12 个 URL 的 JSON 数组，替换内置来源池；单一设置非空时也会加入池中。修改 `.env` 后重启生效。X Token 始终只发送给 X 官方 API。
+
+HTTP 429、503 会触发同来源跨账号退避，尊重 `Retry-After`；其他错误逐步退避。60 秒短时缓存、ETag / Last-Modified 条件请求用于减少重复抓取。WebUI 的「各账号抓取状态」显示各来源条数、限流和退避状态。按账号持久化最近 2048 个已处理帖子 ID；晚到帖子即使小于当前游标，只要高于初次基线且仍在去重窗口内，也会进入严格审核。旧版本升级以原游标建立安全基线，不会自动重放之前的历史帖子。
 
 暂停期间的新帖会在恢复后按订阅源仍保留的数据补发；长时间停机超过订阅源保留范围时不能保证补齐。进程若恰好在 OneBot 已确认发送、SQLite 尚未保存结果之间退出，恢复后仍可能重复投递该条消息。
 
@@ -283,7 +285,8 @@ WebUI 和 `/newswatch status` 显示模型是否配置、拦截计数及固定�
 | `CHECK_INTERVAL_SECONDS` / `REQUEST_TIMEOUT_SECONDS` | 默认巡检间隔和请求超时 |
 | `NIGHT_SAVER_*` | 夜间省流默认参数 |
 | `TIBO_X_BEARER_TOKEN` | 可选，Tibo 雷达使用的 X API v2 Bearer Token |
-| `TIBO_RADAR_SOURCE_URL` | 可选，账号 RSS/Atom/JSON 时间线；留空使用 FxTwitter/FixupX RSS |
+| `TIBO_RADAR_SOURCE_URL` | 可选，单一 RSS/Atom/JSON 时间线；留空使用内置多源池 |
+| `TIBO_RADAR_SOURCE_URLS` | 可选，替换来源池的 JSON URL 数组，支持 `{username}` 模板 |
 
 部分运行参数在 WebUI 保存到 SQLite 后优先于环境变量默认值。需要远程访问时，请自行配置 HTTPS、反向代理与访问控制，不要直接暴露本地演示服务。
 
