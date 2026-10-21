@@ -1007,7 +1007,7 @@ tr.selected {
 
 .command-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(310px, 100%), 1fr));
   gap: 12px;
   padding: 16px;
 }
@@ -1038,6 +1038,8 @@ tr.selected {
   justify-content: space-between;
   gap: 14px;
 }
+
+.command-toggle-head > div { min-width: 0; overflow-wrap: anywhere; }
 
 .command-alias-editor {
   display: grid;

@@ -106,6 +106,8 @@ def save_watch_settings(session: Session, settings: TiboWatchSettings):
     state.accounts = {key: value for key, value in state.accounts.items() if key in settings.accounts}
     state.pending = [item for item in state.pending if item.account in settings.accounts and item.target in settings.targets.split("&")]
     state.cursor = state.accounts.get("thsottiaux", AccountState()).cursor
+    from backend.app.news_summary import prune_summary_scope
+    prune_summary_scope(session, settings.targets.split("&"), settings.accounts)
     # Change settings and invalidate in-flight work in the same transaction.
     for key, value in ((SETTINGS_KEY, settings.model_dump_json()), (STATE_KEY, state.model_dump_json())):
         row = session.scalar(select(AppSetting).where(AppSetting.key == key))
@@ -239,6 +241,7 @@ class TiboWatcher:
                         return
                 state.pending.sort(key=lambda item: (int(item.post_id), item.account, item.target))
                 images = {}
+                reports = {}
                 processed_posts = set()
                 for item in list(state.pending):
                     if item not in state.pending:
@@ -267,6 +270,7 @@ class TiboWatcher:
                             with translation_scope(session, self.box):
                                 report = await self.account_client(item.account).report_for_post(raw)
                             await review_report(report, session, self.box)
+                            reports[post_key] = report
                             images[post_key] = await asyncio.to_thread(render_tibo_radar_image, report)
                         # Re-read after rendering so a paused/removed target stays quiet.
                         current = read_watch_settings(session)
@@ -293,6 +297,8 @@ class TiboWatcher:
                         item.last_error = "图片生成或推送失败，将自动重试。"
                         item.retry_at = utc_now() + timedelta(seconds=min(3600, 60 * 2 ** min(item.attempts - 1, 6)))
                     else:
+                        from backend.app.news_summary import record_delivered_news
+                        record_delivered_news(session, item.target, f"{item.account}:{item.post_id}", item.account, reports[post_key], self.box)
                         state.pending.remove(item)
                         state.last_sent_at = utc_now()
                     if not save():

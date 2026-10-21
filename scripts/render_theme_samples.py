@@ -22,6 +22,8 @@ from backend.app.sub2_price_image import Sub2PriceBoard, render_sub2_price_image
 from backend.app.sub2_rates import Sub2RateHistoryPoint, Sub2StoredRate
 from backend.app.sub2_sentiment import Sub2SentimentSummary, sentiment_date
 from backend.app.tibo_radar import TiboRadarClient, render_tibo_radar_image
+from backend.app.news_summary_image import render_summary_images
+from scripts.summary_sample import summary_sample
 
 
 async def render(output: Path):
@@ -84,6 +86,9 @@ async def render(output: Path):
                             username="OpenAIDevs", text="Offline demo: @superwhisper Meetings is live 🚀🎉👏🏽👩‍💻🇨🇳❤️1️⃣\nRecord, transcribe and summarize meetings automatically.",
                             translated_zh="离线演示：@superwhisper Meetings 已上线 🚀🎉👏🏽👩‍💻🇨🇳❤️1️⃣\n自动录音、转写并总结会议。", translation_label="中文翻译 · 大模型翻译（离线示例）", avatar=None, parent=None, comments=())
         (output / f"ai-news-{mode}.png").write_bytes(render_tibo_radar_image(replace(tibo, monitored_at=now, post=news_post), generated_at=now))
+        summary, sources = summary_sample(now)
+        for index, page in enumerate(render_summary_images(summary, sources, generated_at=now)):
+            (output / f"news-summary-{mode}-{index + 1}.png").write_bytes(page)
     print(output.resolve())
 
 

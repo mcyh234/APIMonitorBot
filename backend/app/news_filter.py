@@ -158,13 +158,18 @@ async def review_report(report, session, box, *, client=None):
         raise
     except Exception:
         raise ContentBlocked("uncertain") from None
+    await review_payload(payload, session, box, client=client)
+
+
+async def review_payload(payload, session, box, *, client=None, extra_instructions=""):
+    """Shared fail-closed classifier for posts and generated summary documents."""
     check_post_payload(payload)
     config = moderator_config(session)
     content = json.dumps(payload, ensure_ascii=False)
     if len(content.encode("utf-8")) > 65536:
         raise ContentBlocked("oversize")
     try:
-        result = await complete(config, box, INSTRUCTIONS, content, client=client)
+        result = await complete(config, box, INSTRUCTIONS + extra_instructions, content, client=client)
         verdict = Verdict.model_validate_json(result)
     except Exception:
         raise ModerationUnavailable() from None

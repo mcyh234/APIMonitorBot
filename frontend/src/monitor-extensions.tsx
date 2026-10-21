@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { Save, RefreshCw, ExternalLink, Eye, X, PlugZap } from "lucide-react";
 import "./monitor-extensions.css";
 import { NewsWatchPanel } from "./news-watch";
+import { NewsSummaryPanel } from "./news-summary";
 
 type RequestJSON = <T>(url: string, init?: RequestInit) => Promise<T>;
 type IntelSettings = {
@@ -78,6 +79,7 @@ export function MonitorExtensions({ request }: { request: RequestJSON }) {
     {message && <p role="status" className="extension-message">{message}</p>}
     {!intel && <p>{busy ? "加载中…" : "监控管理暂不可用"}</p>}
     <NewsWatchPanel request={request} />
+    <NewsSummaryPanel request={request} />
     {advanced && <details>
       <summary>高级巡检设置</summary>
       <form onSubmit={event => { event.preventDefault(); void action(async () => { setAdvanced(await request("/api/monitoring/advanced", save(advanced))); setMessage("巡检设置已保存"); }); }}>

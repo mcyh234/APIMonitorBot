@@ -39,6 +39,8 @@ COMMAND_DEFINITIONS: tuple[CommandDefinition, ...] = (
     CommandDefinition("/newswatch", "AI 消息监听", "管理员订阅 AI 公司、产品与人物账号；支持 all/recommend、add/remove @账号、G群号&PQQ号、on/off/status/accounts。"),
     CommandDefinition("/reviewmodel", "审核模型", "管理员从监测配置中选择审核模型：list/status/配置ID/default。", ("审核模型",)),
     CommandDefinition("/translatemodel", "翻译模型", "管理员从监测配置中选择大模型翻译：list/status/配置ID/default。", ("翻译模型",)),
+    CommandDefinition("/summarymodel", "总结模型", "管理员选择新闻总结模型：list/status/配置ID/default。", ("总结模型",)),
+    CommandDefinition("/newssummary", "新闻总结", "管理员配置每 N 条总结、时间线和记忆：on/off/status/count/now/memory/history/clear。", ("新闻总结",)),
 )
 
 

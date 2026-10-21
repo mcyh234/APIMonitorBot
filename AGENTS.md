@@ -1,5 +1,14 @@
 # Agent 开发指南
 
+## 新闻总结与事件记忆
+
+- 独立总结默认关闭，每对象成功送达 10 条自动新闻触发，阈值 1–100；失败、重复、手动 `/tibo` 和总结本身不计数。计数与新闻发送确认同事务保存，不回放开启前历史。
+- 总结由 `news_summary.py` 独立调度，每轮最多处理两个对象；素材、输出与任务正文加密，跨重启分页续传，模型 / 配置 / 记忆变化使在途结果失效，已经发送的页面不得重发。
+- `/summarymodel` 从监测配置选模型，`default` 跟随审核模型，不允许静默替换失效配置。`/newssummary` 管理开关、条数、最长等待、时间线、记忆、手动排队、历史与清空；两者均仅限管理员并受命令开关控制。
+- 总结、记忆和来源按通知对象隔离。历史只检索该对象成功总结过的已审核新闻，保留期、条数、上下文和积压容量有界；清空历史不得误删尚待总结的新帖，移除订阅须清理素材和活动批次。
+- Markdown 使用离线 token 渲染，不执行 HTML、脚本、外部图片或模型工具调用。时间线日期取真实来源；所有正文、事件和关联必须引用已提供来源，禁止凭空补充事实与链接，历史不得伪装成本期。
+- 总结及引用片段必须通过 `news_filter.review_payload`；失败保留加密任务重试，明确拦截只保留固定原因与计数等元数据。文档在 `docs/ai-news-summary.md`，离线验收脚本不得调用真实模型或 OneBot。
+
 ## X / RSS 多源与晚到帖子
 
 - 默认来源池位于 `backend/app/news_sources.py`，FxTwitter 与三个实测可用的 Nitter 实例并行合并，不能在第一个来源成功后停止。FixupX 不算独立上游；来源记录维护在 `docs/ai-news-sources.md`。
@@ -125,6 +134,8 @@ APIMonitorBot 是本机运行的 API 可用性监控服务：
 - `/tibowatch [G群号&PQQ号|on|off|status]`：管理员配置 Tibo 新帖自动推送。
 - `/newswatch`：管理员配置 AI 多账号推送；支持 `all/recommend/accounts`、`add/remove @账号` 和通知对象、开关及状态查询。
 - `/reviewmodel`、`/translatemodel`：管理员选择审核与翻译使用的监测配置，支持 `list/status/default`。
+- `/summarymodel`：管理员选择新闻总结模型，支持 `list/status/配置ID或名称/default`，默认跟随审核模型。
+- `/newssummary`：管理员配置新闻总结开关、`count/wait/days`、`memory/timeline/connections`、`now/history/clear`。
 - `/cancel`：取消多轮对话。
 
 除 `/cancel` 外，上述命令都必须支持 WebUI 命令开关；关闭后命令返回“该命令已关闭。”。
@@ -246,7 +257,7 @@ WebUI 是运维后台，不是营销页。
   - API 名称、模型名称编辑按钮。
   - 状态条图。
   - Sub2API 渠道倍率面板，默认收起，点击展开；展开后展示当前倍率、涨跌百分比、历史折线、30 日日 K 和全局投票比例。
-  - 命令开关，位于 Sub2API 渠道倍率面板下方，允许开启或关闭 `/addapi`、`/addsub2`、`/list`、`/remove`、`/check`、`/status`、`/price`、`/up`、`/down`、`/radar`、`/tibo`、`/tibowatch`、`/newswatch`、`/reviewmodel`、`/translatemodel`。
+  - 命令开关，位于 Sub2API 渠道倍率面板下方，允许开启或关闭 `/addapi`、`/addsub2`、`/list`、`/remove`、`/check`、`/status`、`/price`、`/up`、`/down`、`/radar`、`/tibo`、`/tibowatch`、`/newswatch`、`/reviewmodel`、`/translatemodel`、`/summarymodel`、`/newssummary`。
   - 管理员管理。
   - 版本升级面板，支持拖拽上传受信任的升级包、安装并自动重启，以及生成升级包。
   - 默认收起的“巡检与冷却”面板，支持修改夜间省流范围、夜间巡检间隔和普通用户命令冷却时间。

@@ -30,7 +30,7 @@ class TranslationUnavailable(ValueError):
 
 def selections(session):
     values = json.loads(get_app_setting(session, KEY) or "{}")
-    if not isinstance(values, dict) or any(key not in {"review", "translation"} or type(value) is not int or value <= 0 for key, value in values.items()):
+    if not isinstance(values, dict) or any(key not in {"review", "translation", "summary"} or type(value) is not int or value <= 0 for key, value in values.items()):
         raise NewsModelUnavailable("模型选择配置无效。")
     return values
 
@@ -49,6 +49,8 @@ def resolve_model(session, role):
         if not isinstance(config, dict) or not all(isinstance(config.get(key), str) and config[key].strip() for key in ("base_url", "model", "key_cipher")):
             raise NewsModelUnavailable("审核模型未配置。")
         return config
+    if role == "summary":
+        return resolve_model(session, "review")
     return None
 
 
@@ -65,10 +67,12 @@ def model_view(session, role):
 
 
 def choose_model(session, role, selector):
-    if role not in {"review", "translation"}:
+    if role not in {"review", "translation", "summary"}:
         raise ValueError("未知模型用途。")
     values = selections(session)
     if selector.casefold() in {"default", "off"}:
+        if role == "summary" and selector.casefold() == "off":
+            raise ValueError("关闭总结请使用 /newssummary off；default 恢复使用审核模型。")
         if role == "review" and selector.casefold() == "off":
             raise ValueError("审核不能关闭；default 恢复情报分析模型。")
         values.pop(role, None)
@@ -89,6 +93,9 @@ def choose_model(session, role, selector):
         if item.last_error and ("审核" in item.last_error or "翻译" in item.last_error):
             item.retry_at, item.attempts = None, 0
     set_app_setting(session, STATE_KEY, state.model_dump_json())
+    from backend.app.news_summary import invalidate_summaries
+    invalidate_summaries(session)
+    session.commit()
     return model_view(session, role)
 
 

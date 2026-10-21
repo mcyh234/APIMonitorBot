@@ -276,3 +276,35 @@ class SendRecord(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     response_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+
+class NewsSummaryItem(Base):
+    __tablename__ = "news_summary_items"
+    __table_args__ = (UniqueConstraint("target", "post_key", name="uq_summary_target_post"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    target: Mapped[str] = mapped_column(String(64), index=True)
+    post_key: Mapped[str] = mapped_column(String(96))
+    account: Mapped[str] = mapped_column(String(16), index=True)
+    delivered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    payload_encrypted: Mapped[str] = mapped_column(Text)
+    batch_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+
+
+class NewsSummaryBatch(Base):
+    __tablename__ = "news_summary_batches"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    target: Mapped[str] = mapped_column(String(64), index=True)
+    active_key: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    item_ids: Mapped[list[int]] = mapped_column(JSON)
+    memory_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    payload_encrypted: Mapped[str] = mapped_column(Text, default="")
+    revision: Mapped[str] = mapped_column(String(128), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    pages_sent: Mapped[int] = mapped_column(Integer, default=0)
+    page_count: Mapped[int] = mapped_column(Integer, default=0)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    blocked_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)

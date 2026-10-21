@@ -185,8 +185,10 @@ class CommandRouter:
             return await self._tibo(session, incoming)
         if command in {"/tibowatch", "/newswatch"}:
             return self._tibo_watch(session, incoming, arg, command)
-        if command in {"/reviewmodel", "/translatemodel"}:
-            return self._news_model(session, incoming, arg, "review" if command == "/reviewmodel" else "translation")
+        if command in {"/reviewmodel", "/translatemodel", "/summarymodel"}:
+            return self._news_model(session, incoming, arg, {"/reviewmodel": "review", "/translatemodel": "translation", "/summarymodel": "summary"}[command])
+        if command == "/newssummary":
+            return self._news_summary(session, incoming, arg)
         return None
 
     async def _manual_check(self, session: Session, incoming: IncomingMessage, name: str) -> str:
@@ -492,8 +494,7 @@ class CommandRouter:
         if not is_admin(session, incoming.user_id):
             return "权限不足，模型配置仅限 Bot 管理员。"
         from backend.app.news_models import choose_model, model_view
-        command = "/reviewmodel" if role == "review" else "/translatemodel"
-        label = "审核模型" if role == "review" else "翻译模型"
+        command, label = {"review": ("/reviewmodel", "审核模型"), "translation": ("/translatemodel", "翻译模型"), "summary": ("/summarymodel", "总结模型")}[role]
         option = arg.strip()
         if option.casefold() == "list":
             configs = session.scalars(select(APIConfig).order_by(APIConfig.id)).all()
@@ -507,6 +508,47 @@ class CommandRouter:
         return (f"{label}：{view['config_name']}" + (f" · {view['model']}" if view['model'] else "")
                 + ("（不可用，已暂停相关投递）" if not view['available'] else "")
                 + f"\n{command} list 查看配置；{command} 配置ID 选择。审核始终开启。")
+
+    def _news_summary(self, session: Session, incoming: IncomingMessage, arg: str) -> str:
+        if not is_admin(session, incoming.user_id):
+            return "权限不足，新闻总结仅限 Bot 管理员配置。"
+        from backend.app.news_summary import read_summary_settings, save_summary_settings, summary_view, queue_summary, clear_memory
+        from backend.app.news_summary_schema import SummarySettings
+        settings = read_summary_settings(session)
+        parts = arg.strip().split(maxsplit=1)
+        action, value = (parts[0].casefold(), parts[1] if len(parts) > 1 else "") if parts else ("status", "")
+        try:
+            if action in {"on", "off"}:
+                save_summary_settings(session, settings.model_copy(update={"enabled": action == "on"}))
+                return "新闻总结已" + ("启用。" if action == "on" else "停用。") + "仅统计各对象成功送达的新闻，审核始终开启。"
+            if action in {"count", "wait", "days"}:
+                field = {"count": "every_posts", "wait": "max_wait_minutes", "days": "memory_days"}[action]
+                data = settings.model_dump(); data[field] = int(value)
+                save_summary_settings(session, SummarySettings(**data))
+                return "新闻总结设置已保存。"
+            if action in {"memory", "timeline", "connections"} and value.casefold() in {"on", "off"}:
+                field = {"memory": "memory_enabled", "timeline": "timeline_enabled", "connections": "connections_enabled"}[action]
+                save_summary_settings(session, settings.model_copy(update={field: value.casefold() == "on"}))
+                return "新闻总结设置已保存。"
+            if action in {"now", "clear"}:
+                target = value.strip() or ("G" + incoming.group_id if incoming.message_type == "group" and incoming.group_id else "P" + incoming.user_id)
+                if action == "clear":
+                    clear_memory(session, target)
+                    return f"{target} 的历史记忆与总结正文已清空；待总结的新帖保留。"
+                batch = queue_summary(session, target, force=True)
+                return f"{batch.target} 的总结任务 #{batch.id} 已排队，共 {len(batch.item_ids)} 条；生成和审核通过后自动发送。"
+            view = summary_view(session)
+            if action == "history":
+                return "\n".join(["最近总结任务（正文请在 WebUI 查看）：", *[f"#{row['id']} {row['target']} · {row['status']} · {row['post_count']} 条" for row in view["history"][:10]]])
+            if action != "status":
+                return "用法：/newssummary on/off/status；count 10；wait 分钟（0 关闭）；days 30；memory/timeline/connections on/off；now/clear [G群号或PQQ号]；history。模型选择：/summarymodel list。"
+            return "\n".join([f"新闻总结：{'启用' if settings.enabled else '关闭'} · 每 {settings.every_posts} 条 · 最长等待 {settings.max_wait_minutes} 分钟（0 为关闭）",
+                f"总结模型：{view['model']['config_name']} · {'可用' if view['model']['available'] else '不可用，暂停总结'}",
+                f"历史记忆：{'开启' if settings.memory_enabled else '关闭'} · {settings.memory_days} 天 · 时间线：{'开启' if settings.timeline_enabled else '关闭'}",
+                *[f"{row['target']}：待总结 {row['waiting_count']} 条 · 记忆 {row['memory_count']} 条" + (f" · 任务 #{row['batch']['id']}" if row['batch'] else "") for row in view["targets"]],
+                "用 /newssummary count 10 设置条数；/newssummary now G群号 提前总结。"])
+        except (ValueError, TypeError):
+            return "设置无效或暂无可总结新闻。条数 1–100，等待 0–1440 分钟，记忆 1–365 天；对象必须已订阅 AI 消息监听。"
 
     async def _tibo(self, session: Session, incoming: IncomingMessage) -> str:
         from backend.app.news_filter import ContentBlocked, ModerationUnavailable, moderator_config, review_report

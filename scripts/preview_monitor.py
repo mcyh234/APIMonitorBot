@@ -28,8 +28,13 @@ from backend.app.onebot import OneBotClient
 from backend.app.settings import Settings
 from backend.app.time_utils import coerce_aware_utc, utc_now
 from backend.app.tibo_watch import AccountState, STATE_KEY, read_watch_state
+from backend.app.news_summary_schema import SummarySettings
+from backend.app.news_summary import SETTINGS_KEY as SUMMARY_SETTINGS_KEY
+from backend.app.models import NewsSummaryBatch, NewsSummaryItem
+from scripts.summary_sample import summary_sample
 from backend.app.webui_auth import set_webui_secret, webui_secret_configured
-from sqlalchemy import select
+from sqlalchemy import delete, select
+import json
 import uvicorn
 
 
@@ -94,6 +99,29 @@ with db.SessionLocal() as session:
         {"host": "nitter.netbub.com", "state": "error", "post_count": 0, "retry_seconds": 120},
     ])
     set_app_setting(session, STATE_KEY, watch_state.model_dump_json())
+
+    session.execute(delete(NewsSummaryItem)); session.execute(delete(NewsSummaryBatch))
+    previous = NewsSummaryBatch(target="G123456", status="sent", item_ids=[], memory_ids=[], payload_encrypted="", created_at=now - timedelta(days=2), sent_at=now - timedelta(days=2), pages_sent=1, page_count=1)
+    session.add(previous); session.flush()
+    document, sources = summary_sample(now)
+    old = NewsSummaryItem(target="G123456", account="openaidevs", post_key="preview-memory", batch_id=previous.id,
+        payload_encrypted=box.encrypt(json.dumps(sources["M42"], ensure_ascii=False)), delivered_at=now - timedelta(days=2))
+    session.add(old); session.flush(); previous.item_ids = [old.id]
+    document, sources = summary_sample(now, history_ref=f"M{old.id}")
+    batch = NewsSummaryBatch(target="G123456", status="sent", item_ids=[], memory_ids=[old.id],
+        payload_encrypted=box.encrypt(json.dumps({"document": document.model_dump(), "sources": sources}, ensure_ascii=False)), created_at=now, sent_at=now, pages_sent=1, page_count=1)
+    session.add(batch); session.flush()
+    ids = []
+    for key in ["N1", "N2"]:
+        item = NewsSummaryItem(target="G123456", account="openaidevs", post_key="preview-summary-" + key, batch_id=batch.id,
+            payload_encrypted=box.encrypt(json.dumps(sources[key], ensure_ascii=False)), delivered_at=now)
+        session.add(item); session.flush(); ids.append(item.id)
+    batch.item_ids = ids
+    for index in range(3):
+        session.add(NewsSummaryItem(target="G123456", account="openaidevs", post_key=f"preview-waiting-{index}",
+            payload_encrypted=box.encrypt(json.dumps(sources["N1"], ensure_ascii=False)), delivered_at=now))
+    session.commit()
+    set_app_setting(session, SUMMARY_SETTINGS_KEY, SummarySettings().model_dump_json())
 
 app = create_app(settings)
 
