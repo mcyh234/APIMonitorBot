@@ -144,7 +144,7 @@ Linux/macOS 对应使用 `.venv/bin/python` 和 `cp .env.example .env`；其余�
 | `/radar` | 生成 Codex Radar 公开趋势报告 |
 | `/tibo` | 自动读取 X @thsottiaux 最新公开帖子，发送原文与中文翻译 |
 | `/tibowatch [G群号&PQQ号\|on\|off\|status]` | 管理员配置 Tibo 新帖自动推送，支持群聊和私聊 |
-| `/newswatch` | 管理员配置多账号 AI 消息推送；支持通知对象、`on/off/status/accounts`、`recommend/all`、`add/remove @账号` |
+| `/newswatch` | 管理员配置多账号 AI 消息推送；支持通知对象、`on/off/status/accounts`、`recommend/all`、`add/remove @账号`、`logs [@账号]` 诊断与 `retry` 重试 |
 | `/reviewmodel [list\|status\|配置ID或名称\|default]` | 管理员从已有监测配置选择审核模型，`default` 恢复情报分析模型 |
 | `/translatemodel [list\|status\|配置ID或名称\|default]` | 管理员独立选择大模型翻译；`default` 恢复公开机器翻译 |
 | `/summarymodel [list\|status\|配置ID或名称\|default]` | 管理员选择新闻总结模型；`default` 跟随审核模型 |
@@ -177,12 +177,16 @@ Bot 管理员也可通过命令配置同一份设置：
 /newswatch all
 /newswatch G123456789&P1122334455
 /newswatch status
+/newswatch logs @thsottiaux
+/newswatch retry
 /newswatch accounts
 /newswatch add @OpenAI
 /newswatch remove @elonmusk
 /newswatch off
 /newswatch on
 ```
+
+遇到停推或漏报，可在 WebUI「AI 消息监听 → 新闻监听日志与排障」查看、筛选和导出最近 300 条阶段日志，区分抓取失败、首次基线、模型不可用、审核拦截、翻译超时与发送失败。`/newswatch logs` 返回最近日志，`retry` 提前重试加密待发送项，保留审核、基线和去重。升级重启后开始记录，详见 [监听诊断与排障](docs/ai-news-diagnostics.md)。
 
 `recommend` 加入推荐组合，`all` 加入全部预设，均保留已选自定义账号；WebUI 可清空或按类取消。`/tibowatch` 保留兼容，操作同一份监听设置；两个命令均有独立命令开关，且只允许 Bot 管理员配置。
 

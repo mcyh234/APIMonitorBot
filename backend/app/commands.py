@@ -448,6 +448,18 @@ class CommandRouter:
         from backend.app.news_accounts import NEWS_ACCOUNTS, normalize_username, recommended_accounts
         settings = read_watch_settings(session)
         option = arg.strip()
+        if option.casefold() == "retry":
+            from backend.app.tibo_watch import retry_pending
+            count = retry_pending(session)
+            return f"已安排 {count} 个待发送项在下一轮重试；保留严格审核与去重，不补发基线前历史。"
+        if option and option.split(maxsplit=1)[0].casefold() in {"logs", "log", "日志"}:
+            from backend.app.news_diagnostics import format_diagnostics
+            parts = option.split(maxsplit=1)
+            try:
+                account = normalize_username(parts[1]) if len(parts) == 2 else None
+            except ValueError:
+                return "用法：/newswatch logs [@账号]。"
+            return format_diagnostics(session, account)
         if option.casefold() in {"", "status"}:
             view = watch_view(session)
             state = view["status"]
@@ -458,7 +470,7 @@ class CommandRouter:
                     f"严格内容过滤：开启；已拦截 {state['blocked_count']} 条\n"
                     f"审核模型：{'已配置' if view['moderation']['model_configured'] else '未配置，已暂停投递'}\n"
                     f"{state['last_error'] or ''}\n"
-                    "用法：/newswatch G群号&PQQ号；on/off/status；accounts 查看订阅；recommend 推荐组合；all 全部；add/remove @账号。")
+                    "用法：/newswatch G群号&PQQ号；on/off/status；logs [@账号] 查看诊断；retry 重试；accounts 查看订阅；recommend 推荐组合；all 全部；add/remove @账号。")
         if option.casefold() == "accounts":
             return "已订阅账号：\n" + ("、".join(f"@{name}" for name in settings.accounts) or "暂无")
         try:

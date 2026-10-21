@@ -29,6 +29,137 @@ from backend.app.time_utils import utc_now
 from test_monitor import FakeNotifier, SequenceProbe, add_config, add_sub2_config
 
 
+def test_news_diagnostic_journal_is_bounded_and_never_persists_untrusted_text(database):
+    from backend.app.news_diagnostics import KEY, LIMIT, read_journal, record
+    session, _ = database
+    for index in range(LIMIT + 5):
+        record(session, "failed", account="thsottiaux", post_id=str(index), target="G123", stage="sending",
+               reason="secret model response", body="private post", url="https://token@private.test",
+               elapsed_ms=123, exception="API key secret")
+    stored = get_app_setting(session, KEY)
+    assert "private" not in stored and "secret" not in stored and "API key" not in stored
+    events = read_journal(session)["events"]
+    assert len(events) == LIMIT and events[0]["post_id"] == "5"
+    assert events[-1]["stage_label"] == "等待通知发送确认"
+    record(session, "failed", account="https://secret@host", target="secret", post_id="private", stage="private")
+    event = read_journal(session)["events"][-1]
+    assert not {"account", "target", "post_id", "stage"}.intersection(event)
+    with pytest.raises(ValueError): record(session, "private arbitrary text")
+    record(session, "blocked", account="thsottiaux", post_id="123", target="G123", reason="uncertain")
+    event = read_journal(session)["events"][-1]
+    assert event["count"] == 1 and not {"account", "post_id", "target", "stage"}.intersection(event)
+    for _ in range(5):
+        record(session, "started"); record(session, "finished")
+    assert [item["code"] for item in read_journal(session)["events"][-3:]] == ["blocked", "started", "finished"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "model", "review", "render", "send", "blocked", "success"])
+async def test_news_diagnostic_stages_retain_retry_work_and_only_log_ack(database, monkeypatch, approved_delivery_unit, failure):
+    import backend.app.tibo_watch as watch
+    from backend.app.news_diagnostics import KEY, diagnostics_view
+    from backend.app.news_filter import ModerationUnavailable, ContentBlocked
+    session, factory = database
+    box = SecretBox("diagnostic-offline-test")
+    watch.save_watch_settings(session, watch.TiboWatchSettings(enabled=True, targets="G123"))
+    state = watch.read_watch_state(session)
+    state.accounts["thsottiaux"] = watch.AccountState(cursor="100", discovery_floor="100", last_checked_at=utc_now())
+    raw = tibo_timeline_post("200", "GPT API product private fixture")
+    state.pending = [watch.PendingDelivery(account="thsottiaux", post_id="200", target="G123", payload_encrypted=box.encrypt(json.dumps(raw)))]
+    set_app_setting(session, watch.STATE_KEY, state.model_dump_json())
+    def fail(): raise RuntimeError("SECRET raw upstream reply and token")
+    if failure == "model":
+        def unavailable(session): raise ModerationUnavailable()
+        monkeypatch.setattr(watch, "moderator_config", unavailable)
+    async def review(*args):
+        if failure == "review": fail()
+        if failure == "blocked": raise ContentBlocked("uncertain")
+    monkeypatch.setattr(watch, "review_report", review)
+    def render(*args):
+        if failure == "render": fail()
+        return b"offline-image"
+    monkeypatch.setattr(watch, "render_tibo_radar_image", render)
+    monkeypatch.setattr(watch, "POST_PREPARATION_TIMEOUT", .01)
+    class Client:
+        async def report_for_post(self, raw):
+            if failure == "timeout": await asyncio.sleep(1)
+            return raw
+    class Delivery:
+        async def send_image(self, *args):
+            if failure == "send": fail()
+            return SimpleNamespace(ok=True)
+    await watch.TiboWatcher(Client(), Delivery(), box).run_once(factory)
+    view, state = diagnostics_view(session), watch.read_watch_state(session)
+    codes = [item["code"] for item in view["events"]]
+    assert view["running"] is False and codes[0] == "finished"
+    assert ("sent" in codes) is (failure == "success")
+    assert "SECRET" not in get_app_setting(session, KEY) and "private fixture" not in get_app_setting(session, KEY)
+    assert bool(state.pending) is (failure not in {"success", "blocked"})
+    if state.pending:
+        assert state.pending[0].attempts == 1 and state.pending[0].retry_at
+        assert state.pending[0].last_stage in {"checking_model", "preparing", "reviewing", "rendering", "sending"}
+        assert state.pending[0].failure_code in {"timeout", "model_unavailable", "failed"}
+        assert box.decrypt(state.pending[0].payload_encrypted) == json.dumps(raw)
+    if failure == "timeout":
+        assert next(row for row in view["events"] if row["code"] == "timeout")["stage"] == "preparing"
+    if failure == "blocked": assert state.blocked_count == 1
+
+
+@pytest.mark.asyncio
+async def test_news_logs_admin_command_switch_and_retry_preserve_baseline(database):
+    from backend.app.commands import CommandRouter, IncomingMessage
+    from backend.app.command_settings import set_command_enabled
+    from backend.app.tibo_watch import TiboWatchSettings, AccountState, PendingDelivery, STATE_KEY, read_watch_state, save_watch_settings
+    from tests.test_commands import FakeOneBot, FakeProbe
+    session, _ = database
+    box = SecretBox("diagnostic-admin-offline")
+    session.add(BotAdmin(qq="999")); session.commit()
+    save_watch_settings(session, TiboWatchSettings(enabled=True, targets="G123"))
+    state = read_watch_state(session)
+    state.accounts["thsottiaux"] = AccountState(cursor="300", discovery_floor="100", seen_ids=["200", "300"])
+    state.pending = [PendingDelivery(post_id="200", payload_encrypted=box.encrypt("secret"), target="G123", retry_at=utc_now() + timedelta(hours=1), attempts=4)]
+    set_app_setting(session, STATE_KEY, state.model_dump_json())
+    router = CommandRouter(Settings(), FakeOneBot(), box, probe=FakeProbe())
+    async def command(value, qq="999"):
+        return await router.handle_message(session, IncomingMessage(qq, value, "private"))
+    assert "权限不足" in await command("/newswatch logs", "111")
+    assert "权限不足" in await command("/newswatch retry", "111")
+    response = await command("/newswatch logs @thsottiaux")
+    assert "退避" in response and "300" in response and "secret" not in response
+    assert "已安排 1" in await command("/newswatch retry")
+    updated = read_watch_state(session)
+    assert updated.generation != state.generation and updated.accounts == state.accounts
+    assert updated.pending[0].retry_at is None and updated.pending[0].attempts == 4
+    assert updated.pending[0].payload_encrypted == state.pending[0].payload_encrypted
+    set_command_enabled(session, "/newswatch", False)
+    for option in ("logs", "retry"):
+        assert await command("/newswatch " + option) == "该命令已关闭。"
+
+
+@pytest.mark.asyncio
+async def test_news_diagnostics_can_observe_active_phase_and_fetch_failure(database, monkeypatch):
+    from backend.app.tibo_watch import TiboWatcher, TiboWatchSettings, save_watch_settings, read_watch_state
+    from backend.app.news_diagnostics import diagnostics_view
+    session, factory = database
+    save_watch_settings(session, TiboWatchSettings(enabled=True, targets="G123"))
+    entered, release = asyncio.Event(), asyncio.Event()
+    class Client:
+        async def fetch_posts(self):
+            entered.set(); await release.wait()
+            raise RuntimeError("private RSS response with token")
+    watcher = TiboWatcher(Client(), None, SecretBox("diagnostic-stage-test"))
+    task = asyncio.create_task(watcher.run_once(factory))
+    await entered.wait()
+    view = diagnostics_view(session)
+    assert view["running"] and view["stage"]["code"] == "fetching"
+    await watcher.run_once(factory)  # No duplicate fetch when already running.
+    release.set(); await task
+    view = diagnostics_view(session)
+    assert not view["running"] and any(row["code"] == "fetch_failed" for row in view["events"])
+    assert read_watch_state(session).accounts["thsottiaux"].last_completed_at
+    assert "private RSS" not in json.dumps(view, default=str)
+
+
 @pytest.fixture
 def database():
     engine = create_engine("sqlite:///:memory:")

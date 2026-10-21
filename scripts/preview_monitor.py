@@ -27,7 +27,7 @@ from backend.app.notifier import Notifier
 from backend.app.onebot import OneBotClient
 from backend.app.settings import Settings
 from backend.app.time_utils import coerce_aware_utc, utc_now
-from backend.app.tibo_watch import AccountState, STATE_KEY, read_watch_state
+from backend.app.tibo_watch import AccountState, PendingDelivery, STATE_KEY, read_watch_state
 from backend.app.news_summary_schema import SummarySettings
 from backend.app.news_summary import SETTINGS_KEY as SUMMARY_SETTINGS_KEY
 from backend.app.models import NewsSummaryBatch, NewsSummaryItem
@@ -98,7 +98,17 @@ with db.SessionLocal() as session:
         {"host": "nitter.jaydenha.uk", "state": "cooldown", "post_count": 0, "retry_seconds": 60},
         {"host": "nitter.netbub.com", "state": "error", "post_count": 0, "retry_seconds": 120},
     ])
+    watch_state.pending = [PendingDelivery(post_id="200", account="thsottiaux", target="G123456",
+        payload_encrypted=box.encrypt("offline diagnostic fixture; never sent"), attempts=2,
+        last_stage="preparing", failure_code="timeout", retry_at=now + timedelta(minutes=60))]
     set_app_setting(session, STATE_KEY, watch_state.model_dump_json())
+    from backend.app.news_diagnostics import KEY as DIAGNOSTICS_KEY, record
+    set_app_setting(session, DIAGNOSTICS_KEY, "{}")
+    record(session, "started")
+    record(session, "fetched", account="thsottiaux", count=61, elapsed_ms=420)
+    record(session, "preparing", account="thsottiaux", post_id="200", target="G123456")
+    record(session, "timeout", account="thsottiaux", post_id="200", target="G123456", stage="preparing", elapsed_ms=120000)
+    record(session, "finished", elapsed_ms=120420)
 
     session.execute(delete(NewsSummaryItem)); session.execute(delete(NewsSummaryBatch))
     previous = NewsSummaryBatch(target="G123456", status="sent", item_ids=[], memory_ids=[], payload_encrypted="", created_at=now - timedelta(days=2), sent_at=now - timedelta(days=2), pages_sent=1, page_count=1)

@@ -1,11 +1,12 @@
 import React, { useEffect, useState } from "react";
 import { Save, RefreshCw, ExternalLink, Plus, X } from "lucide-react";
+import { NewsDiagnostics } from "./news-diagnostics";
 
 type RequestJSON = <T>(url: string, init?: RequestInit) => Promise<T>;
 type Config = { enabled: boolean; targets: string; interval_seconds: number; accounts: string[] };
 type Account = { username: string; name: string; company: string; category: string; reason: string; recommended: boolean; url: string };
 type FeedStatus = { host: string; state: string; post_count: number; retry_seconds?: number };
-type AccountStatus = { username: string; cursor: string | null; last_checked_at: string | null; last_error: string | null; pending_count: number; sources?: FeedStatus[] };
+type AccountStatus = { username: string; cursor: string | null; last_checked_at: string | null; last_completed_at?: string | null; last_error: string | null; pending_count: number; sources?: FeedStatus[] };
 type Status = { initialized: boolean; last_checked_at: string | null; last_sent_at: string | null; pending_count: number; last_error: string | null; accounts: AccountStatus[]; blocked_count: number; last_blocked_reason: string | null; last_blocked_at: string | null };
 type ModelStatus = { configured: boolean; available: boolean; config_name: string; model: string | null };
 type Moderation = { enabled: boolean; mode: string; model_configured: boolean; review_model: ModelStatus; translation_model: ModelStatus };
@@ -104,9 +105,10 @@ export function NewsWatchPanel({ request }: { request: RequestJSON }) {
       <p>内容拦截：{status.blocked_count} 条{status.last_blocked_reason ? ` · 最近原因：${status.last_blocked_reason} · ${time(status.last_blocked_at)}` : ""}</p>
       {status.last_error && <p role="alert">{status.last_error}</p>}
       <details><summary>各账号抓取状态</summary><div className="news-account-grid">{status.accounts.map(item => <div className="news-account-state" key={item.username}>
-        <strong>@{item.username}</strong><span>{item.last_error ? "获取失败，等待重试" : item.cursor ? "已建立基线" : "等待首次检查"} · 待推送 {item.pending_count}</span><span>最近检查：{time(item.last_checked_at)}</span>
+        <strong>@{item.username}</strong><span>{item.last_error ? "获取失败，等待重试" : item.cursor ? "已建立基线" : "等待首次检查"} · 待推送 {item.pending_count}</span><span>检查启动：{time(item.last_checked_at)} · 抓取完成：{time(item.last_completed_at || null)}</span>
         {item.sources?.map((source, index) => <span key={`${source.host}-${index}`}>{source.host}：{source.state === "ok" || source.state === "cached" ? `${source.state === "cached" ? "短时缓存" : "可用"} · ${source.post_count} 条` : `${source.state === "rate_limited" ? "限流" : source.state === "cooldown" ? "退避中" : "获取失败"}${source.retry_seconds ? ` · 检查时剩余 ${source.retry_seconds} 秒` : ""}`}</span>)}
       </div>)}</div></details>
     </div>}
+    <NewsDiagnostics request={request} />
   </details>;
 }

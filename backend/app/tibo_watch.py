@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta
 import json
+from time import monotonic
+from typing import Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends
@@ -27,6 +29,7 @@ from backend.app.news_models import translation_scope, TranslationUnavailable
 router = APIRouter(prefix="/api/tibo-watch")
 SETTINGS_KEY = "tibo.watch.settings"
 STATE_KEY = "tibo.watch.state"
+POST_PREPARATION_TIMEOUT = 120
 
 
 class TiboWatchSettings(BaseModel):
@@ -62,6 +65,8 @@ class PendingDelivery(BaseModel):
     attempts: int = 0
     retry_at: datetime | None = None
     last_error: str | None = None
+    last_stage: Literal["checking_model", "preparing", "reviewing", "rendering", "sending"] | None = None
+    failure_code: Literal["model_unavailable", "failed", "timeout"] | None = None
 
 
 class AccountState(BaseModel):
@@ -70,6 +75,7 @@ class AccountState(BaseModel):
     seen_ids: list[str] = Field(default_factory=list)
     sources: list[dict] = Field(default_factory=list)
     last_checked_at: datetime | None = None
+    last_completed_at: datetime | None = None
     last_error: str | None = None
 
 
@@ -147,6 +153,30 @@ def put_watch(data: TiboWatchSettings, session: Session = Depends(get_session)):
     return save_watch_settings(session, data)
 
 
+@router.get("/logs")
+def get_watch_logs(session: Session = Depends(get_session)):
+    from backend.app.news_diagnostics import diagnostics_view
+    return diagnostics_view(session)
+
+
+def retry_pending(session: Session):
+    """Invalidate in-flight work; preserve baselines, deduplication and encrypted payloads."""
+    state = read_watch_state(session)
+    state.generation = uuid4().hex
+    for item in state.pending:
+        item.retry_at = None
+    set_app_setting(session, STATE_KEY, state.model_dump_json())
+    from backend.app.news_diagnostics import record
+    record(session, "retry_requested", count=len(state.pending))
+    return len(state.pending)
+
+
+@router.post("/retry")
+def post_watch_retry(session: Session = Depends(get_session)):
+    retry_pending(session)
+    return get_watch_logs(session)
+
+
 class TiboWatcher:
     def __init__(self, client: TiboRadarClient, notifier: Notifier, box: SecretBox):
         self.client, self.notifier, self.box = client, notifier, box
@@ -159,12 +189,40 @@ class TiboWatcher:
         return self._clients[username]
 
     async def run_once(self, session_factory):
+        from backend.app.news_diagnostics import record, read_journal
+        def event(code, **metadata):
+            with session_factory() as diagnostic_session:
+                record(diagnostic_session, code, **metadata)
+        if self._lock.locked():
+            # Keep the actual active stage visible; avoid flooding the journal.
+            return
+        with session_factory() as diagnostic_session:
+            if not read_watch_settings(diagnostic_session).enabled:
+                journal = read_journal(diagnostic_session)["events"]
+                if not journal or journal[-1]["code"] != "disabled":
+                    record(diagnostic_session, "disabled")
+                return
+        started = monotonic()
+        event("started")
+        try:
+            await asyncio.wait_for(self._run_once(session_factory, event), timeout=600)
+        except asyncio.CancelledError:
+            event("crashed", elapsed_ms=int((monotonic() - started) * 1000))
+            raise
+        except Exception:
+            event("crashed", elapsed_ms=int((monotonic() - started) * 1000))
+            raise
+        else:
+            event("finished", elapsed_ms=int((monotonic() - started) * 1000))
+
+    async def _run_once(self, session_factory, event):
         if self._lock.locked():
             return
         async with self._lock:
             with session_factory() as session:
                 settings = read_watch_settings(session)
                 if not settings.enabled:
+                    event("disabled")
                     return
                 self._clients = {key: value for key, value in self._clients.items() if key in settings.accounts or key == "thsottiaux"}
                 state, now = read_watch_state(session), utc_now()
@@ -174,6 +232,7 @@ class TiboWatcher:
                     state.last_blocked_reason = exc.code
                 def save():
                     if read_watch_state(session).generation != state.generation:
+                        event("invalidated")
                         return False
                     set_app_setting(session, STATE_KEY, state.model_dump_json())
                     return True
@@ -193,12 +252,21 @@ class TiboWatcher:
                     semaphore = asyncio.Semaphore(4)
                     async def fetch(username):
                         async with semaphore:
-                            return await asyncio.wait_for(self.account_client(username).fetch_posts(), timeout=20)
+                            event("fetching", account=username)
+                            fetch_started = monotonic()
+                            try:
+                                posts = await asyncio.wait_for(self.account_client(username).fetch_posts(), timeout=20)
+                            except Exception:
+                                event("fetch_failed", account=username, elapsed_ms=int((monotonic() - fetch_started) * 1000))
+                                raise
+                            event("fetched", account=username, count=len(posts), elapsed_ms=int((monotonic() - fetch_started) * 1000))
+                            return posts
                     results = await asyncio.gather(*(fetch(username) for username in due), return_exceptions=True)
                     if read_watch_state(session).generation != state.generation:
                         return
                     for username, result in zip(due, results):
                         account = state.accounts[username]
+                        account.last_completed_at = utc_now()
                         account.sources = getattr(self.account_client(username), "source_status", [])
                         try:
                             if isinstance(result, BaseException):
@@ -211,20 +279,26 @@ class TiboWatcher:
                             # moving high-water mark alone loses delayed RSS items.
                             if account.discovery_floor is None:
                                 account.discovery_floor = account.cursor or str(newest_id)
+                            if account.cursor is None:
+                                event("baseline", account=username, post_id=str(newest_id), count=len(posts))
                             seen = set(account.seen_ids)
                             if account.cursor is not None:
                                 new_posts = sorted((post for post in posts if int(post["id"]) > int(account.discovery_floor)
                                                     and post["id"] not in seen), key=lambda post: int(post["id"]))
+                                queued = 0
                                 for post in new_posts:
                                     seen.add(post["id"])
                                     try:
                                         check_post_payload(post)
                                     except ContentBlocked as exc:
                                         blocked(exc)
+                                        event("blocked", account=username, post_id=str(post["id"]), reason=exc.code)
                                         continue
                                     encrypted = self.box.encrypt(json.dumps(post, ensure_ascii=False))
                                     state.pending.extend(PendingDelivery(account=username, post_id=str(post["id"]), payload_encrypted=encrypted, target=target)
                                                          for target in settings.targets.split("&"))
+                                    queued += 1
+                                event("discovered", account=username, count=queued)
                             # Bounded deduplication survives restarts and definitive
                             # moderation blocks. Eviction advances the safe floor.
                             retained = sorted(seen | {str(post["id"]) for post in posts}, key=int)
@@ -235,6 +309,8 @@ class TiboWatcher:
                             account.last_error = None
                         except Exception:
                             account.last_error = f"@{username} 时间线获取失败，将按检查间隔重试。"
+                            if not isinstance(result, BaseException):
+                                event("fetch_failed", account=username)
                     tibo = state.accounts.get("thsottiaux", AccountState())
                     state.cursor, state.last_error = tibo.cursor, tibo.last_error
                     if not save():  # Cursor and encrypted queue are committed together.
@@ -262,15 +338,27 @@ class TiboWatcher:
                     if any(other.account == item.account and other.target == item.target and int(other.post_id) < int(item.post_id) for other in state.pending):
                         continue
                     processed_posts.add(post_key)
+                    stage = "preparing"
+                    delivered = False
+                    step_started = monotonic()
+                    def step(code):
+                        nonlocal stage, step_started
+                        stage, step_started = code, monotonic()
+                        event(code, account=item.account, post_id=item.post_id, target=item.target)
                     try:
                         if post_key not in images:
+                            step("preparing")
                             raw = json.loads(self.box.decrypt(item.payload_encrypted))
                             check_post_payload(raw)  # Recheck persisted work from older versions.
+                            step("checking_model")
                             moderator_config(session)
+                            step("preparing")
                             with translation_scope(session, self.box):
-                                report = await self.account_client(item.account).report_for_post(raw)
-                            await review_report(report, session, self.box)
+                                report = await asyncio.wait_for(self.account_client(item.account).report_for_post(raw), timeout=POST_PREPARATION_TIMEOUT)
+                            step("reviewing")
+                            await asyncio.wait_for(review_report(report, session, self.box), timeout=60)
                             reports[post_key] = report
+                            step("rendering")
                             images[post_key] = await asyncio.to_thread(render_tibo_radar_image, report)
                         # Re-read after rendering so a paused/removed target stays quiet.
                         current = read_watch_settings(session)
@@ -282,19 +370,30 @@ class TiboWatcher:
                             continue
                         kind, target_id = parse_targets(item.target)[0]
                         filename = "tibo-radar.png" if item.account == "thsottiaux" else f"ai-news-{item.account}.png"
-                        result = await self.notifier.send_image(NotifyTarget(kind, target_id), images[post_key], filename)
+                        step("sending")
+                        result = await asyncio.wait_for(self.notifier.send_image(NotifyTarget(kind, target_id), images[post_key], filename), timeout=30)
                         if not getattr(result, "ok", False):
                             raise RuntimeError("Delivery not acknowledged")
+                        delivered = True
                     except ContentBlocked as exc:
                         blocked(exc)
+                        event("blocked", account=item.account, post_id=item.post_id, reason=exc.code, stage=stage)
                         state.pending = [other for other in state.pending if (other.account, other.post_id) != post_key]
                     except (ModerationUnavailable, TranslationUnavailable) as exc:
+                        event("model_unavailable", account=item.account, post_id=item.post_id, target=item.target, stage=stage)
+                        item.last_stage, item.failure_code = stage, "model_unavailable"
                         item.attempts += 1
                         item.last_error = str(exc)
                         item.retry_at = utc_now() + timedelta(seconds=min(3600, 60 * 2 ** min(item.attempts - 1, 6)))
-                    except Exception:
+                    except Exception as exc:
+                        item.last_stage = stage
+                        item.failure_code = "timeout" if isinstance(exc, TimeoutError) else "failed"
+                        event("timeout" if isinstance(exc, TimeoutError) else "failed", account=item.account,
+                              post_id=item.post_id, target=item.target, stage=stage,
+                              elapsed_ms=int((monotonic() - step_started) * 1000))
                         item.attempts += 1
-                        item.last_error = "图片生成或推送失败，将自动重试。"
+                        from backend.app.news_diagnostics import LABELS
+                        item.last_error = f"{LABELS[stage]}失败或超时，将自动重试。"
                         item.retry_at = utc_now() + timedelta(seconds=min(3600, 60 * 2 ** min(item.attempts - 1, 6)))
                     else:
                         from backend.app.news_summary import record_delivered_news
@@ -303,3 +402,5 @@ class TiboWatcher:
                         state.last_sent_at = utc_now()
                     if not save():
                         return
+                    if delivered:
+                        event("sent", account=item.account, post_id=item.post_id, target=item.target)
