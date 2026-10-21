@@ -11,6 +11,10 @@
 
 各账号替换 URL 中的用户名，同时查询全部来源并合并帖子。FxTwitter 与 FixupX 是同源别名，FixupX 不计作独立备用。多实例只能减少单站故障，不能保证覆盖 X 的全部消息或全部账号。
 
+2026-10-21 更新：同一来源域名的请求启动间隔至少 1 秒，最多两个在途请求，降低多账号集中请求触发限流的风险，同时避免慢响应长时间挡住后续账号。单次网络请求最多 5 秒，含排队总等待最多 18 秒，账号轮次仍受 20 秒上限约束。普通网络、解析及 HTTP 错误按 60、120、240、300 秒退避，不再因重复失败自行延长到 1 小时。429 / 503 使用独立的域名失败计数并跨账号退避，不继承某个失败账号的历史次数；上游明确返回的 `Retry-After`（秒数或 HTTP 日期）仍完整遵守，可能超过 5 分钟。其他 HTTP 错误只影响当前账号的该来源。
+
+状态新增固定原因与范围：`scope=account/host` 区分账号来源和整个域名，`reason=retry_after/http_error/timeout/network_or_parse` 区分上游指定等待、HTTP 错误、超时、网络或解析失败；来源池满时使用 `queue_full`，不会无限扩展缓存。冷却期间保留这些原因与原 HTTP 状态；不记录异常正文或完整 URL。等待不会在每次检查时重新计时。检查间隔和账号轮转仍可能使实际重试晚于冷却截止。
+
 其他候选实测：nitter.net 返回 410，xcancel.com 返回 451；nitter.space、nitter.xitter.cc、nitter.tiekoetter.com、nuku.trabun.org 返回 403；nitter.privacydev.net 和 RSSHub 官方 Twitter 路由返回 404；rsshub.rssforever.com 返回 503；其他部分实例连接失败。未通过实测的来源不加入默认池，也不绕过访问限制。
 
 可在 `.env` 配置自己的多源池，例如：

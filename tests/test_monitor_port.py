@@ -54,6 +54,117 @@ def test_news_diagnostic_journal_is_bounded_and_never_persists_untrusted_text(da
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["network", "parse", "404", "503", "timeout"])
+async def test_feed_ordinary_failures_never_grow_to_hour_and_success_resets(monkeypatch, failure):
+    import backend.app.news_sources as sources
+    clock, calls = [100.0], []
+    monkeypatch.setattr(sources.time, "monotonic", lambda: clock[0])
+    pool = sources.FeedPool()
+    healthy = False
+    async def get(url, **kwargs):
+        calls.append(url)
+        if healthy:
+            return httpx.Response(200, json={"tweets": [tibo_timeline_post("300")]})
+        if failure == "network": raise httpx.ConnectError("secret credential and upstream body")
+        if failure == "timeout": raise TimeoutError("private timeout detail")
+        if failure == "parse": return httpx.Response(200, text="private invalid feed")
+        return httpx.Response(int(failure), text="private upstream body")
+    for expected in [60, 120, 240, 300, 300, 300, 300]:
+        posts, status = await pool.fetch("https://feed.example/rss", "thsottiaux", get, 20)
+        assert not posts and status["retry_seconds"] == expected
+        assert status["scope"] == ("host" if failure == "503" else "account")
+        deadline = clock[0] + expected
+        clock[0] += 1
+        _, cooldown = await pool.fetch("https://feed.example/rss", "thsottiaux", get, 20)
+        assert cooldown["state"] == "cooldown" and cooldown["retry_seconds"] == expected - 1
+        assert cooldown["reason"] == status["reason"]  # Observing does not extend the deadline.
+        assert "private" not in json.dumps(cooldown) and "secret" not in json.dumps(cooldown)
+        clock[0] = deadline + 1
+    assert len(calls) == 7
+    healthy = True
+    posts, status = await pool.fetch("https://feed.example/rss", "thsottiaux", get, 20)
+    assert posts and status["state"] == "ok"
+    assert pool.states["https://feed.example/rss"].failures == 0
+    assert pool.hosts["feed.example"].failures == 0
+
+
+@pytest.mark.asyncio
+async def test_feed_bad_account_cannot_inflate_shared_host_backoff(monkeypatch):
+    import backend.app.news_sources as sources
+    clock = [100.0]
+    monkeypatch.setattr(sources.time, "monotonic", lambda: clock[0])
+    pool = sources.FeedPool()
+    async def get(url, **kwargs):
+        return httpx.Response(404 if url.endswith("bad") else 503)
+    for _ in range(8):
+        await pool.fetch("https://feed.example/bad", "thsottiaux", get, 20)
+        clock[0] += 301
+    assert pool.states["https://feed.example/bad"].failures == 8
+    _, status = await pool.fetch("https://feed.example/other", "openai", get, 20)
+    assert status["retry_seconds"] == 60 and status["scope"] == "host"
+    _, cooldown = await pool.fetch("https://feed.example/bad", "thsottiaux", get, 20)
+    assert cooldown["scope"] == "host" and cooldown["http_status"] == 503
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [429, 503])
+async def test_feed_host_pacing_stops_queued_requests_after_retry_after(monkeypatch, code):
+    import backend.app.news_sources as sources
+    pool, calls = sources.FeedPool(), []
+    async def get(url, **kwargs):
+        calls.append(url)
+        await asyncio.sleep(.01)
+        return httpx.Response(code, headers={"Retry-After": "2400"}, text="private server response")
+    results = await asyncio.gather(*(pool.fetch(f"https://feed.example/{username}", username, get, 20)
+                                     for username in ["thsottiaux", "openai", "xai", "copilot"]))
+    assert len(calls) == 1
+    assert results[0][1]["retry_seconds"] == 2400
+    for _, status in results[1:]:
+        assert status["state"] == "cooldown" and 2380 <= status["retry_seconds"] <= 2400
+        assert status["scope"] == "host" and status["reason"] == "retry_after" and status["http_status"] == code
+    assert "private" not in json.dumps(results)
+
+
+@pytest.mark.asyncio
+async def test_feed_successful_requests_to_one_host_are_spaced_and_other_hosts_continue(monkeypatch):
+    import backend.app.news_sources as sources
+    monkeypatch.setattr(sources, "HOST_REQUEST_INTERVAL", .03)
+    pool, times = sources.FeedPool(), []
+    async def get(url, **kwargs):
+        times.append((url, sources.time.monotonic()))
+        return httpx.Response(200, json={"tweets": [tibo_timeline_post("300")]})
+    results = await asyncio.gather(*(pool.fetch(url, "thsottiaux", get, 20) for url in
+        ["https://feed.example/a", "https://feed.example/b", "https://feed.example/c", "https://other.example/a"]))
+    assert all(posts for posts, status in results)
+    stamps = [stamp for url, stamp in times if url.startswith("https://feed.example")]
+    assert len(stamps) == 3 and all(right - left >= .025 for left, right in zip(stamps, stamps[1:]))
+    assert next(stamp for url, stamp in times if "other.example" in url) < stamps[-1]
+
+
+@pytest.mark.asyncio
+async def test_feed_concurrent_success_does_not_cancel_other_accounts_retry_after(monkeypatch):
+    import backend.app.news_sources as sources
+    monkeypatch.setattr(sources, "HOST_REQUEST_INTERVAL", 0)
+    pool = sources.FeedPool()
+    second_started, release = asyncio.Event(), asyncio.Event()
+    async def get(url, **kwargs):
+        if url.endswith("limited"):
+            await second_started.wait()
+            return httpx.Response(503, headers={"Retry-After": "2400"})
+        second_started.set()
+        await release.wait()
+        return httpx.Response(200, json={"tweets": [tibo_timeline_post("300")]})
+    limited = asyncio.create_task(pool.fetch("https://feed.example/limited", "thsottiaux", get, 20))
+    success = asyncio.create_task(pool.fetch("https://feed.example/healthy", "thsottiaux", get, 20))
+    await limited
+    release.set()
+    assert (await success)[1]["state"] == "ok"
+    _, status = await pool.fetch("https://feed.example/next", "openai", get, 20)
+    assert status["state"] == "cooldown" and status["retry_seconds"] >= 2399
+    assert status["scope"] == "host" and status["reason"] == "retry_after"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["timeout", "model", "review", "render", "send", "blocked", "success"])
 async def test_news_diagnostic_stages_retain_retry_work_and_only_log_ack(database, monkeypatch, approved_delivery_unit, failure):
     import backend.app.tibo_watch as watch

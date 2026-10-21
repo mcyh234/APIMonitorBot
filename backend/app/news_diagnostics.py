@@ -10,6 +10,8 @@ from backend.app.time_utils import utc_now
 
 KEY = "news.watch.diagnostics"
 LIMIT = 300
+SOURCE_REASONS = {"retry_after": "上游指定等待", "http_error": "HTTP 错误", "timeout": "请求或排队超时", "network_or_parse": "网络或订阅解析失败", "queue_full": "来源池繁忙"}
+SOURCE_SCOPES = {"host": "整个来源域名", "account": "本账号的该来源"}
 LABELS = {
     "started": "监听轮次开始", "finished": "监听轮次完成", "disabled": "监听关闭",
     "busy": "上一轮仍在处理", "crashed": "监听轮次异常，等待调度重试",
@@ -111,6 +113,10 @@ def diagnostics_view(session):
                 continue
             sources.append({"host": source["host"], "state": source["state"],
                             **{key: source[key] for key in ("post_count", "http_status", "retry_seconds") if isinstance(source.get(key), int)}})
+            if source.get("reason") in SOURCE_REASONS:
+                sources[-1]["reason_label"] = SOURCE_REASONS[source["reason"]]
+            if source.get("scope") in SOURCE_SCOPES:
+                sources[-1]["scope_label"] = SOURCE_SCOPES[source["scope"]]
         accounts.append({"account": username, "cursor": item.cursor if item else None,
                          "last_completed_at": item.last_completed_at if item else None,
                          "sources": sources,
@@ -133,7 +139,9 @@ def format_diagnostics(session, account=None):
     for row in [row for row in view["accounts"] if row["account"] == account or (not account and row["fetch_failed"])][:5]:
         lines.append(f"@{row['account']} 最近抓取完成：{row['last_completed_at'] or '暂无'} · 最新ID：{row['cursor'] or '未建立基线'} · {'抓取失败' if row['fetch_failed'] else '抓取正常'} · 待发送 {row['pending_count']}")
         for source in row["sources"]:
-            lines.append(f"  {source['host']} {source['state']} · {source.get('post_count', 0)} 条 · 退避 {source.get('retry_seconds', 0)} 秒")
+            lines.append(f"  {source['host']} {source['state']} · {source.get('post_count', 0)} 条 · 退避 {source.get('retry_seconds', 0)} 秒"
+                         f" · {source.get('scope_label', '旧记录，范围未知')} · {source.get('reason_label', '原因未记录')}"
+                         + (f" · HTTP {source['http_status']}" if 'http_status' in source else ""))
     for row in [row for row in view["pending"] if not account or row["account"] == account][:5]:
         lines.append(f"待发送 @{row['account']} {row['post_id']} → {row['target']} · 失败 {row['attempts']} 次 · {row['stage_label'] or '尚无失败阶段'} · 重试时间 {row['retry_at'] or '下一轮'}")
     events = [item for item in view["events"] if not account or item.get("account") == account]

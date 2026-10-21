@@ -96,7 +96,8 @@ with db.SessionLocal() as session:
         {"host": "fxtwitter.com", "state": "ok", "post_count": 61, "latest_id": "100"},
         {"host": "nitter.kareem.one", "state": "rate_limited", "post_count": 0, "retry_seconds": 600},
         {"host": "nitter.jaydenha.uk", "state": "cooldown", "post_count": 0, "retry_seconds": 60},
-        {"host": "nitter.netbub.com", "state": "error", "post_count": 0, "retry_seconds": 120},
+        {"host": "nitter.netbub.com", "state": "error", "post_count": 0, "retry_seconds": 120,
+         "scope": "account", "reason": "timeout"},
     ])
     watch_state.pending = [PendingDelivery(post_id="200", account="thsottiaux", target="G123456",
         payload_encrypted=box.encrypt("offline diagnostic fixture; never sent"), attempts=2,

@@ -54,6 +54,7 @@ const assert = require("node:assert/strict");
     const sourceCard = page.locator(".news-account-state").filter({ has: page.getByText("@thsottiaux", { exact: true }) });
     await sourceCard.getByText("fxtwitter.com：可用 · 61 条", { exact: true }).waitFor();
     await sourceCard.getByText("nitter.kareem.one：限流 · 检查时剩余 600 秒", { exact: true }).waitFor();
+    await sourceCard.getByText("nitter.netbub.com：获取失败 · 检查时剩余 120 秒 · 本账号的该来源 · 请求或排队超时", { exact: true }).waitFor();
     await sourceCard.screenshot({ path: path.join(output, "ai-news-sources-desktop.png") });
     await page.getByText("各账号抓取状态", { exact: true }).click();
     await watchPanel.screenshot({ path: path.join(output, "ai-news-desktop.png") });
