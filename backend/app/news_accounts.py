@@ -42,12 +42,12 @@ NEWS_ACCOUNTS = (
     NewsAccount("demishassabis", "Demis Hassabis", "Google", "创始人", "DeepMind 研究与模型进展", False),
     NewsAccount("sundarpichai", "Sundar Pichai", "Google", "负责人", "Google 产品与公司方向", False),
     NewsAccount("OfficialLoganK", "Logan Kilpatrick", "Google", "负责人", "Gemini API 与 AI Studio 开发者动态"),
-    NewsAccount("xai", "xAI", "xAI", "公司", "Grok 模型与 API 公告"),
+    NewsAccount("SpaceXSI", "SpaceXSI / xAI", "xAI / SpaceXSI", "公司", "Grok 模型与 API 公告；官网当前链接账号"),
     NewsAccount("grok", "Grok", "xAI", "产品", "Grok 产品与公开互动，发帖频繁", False),
     NewsAccount("elonmusk", "Elon Musk", "xAI", "创始人", "xAI 与 Grok 动态，也包含大量其他话题", False),
     NewsAccount("AIatMeta", "AI at Meta", "Meta", "公司", "Llama、开源模型与研究"),
     NewsAccount("MicrosoftAI", "Microsoft AI", "Microsoft", "公司", "Microsoft AI 与 Copilot 动态"),
-    NewsAccount("Copilot", "Microsoft Copilot", "Microsoft", "产品", "Copilot 产品更新"),
+    NewsAccount("MSFTCopilot", "Microsoft Copilot", "Microsoft", "产品", "Copilot 产品更新；官方博客所列账号"),
     NewsAccount("satyanadella", "Satya Nadella", "Microsoft", "负责人", "微软 AI 产品与公司方向", False),
     NewsAccount("mustafasuleyman", "Mustafa Suleyman", "Microsoft", "负责人", "微软 AI 与产品方向", False),
     NewsAccount("deepseek_ai", "DeepSeek", "DeepSeek", "公司", "模型发布、API 与开源更新"),
@@ -106,3 +106,8 @@ def recommended_accounts() -> list[str]:
 
 def account_name(username: str) -> str:
     return next((item.name for item in NEWS_ACCOUNTS if item.username.casefold() == username.casefold()), username)
+
+
+# Reviewed 2026-10-21 against x.ai and Microsoft's Copilot blog social links.
+# These are subscription corrections, not aliases for validating tweet authors.
+ACCOUNT_CORRECTIONS = {"xai": "spacexsi", "copilot": "msftcopilot"}

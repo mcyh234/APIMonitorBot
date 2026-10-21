@@ -1163,6 +1163,117 @@ def test_news_accounts_validation_catalog_and_legacy_migration(database):
     assert watch_view(session)["status"]["initialized"]
 
 
+@pytest.mark.parametrize("stored", [None, '{"enabled":false,"targets":""}', '{"accounts":["openai"],"enabled":false,"targets":""}'])
+def test_account_correction_never_expands_unselected_subscriptions(database, stored):
+    from backend.app.tibo_watch import SETTINGS_KEY, STATE_KEY, ACCOUNT_CORRECTIONS_KEY, read_watch_settings, migrate_news_account_corrections
+    session, _ = database
+    if stored:
+        set_app_setting(session, SETTINGS_KEY, stored)
+    before = read_watch_settings(session)
+    assert not migrate_news_account_corrections(session)
+    assert read_watch_settings(session) == before
+    assert get_app_setting(session, SETTINGS_KEY) == stored
+    assert get_app_setting(session, STATE_KEY) is None
+    assert get_app_setting(session, ACCOUNT_CORRECTIONS_KEY) == "1"
+
+
+def test_account_correction_prunes_retired_work_keeps_other_progress_and_runs_once(database):
+    import backend.app.tibo_watch as watch
+    from backend.app.models import NewsSummaryBatch, NewsSummaryItem
+    from backend.app.news_diagnostics import read_journal
+    session, _ = database
+    box = SecretBox("account-correction-offline")
+    settings = watch.TiboWatchSettings(enabled=False, targets="G123&P456", interval_seconds=180,
+                                      accounts=["xai", "copilot", "thsottiaux", "spacexsi"])
+    watch.save_watch_settings(session, settings)
+    state = watch.read_watch_state(session)
+    state.accounts = {name: watch.AccountState(cursor=number, discovery_floor="50", seen_ids=[number])
+                      for name, number in [("xai", "100"), ("copilot", "200"), ("thsottiaux", "300"), ("spacexsi", "400")]}
+    state.pending = [watch.PendingDelivery(account=name, post_id="500", target="G123", payload_encrypted=box.encrypt("private fixture"))
+                     for name in ["xai", "copilot", "thsottiaux"]]
+    state.last_sent_at = utc_now()
+    state.blocked_count = 62
+    set_app_setting(session, watch.STATE_KEY, state.model_dump_json())
+    batch = NewsSummaryBatch(target="G123", active_key="G123", item_ids=[], memory_ids=[], payload_encrypted=box.encrypt("private batch"))
+    session.add(batch); session.flush()
+    old = NewsSummaryItem(target="G123", post_key="xai:100", account="xai", batch_id=batch.id, payload_encrypted=box.encrypt("private history"))
+    kept = NewsSummaryItem(target="G123", post_key="thsottiaux:300", account="thsottiaux", payload_encrypted=box.encrypt("private news"))
+    session.add_all([old, kept]); session.flush(); batch.item_ids = [old.id]; session.commit()
+    assert watch.migrate_news_account_corrections(session) == [("xai", "spacexsi"), ("copilot", "msftcopilot")]
+    updated, after = watch.read_watch_settings(session), watch.read_watch_state(session)
+    assert updated.accounts == ["spacexsi", "msftcopilot", "thsottiaux"]
+    assert not updated.enabled and updated.targets == settings.targets and updated.interval_seconds == 180
+    assert set(after.accounts) == {"spacexsi", "thsottiaux"} and after.accounts["spacexsi"].cursor == "400"
+    assert after.accounts["thsottiaux"] == state.accounts["thsottiaux"]
+    assert after.pending == [state.pending[2]] and after.last_sent_at == state.last_sent_at and after.blocked_count == 62
+    assert after.generation != state.generation
+    assert session.get(NewsSummaryItem, old.id) is None and session.get(NewsSummaryItem, kept.id)
+    assert session.get(NewsSummaryBatch, batch.id).status == "cancelled"
+    assert read_journal(session)["events"][-1]["code"] == "accounts_corrected"
+    assert "private" not in json.dumps(read_journal(session))
+    from backend.app.news_diagnostics import format_diagnostics
+    response = format_diagnostics(session, "xai")
+    assert "@xai → @spacexsi" in response and "账号基线 2/3" in response
+    assert not watch.migrate_news_account_corrections(session)
+    assert watch.read_watch_state(session).generation == after.generation
+    # A later explicit choice is not silently rewritten on every service start.
+    watch.save_watch_settings(session, updated.model_copy(update={"accounts": ["xai"]}))
+    assert not watch.migrate_news_account_corrections(session)
+    assert watch.read_watch_settings(session).accounts == ["xai"]
+
+
+def test_account_corrections_do_not_alias_fetched_author_identities():
+    from backend.app.x_timeline import parse_timeline_posts
+    payload = json.dumps({"tweets": [tibo_timeline_post("500", author={"screen_name": "SpaceXSI", "name": "SpaceXSI"})]}).encode()
+    assert parse_timeline_posts(payload, "spacexsi")[0]["id"] == "500"
+    with pytest.raises(ValueError): parse_timeline_posts(payload, "xai")
+
+
+def test_account_correction_marker_and_subscription_changes_roll_back_together(database, monkeypatch):
+    import backend.app.tibo_watch as watch
+    session, _ = database
+    watch.save_watch_settings(session, watch.TiboWatchSettings(accounts=["xai"]))
+    original = get_app_setting(session, watch.SETTINGS_KEY)
+    def failed(*args): raise RuntimeError("offline transaction failure")
+    monkeypatch.setattr("backend.app.news_summary.prune_summary_scope", failed)
+    with pytest.raises(RuntimeError): watch.migrate_news_account_corrections(session)
+    session.rollback()
+    assert get_app_setting(session, watch.ACCOUNT_CORRECTIONS_KEY) is None
+    assert get_app_setting(session, watch.SETTINGS_KEY) == original
+
+
+@pytest.mark.asyncio
+async def test_corrected_accounts_build_fresh_baselines_then_only_send_later_news(database, monkeypatch, approved_delivery_unit):
+    import backend.app.tibo_watch as watch
+    session, factory = database
+    watch.save_watch_settings(session, watch.TiboWatchSettings(enabled=True, targets="G123", accounts=["xai", "copilot"]))
+    watch.migrate_news_account_corrections(session)
+    clock, post_id, sent = [utc_now()], ["500"], []
+    monkeypatch.setattr(watch, "utc_now", lambda: clock[0])
+    monkeypatch.setattr(watch, "render_tibo_radar_image", lambda report: report["id"].encode())
+    class Client:
+        def __init__(self, username="thsottiaux"): self.username = username
+        def for_account(self, username): return Client(username)
+        async def fetch_posts(self): return [tibo_timeline_post(post_id[0], "GPT API technical update")]
+        async def report_for_post(self, raw): return raw
+    class Delivery:
+        async def send_image(self, target, image_bytes, filename):
+            sent.append(image_bytes); return SimpleNamespace(ok=True)
+    watcher = watch.TiboWatcher(Client(), Delivery(), SecretBox("new-baseline-offline"))
+    await watcher.run_once(factory)
+    state = watch.read_watch_state(session)
+    assert not sent and not state.pending
+    assert all(state.accounts[name].discovery_floor == "500" for name in ["spacexsi", "msftcopilot"])
+    clock[0] += timedelta(seconds=120)
+    await watcher.run_once(factory)
+    from backend.app.news_diagnostics import read_journal
+    assert any(row["code"] == "no_new_posts" for row in read_journal(session)["events"])
+    assert not sent
+    clock[0] += timedelta(seconds=120); post_id[0] = "600"
+    await watcher.run_once(factory)
+    assert sent == [b"600", b"600"] and not watch.read_watch_state(session).pending
+
+
 @pytest.mark.asyncio
 async def test_news_client_uses_account_feed_and_custom_template_without_token_leak():
     from backend.app.tibo_radar import TiboRadarClient

@@ -29,6 +29,7 @@ from backend.app.news_models import translation_scope, TranslationUnavailable
 router = APIRouter(prefix="/api/tibo-watch")
 SETTINGS_KEY = "tibo.watch.settings"
 STATE_KEY = "tibo.watch.state"
+ACCOUNT_CORRECTIONS_KEY = "news.accounts.corrections.20261021"
 POST_PREPARATION_TIMEOUT = 120
 
 
@@ -123,6 +124,30 @@ def save_watch_settings(session: Session, settings: TiboWatchSettings):
             row.value = value
     session.commit()
     return watch_view(session)
+
+
+def migrate_news_account_corrections(session: Session):
+    """Once per installation, replace only selected obsolete preset entries.
+
+    Save through the normal subscription path: remove old encrypted work, retain
+    unrelated cursors and require fresh baselines for newly selected identities.
+    Never normalize fetched authors through this mapping.
+    """
+    if get_app_setting(session, ACCOUNT_CORRECTIONS_KEY):
+        return []
+    from backend.app.news_accounts import ACCOUNT_CORRECTIONS
+    settings = read_watch_settings(session)
+    changes = [(name, ACCOUNT_CORRECTIONS[name]) for name in settings.accounts if name in ACCOUNT_CORRECTIONS]
+    # Commit the migration marker in the same transaction as settings and pruning.
+    session.add(AppSetting(key=ACCOUNT_CORRECTIONS_KEY, value="1"))
+    if get_app_setting(session, SETTINGS_KEY) and changes:
+        accounts = list(dict.fromkeys(ACCOUNT_CORRECTIONS.get(name, name) for name in settings.accounts))
+        save_watch_settings(session, settings.model_copy(update={"accounts": accounts}))
+        from backend.app.news_diagnostics import record
+        record(session, "accounts_corrected", count=len(changes))
+    else:
+        session.commit()
+    return changes
 
 
 def watch_view(session: Session):
@@ -298,7 +323,7 @@ class TiboWatcher:
                                     state.pending.extend(PendingDelivery(account=username, post_id=str(post["id"]), payload_encrypted=encrypted, target=target)
                                                          for target in settings.targets.split("&"))
                                     queued += 1
-                                event("discovered", account=username, count=queued)
+                                event("discovered" if queued else "no_new_posts", account=username, count=queued)
                             # Bounded deduplication survives restarts and definitive
                             # moderation blocks. Eviction advances the safe floor.
                             retained = sorted(seen | {str(post["id"]) for post in posts}, key=int)

@@ -17,12 +17,14 @@ LABELS = {
     "busy": "上一轮仍在处理", "crashed": "监听轮次异常，等待调度重试",
     "fetching": "抓取来源", "fetched": "来源抓取完成", "fetch_failed": "来源抓取失败或超时",
     "baseline": "首次建立基线，不补发历史", "discovered": "发现新帖并加入待发送队列",
+    "no_new_posts": "本轮没有可入队的新帖",
     "preparing": "读取帖子详情与翻译", "reviewing": "审核原文、译文与上下文",
     "checking_model": "检查审核模型配置",
     "rendering": "生成新闻图片", "sending": "等待通知发送确认", "sent": "通知已确认送达",
     "blocked": "内容审核明确拦截", "model_unavailable": "审核或翻译不可用，保留加密任务重试",
     "failed": "当前阶段失败，保留加密任务重试", "timeout": "当前阶段超时，保留加密任务重试",
     "invalidated": "设置变化，本轮工作失效", "retry_requested": "管理员请求立即重试待发送项",
+    "accounts_corrected": "内置官号订阅已更正，新账号首次建立基线",
 }
 
 
@@ -133,7 +135,16 @@ def diagnostics_view(session):
 
 def format_diagnostics(session, account=None):
     view = diagnostics_view(session)
+    from backend.app.news_accounts import ACCOUNT_CORRECTIONS
+    correction = ACCOUNT_CORRECTIONS.get(account)
+    selected = {row["account"] for row in view["accounts"]}
+    notice = []
+    if correction and account not in selected and correction in selected:
+        notice = [f"官号订阅已更正：@{account} → @{correction}，以下显示新账号。"]
+        account = correction
     lines = ["AI 新闻监听诊断", *view["warnings"],
+             *notice,
+             f"账号基线 {sum(row['cursor'] is not None for row in view['accounts'])}/{len(view['accounts'])} · 最近抓取异常 {sum(row['fetch_failed'] for row in view['accounts'])} 个账号",
              f"待发送 {view['pending_count']} 个投递 · 退避 {view['retry_waiting']} · 累计拦截 {view['blocked_count']}",
              f"最近送达：{view['last_sent_at'] or '暂无'}", "最近日志（时间为 UTC）："]
     for row in [row for row in view["accounts"] if row["account"] == account or (not account and row["fetch_failed"])][:5]:

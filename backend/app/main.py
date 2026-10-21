@@ -16,7 +16,7 @@ from backend.app.availability import ApiProbe
 from backend.app.commands import CommandRouter, parse_onebot_message
 from backend.app.intelligence import IntelPipeline, router as intel_router
 from backend.app.monitor_extensions import apply_advanced_settings, router as extensions_router
-from backend.app.tibo_watch import TiboWatcher, router as tibo_watch_router
+from backend.app.tibo_watch import TiboWatcher, migrate_news_account_corrections, router as tibo_watch_router
 from backend.app.news_summary import SummaryService, router as summary_router
 from backend.app.models import ConversationState
 from sqlalchemy import select
@@ -47,6 +47,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if "_cipher" not in (conversation.payload or {}):
                     conversation.payload = {"_cipher": secret_box.encrypt(json.dumps(conversation.payload or {}, ensure_ascii=False))}
             session.commit()
+            migrate_news_account_corrections(session)
         onebot_client = OneBotClient(app_settings)
         notifier = OneBotNotifier(onebot_client, SessionLocal)
         monitor = MonitorService(

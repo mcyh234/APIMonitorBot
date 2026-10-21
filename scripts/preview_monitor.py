@@ -27,7 +27,7 @@ from backend.app.notifier import Notifier
 from backend.app.onebot import OneBotClient
 from backend.app.settings import Settings
 from backend.app.time_utils import coerce_aware_utc, utc_now
-from backend.app.tibo_watch import AccountState, PendingDelivery, STATE_KEY, read_watch_state
+from backend.app.tibo_watch import AccountState, PendingDelivery, STATE_KEY, read_watch_state, migrate_news_account_corrections
 from backend.app.news_summary_schema import SummarySettings
 from backend.app.news_summary import SETTINGS_KEY as SUMMARY_SETTINGS_KEY
 from backend.app.models import NewsSummaryBatch, NewsSummaryItem
@@ -90,6 +90,8 @@ with db.SessionLocal() as session:
         config.last_checked_at = now
     session.commit()
 
+    # Exercise the production startup correction against only the preview DB.
+    migrate_news_account_corrections(session)
     # Fixed source health examples; no public feed or OneBot calls in preview.
     watch_state = read_watch_state(session)
     watch_state.accounts["thsottiaux"] = AccountState(cursor="100", discovery_floor="100", seen_ids=["100"], last_checked_at=now, sources=[
