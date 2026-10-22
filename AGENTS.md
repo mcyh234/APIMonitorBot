@@ -1,5 +1,13 @@
 # Agent 开发指南
 
+## 2026-10-22 安全修复
+
+- SPA 静态文件兜底必须限制在前端构建目录内；路径遍历、盘符、UNC、设备名、ADS、点文件、符号链接及 Windows 重解析点须在访问不可信路径前拒绝，不得以 `Path.resolve()` 后才检查的方式处理 UNC。
+- WebUI 鉴权使用 ASGI `scope["path"]`，不得使用受 Host 重建影响的 `request.url.path`。畸形或超长 Bearer token 应返回未授权，不可抛出 500。
+- 缺失 `SECRET_MASTER_KEY` 必须明确失败，禁止公共默认加密密钥；不得自动生成替换已有主密钥、修改 `.env` 或迁移生产密文。
+- 弃用的 `/onebot/webhook` 只返回兼容响应，不读取或缓存请求体。
+- 依赖安全基线和审计证据见 `docs/security-review-2026-10-22.md`；前端使用官方 npm registry 审计，镜像审计接口失败不得当作零漏洞。安装环境中的工具链也需更新，审计原始报告保存在忽略的 `data/` 中。
+
 ## 新闻监听诊断
 
 - `/newswatch logs [@账号]`（兼容 `/tibowatch logs`）仅限管理员，沿用各自命令开关；`retry` 只提前重试加密待发送项并使在途工作失效，不清除基线、去重或绕过审核。

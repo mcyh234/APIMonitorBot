@@ -29,6 +29,118 @@ from backend.app.time_utils import utc_now
 from test_monitor import FakeNotifier, SequenceProbe, add_config, add_sub2_config
 
 
+@pytest.mark.asyncio
+async def test_security_spa_cannot_serve_files_outside_frontend(tmp_path):
+    from fastapi import FastAPI
+    from backend.app.api import mount_spa_routes
+    root = tmp_path / "dist"; root.mkdir()
+    (root / "index.html").write_text("offline application", encoding="utf-8")
+    (tmp_path / "outside-canary.txt").write_text("OFFLINE_PRIVATE_CANARY", encoding="utf-8")
+    app = FastAPI(); mount_spa_routes(app, root)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://testserver") as client:
+        response = await client.get("/%2e%2e/outside-canary.txt")
+        assert response.status_code == 404 and "OFFLINE_PRIVATE_CANARY" not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["../secret", "safe/../secret", r"..\secret", r"\\invalid.example\share", r"C:\secret",
+                                  r"\\?\UNC\invalid.example\share", "/absolute", "index.html:stream", ".env", ".git/config",
+                                  "NUL.txt", "CON", "folder./file", "folder /file", "bad\x00file"])
+async def test_security_spa_rejects_unsafe_paths_before_filesystem_io(tmp_path, monkeypatch, name):
+    from fastapi import FastAPI
+    from pathlib import Path
+    from backend.app.api import mount_spa_routes
+    app = FastAPI(); mount_spa_routes(app, tmp_path)
+    handler = next(route.endpoint for route in app.routes if route.path == "/{full_path:path}")
+    def forbidden(*args, **kwargs): raise AssertionError("unsafe path reached filesystem")
+    monkeypatch.setattr(Path, "lstat", forbidden)
+    with pytest.raises(HTTPException) as error:
+        await handler(name)
+    assert error.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_security_spa_rejects_reparse_points_and_keeps_client_routes(tmp_path, monkeypatch):
+    import stat
+    from pathlib import Path
+    from fastapi import FastAPI
+    from backend.app.api import mount_spa_routes
+    (tmp_path / "index.html").write_text("offline application", encoding="utf-8")
+    (tmp_path / "bundle.js").write_text("console.log('offline')", encoding="utf-8")
+    app = FastAPI(); mount_spa_routes(app, tmp_path)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://testserver") as client:
+        assert (await client.get("/status")).text == "offline application"
+        assert (await client.get("/bundle.js")).text == "console.log('offline')"
+    handler = next(route.endpoint for route in app.routes if route.path == "/{full_path:path}")
+    calls = []
+    def reparse(path):
+        calls.append(path.name)
+        return SimpleNamespace(st_mode=stat.S_IFDIR, st_file_attributes=0x400)
+    monkeypatch.setattr(Path, "lstat", reparse)
+    for path in ["junction/secret.txt", "index.html"]:
+        with pytest.raises(HTTPException): await handler(path)
+    assert calls == ["junction", "index.html"]
+
+
+@pytest.mark.asyncio
+async def test_security_auth_uses_router_path_even_if_reconstructed_url_is_public(monkeypatch):
+    from contextlib import nullcontext
+    from fastapi import FastAPI, Request
+    from starlette.datastructures import URL
+    import backend.app.main as main
+    monkeypatch.setattr(main, "SessionLocal", lambda: nullcontext(object()))
+    monkeypatch.setattr(main, "webui_secret_configured", lambda session: True)
+    monkeypatch.setattr(main, "verify_webui_token", lambda session, token: token == "allowed")
+    # Model a poisoned reconstructed URL independently of the installed
+    # framework's Host-header patch. Authorization must still use scope.path.
+    monkeypatch.setattr(Request, "url", property(lambda self: URL("http://testserver/api/public-status")))
+    app = FastAPI(); main.add_webui_auth_middleware(app)
+    @app.get("/api/security-canary")
+    def protected(): return {"ok": True}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://testserver") as client:
+        for host in ["testserver", "testserver/api/public-status?", "testserver#fragment"]:
+            assert (await client.get("/api/security-canary", headers={"host": host})).status_code == 401
+        assert (await client.get("/api/security-canary", headers={"Authorization": "Bearer allowed"})).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_security_deprecated_webhook_does_not_read_untrusted_body():
+    from backend.app.api import onebot_webhook
+    class Unreadable:
+        async def body(self): raise AssertionError("deprecated endpoint consumed request body")
+    assert (await onebot_webhook(Unreadable()))["status"] == "ignored"
+
+
+@pytest.mark.parametrize("token", ["9" * 5000 + ".nonce.sig", "1." + "a" * 24 + ".你好", "1." + "a" * 24 + "." + "é" * 64, "" ])
+def test_security_malformed_auth_tokens_fail_closed(database, token):
+    from backend.app.webui_auth import set_webui_secret, verify_webui_token
+    session, _ = database
+    set_webui_secret(session, "offline-access-secret")
+    assert not verify_webui_token(session, token)
+
+
+@pytest.mark.parametrize("value", ["", " ", "\n\t"])
+def test_security_missing_master_key_never_uses_public_fallback(value):
+    with pytest.raises(ValueError, match="SECRET_MASTER_KEY"):
+        SecretBox(value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [200, 401])
+@pytest.mark.parametrize("protocol", ["openai", "anthropic"])
+async def test_security_probe_redacts_reflected_api_key_before_truncation(status, protocol):
+    key = "sk-offline-secret-" + "A" * 300
+    def handler(request):
+        data = {"error": {"message": f"Invalid credential: {key}"}} if status == 401 else (
+            {"content": [{"type": "text", "text": key}]} if protocol == "anthropic" else {"choices": [{"message": {"content": key}}]})
+        return httpx.Response(status, json=data)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await ApiProbe(client=client).probe("https://offline.invalid/v1", key, "test", protocol=protocol)
+    value = result.error or result.response_preview
+    assert "sk-offline-secret" not in value and "[redacted]" in value
+    assert result.ok is (status == 200)
+
+
 def test_news_diagnostic_journal_is_bounded_and_never_persists_untrusted_text(database):
     from backend.app.news_diagnostics import KEY, LIMIT, read_journal, record
     session, _ = database

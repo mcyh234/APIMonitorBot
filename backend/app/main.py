@@ -137,7 +137,9 @@ def add_webui_auth_middleware(app: FastAPI) -> None:
     async def webui_auth_middleware(request: Request, call_next):
         if request.method == "OPTIONS":
             return await call_next(request)
-        path = request.url.path
+        # Match exactly the path the ASGI router sees, independent of Host or
+        # URL reconstruction (including CVE-2026-48710 on older Starlette).
+        path = request.scope["path"]
         if not path.startswith("/api") or path in public_api_paths:
             return await call_next(request)
         with SessionLocal() as session:

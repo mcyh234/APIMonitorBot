@@ -20,8 +20,7 @@ def normalize_master_key(raw: str) -> bytes:
             digest = hashlib.sha256(candidate).digest()
             return base64.urlsafe_b64encode(digest)
 
-    digest = hashlib.sha256(b"APIMonitorBot development fallback key").digest()
-    return base64.urlsafe_b64encode(digest)
+    raise ValueError("SECRET_MASTER_KEY 未配置：请在 .env 中设置独立主密钥，禁止使用公共默认加密密钥。")
 
 
 class SecretBox:

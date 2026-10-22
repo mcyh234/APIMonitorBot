@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
+import stat
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, Response, status
@@ -813,17 +814,48 @@ async def _read_upgrade_upload(request: Request) -> bytes:
 async def onebot_webhook(
     request: Request,
 ) -> dict[str, str]:
-    await request.body()
     return {"status": "ignored", "reason": "OneBot HTTP webhook is deprecated. Use WebSocket only."}
 
 
 def mount_spa_routes(app, frontend_dist: Path) -> None:
+    root = frontend_dist.resolve()
+
+    def safe_target(full_path: str):
+        # Reject lexical Windows paths BEFORE any stat/resolve: resolving UNC or
+        # device paths can itself make an outbound SMB request on Windows.
+        parts = PurePosixPath(full_path).parts
+        if ("\\" in full_path or ":" in full_path or "\x00" in full_path
+                or PureWindowsPath(full_path).drive or full_path.startswith("/")
+                or any(part in {".."} or part.startswith(".") or part.endswith((".", " "))
+                       or PureWindowsPath(part).is_reserved() for part in parts)):
+            raise HTTPException(status_code=404, detail="Not found.")
+        requested = root.joinpath(*parts)
+        # Do not follow symlinks or junctions even if their target happens to be
+        # inside the root. This also avoids remote reparse-point resolution.
+        current = root
+        for part in parts:
+            current = current / part
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                break
+            except OSError:
+                raise HTTPException(status_code=404, detail="Not found.") from None
+            if (stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0)
+                    & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
+                raise HTTPException(status_code=404, detail="Not found.")
+        try:
+            requested.resolve().relative_to(root)
+        except (ValueError, OSError, RuntimeError):
+            raise HTTPException(status_code=404, detail="Not found.") from None
+        return requested
+
     @app.get("/{full_path:path}", include_in_schema=False)
     async def spa_fallback(full_path: str):
-        index = frontend_dist / "index.html"
-        requested = frontend_dist / full_path
+        requested = safe_target(full_path)
         if full_path and requested.is_file():
             return FileResponse(requested)
-        if index.exists():
+        index = safe_target("index.html")
+        if index.is_file():
             return FileResponse(index)
         raise HTTPException(status_code=404, detail="Frontend has not been built yet.")

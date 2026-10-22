@@ -105,7 +105,11 @@ class ApiProbe:
                 protocol = "anthropic" if any(part in model_name.lower() for part in ("claude", "sonnet", "opus", "haiku", "anthropic")) or urlsplit(base_url).hostname == "api.anthropic.com" else "openai"
         result = await self._probe_protocol(base_url, api_key, model_name, protocol, verify_tls)
         if inferred and protocol == "anthropic" and result.code in {"404", "405"}:
-            return await self._probe_protocol(base_url, api_key, model_name, "openai", verify_tls)
+            result = await self._probe_protocol(base_url, api_key, model_name, "openai", verify_tls)
+        # Provider error bodies and network exceptions can echo request secrets.
+        # Scrub before any result is persisted or returned to a chat command.
+        if result.error and api_key:
+            result.error = result.error.replace(api_key, "[redacted]")[:240]
         return result
 
     async def _probe_protocol(self, base_url: str, api_key: str, model_name: str, protocol: str, verify_tls: bool) -> CheckResult:
@@ -158,7 +162,10 @@ class ApiProbe:
             data = None
 
         if not 200 <= response.status_code < 300:
-            error = error_message_from_payload(data) or response.text[:240]
+            error = error_message_from_payload(data) or response.text
+            if api_key:
+                error = error.replace(api_key, "[redacted]")
+            error = error[:240]
             return CheckResult(ok=False, code=code, error=error, latency_ms=latency_ms)
 
         if not isinstance(data, dict):
@@ -175,7 +182,8 @@ class ApiProbe:
                 error="No assistant content in response.",
                 latency_ms=latency_ms,
             )
-        return CheckResult(ok=True, code=code, latency_ms=latency_ms, response_preview=content[:240])
+        preview = content.replace(api_key, "[redacted]") if api_key else content
+        return CheckResult(ok=True, code=code, latency_ms=latency_ms, response_preview=preview[:240])
 
 
 class InternetConnectivityProbe:

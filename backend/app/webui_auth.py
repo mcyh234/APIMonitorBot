@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import re
 import secrets
 import time
 
@@ -45,7 +46,7 @@ def create_webui_token(session: Session) -> str:
 
 
 def verify_webui_token(session: Session, token: str | None) -> bool:
-    if not token:
+    if not token or len(token) > 160 or not re.fullmatch(r"[0-9]{1,12}\.[A-Za-z0-9_-]{24}\.[0-9a-f]{64}", token):
         return False
     stored = get_app_setting(session, WEBUI_SECRET_HASH_KEY)
     if not stored:

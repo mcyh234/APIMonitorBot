@@ -78,6 +78,8 @@ Copy-Item .env.example .env
 
 将生成的密钥填入 `.env` 的 `SECRET_MASTER_KEY`。这是数据库敏感字段的加密主密钥，**不是 WebUI 登录密钥**；请妥善备份，不要在升级时重新生成。
 
+2026-10-22 安全更新修复了前端静态路由的目录越界读取，并提高依赖安全基线。已有部署请运行 `python -m pip install -r requirements.txt`，在前端执行 `npm ci && npm run build`，然后重启。空 `SECRET_MASTER_KEY` 现在会阻止加密服务启动；曾使用空主密钥的旧数据库不能通过直接换新密钥恢复，需先备份并单独迁移，勿覆盖已有有效主密钥。详见[安全排查与修复记录](docs/security-review-2026-10-22.md)。
+
 同时将 `.env` 中的 `DEFAULT_ADMIN_QQ` 改为自己的 QQ 号。模板包含默认管理员，部署后请在 WebUI 核对管理员列表，删除不属于自己的账号。
 
 ### 2. 构建并启动
